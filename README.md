@@ -68,16 +68,38 @@ cargo run --example stock_vshape
 
 ## Benchmarks
 
-The table below shows Criterion median timings on Apple Silicon (`cargo bench --bench funnel_bench -- --quick`) for two workloads: an adversarial backtracking pattern `(A+)+ B` against non-matching rows of `A`, and a full end-to-end SQL 3-step drop-off funnel (`(a any0* b any1* c) | (a any0* b) | a`, including SQL parsing, planning, repartitioning, sorting, pattern matching, and measure evaluation).
+The tables below compare `datafusion-match-recognize` against Trino 484 on five 1,000,000-row workloads (20,000 partitions x 50 rows) and report Criterion microbenchmarks for adversarial backtracking patterns.
+
+### Single-node comparison against Trino 484 (1,000,000 rows)
+
+| Workload | Matched output rows | DataFusion p50 | Trino server exec p50 | Trino CPU p50 | Relative (vs Trino exec) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `1_funnel_3step_stateless` | 100,000 | **33.0 ms** | 645.0 ms | 1,688 ms | 19.6x faster |
+| `2_funnel_sparse_1pct_fast_skip` | 200 | **19.8 ms** | 154.0 ms | 411 ms | 7.8x faster |
+| `3_overlapping_skip_next_all_rows` | 1,509,234 | **38.6 ms** | 1,694.0 ms | 4,047 ms | 43.9x faster |
+| `4_stock_vshape_stateful_prev` | 304,390 | **211.3 ms** | 988.0 ms | 2,140 ms | 4.7x faster |
+| `5_time_window_funnel_stateful` | 88,000 | **117.2 ms** | 573.0 ms | 1,400 ms | 4.9x faster |
+
+**Conditions and fairness caveats.** Both engines ran on the same Apple Silicon machine over the exact same deterministic 1,000,000-row in-memory table (DataFusion `MemTable` vs. Trino 484 `memory` catalog), wrapped in `SELECT COUNT(*), SUM(...)` so result transfer is 1 row and asserting identical counts and sums on every query. Each engine ran 3 warmup iterations (to warm Trino's JIT) followed by 5 measured runs (median p50 reported), with DataFusion pinned to `target_partitions = 10` and 10 Tokio worker threads to match the 10 vCPU / 20 GiB Colima VM running `trinodb/trino:latest`. Trino's server-side `elapsedTimeMillis` is reported so HTTP client round-trip time is excluded.
+
+This is a single-node in-memory snapshot, not a general ranking. DataFusion ran natively on macOS while Trino ran inside Colima's Linux ARM64 VM, and single-node `MemTable` vs. `memory` catalog tests operator efficiency rather than Parquet/S3 scan I/O, distributed network shuffles, or multi-tenant cluster scheduling (for cluster-scale comparisons, pair this crate with `datafusion-distributed`). Notice also that Tier 2 stateful `DEFINE` workloads (`4_stock_vshape_stateful_prev`, `5_time_window_funnel_stateful`) are roughly 4-6x slower than Tier 1 stateless workloads because stateful candidate evaluation currently runs through DataFusion's `PhysicalExpr` on 1-row slot batches rather than compiled scalar bytecode.
+
+Reproduce the Trino comparison locally:
+
+```sh
+docker run -d --name mr-trino-bench -p 18080:8080 trinodb/trino:latest
+cargo run --release --example bench_vs_trino
+docker rm -f mr-trino-bench
+```
+
+### Adversarial backtracking microbenchmarks (Criterion)
+
+Measured with `cargo bench --bench funnel_bench -- --quick` on `(A+)+ B` against non-matching rows of `A` (confirming linear scaling from Tier 1 per-position `pc` deduplication):
 
 | Benchmark | Rows | Median time | Throughput |
 | --- | ---: | ---: | ---: |
 | `nfa_adversarial/(A+)+B_no_match` | 1,000 | 18.3 us | ~54.6M rows/s |
 | `nfa_adversarial/(A+)+B_no_match` | 10,000 | 192.3 us | ~52.0M rows/s |
-| `sql_3step_funnel` (100 users x 50 events) | 5,000 | 2.44 ms | ~2.0M rows/s |
-| `sql_3step_funnel` (1,000 users x 50 events) | 50,000 | 11.14 ms | ~4.5M rows/s |
-
-These numbers are a local snapshot on synthetic in-memory Arrow batches, not a general cross-engine ranking. Reproduce them locally with `cargo bench --bench funnel_bench`.
 
 ## Core tenets of the project
 
