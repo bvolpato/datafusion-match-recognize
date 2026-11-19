@@ -1,4 +1,5 @@
 /target
+/.bench-tmp
 Cargo.lock
 **/*.rs.bk
 *.pdb

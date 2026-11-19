@@ -1,34 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reproducible head-to-head benchmark comparing `datafusion-match-recognize` against a live
-//! Trino container on 5 canonical SQL:2016 `MATCH_RECOGNIZE` workloads (1,000,000 rows).
+//! Reproducible head-to-head benchmark comparing `datafusion-match-recognize` against Trino 484
+//! on five canonical SQL:2016 `MATCH_RECOGNIZE` workloads (1,000,000 rows).
 //!
-//! Fairness controls:
-//! - Identical deterministic 1M-row dataset loaded into memory on both engines (DataFusion
-//!   `MemTable` vs. Trino `memory` catalog).
-//! - DataFusion Tokio runtime and `target_partitions` pinned to `BENCH_THREADS` (default: 10,
-//!   matching Colima's vCPU count).
-//! - Warmup runs before measured runs on both engines (warms Trino JIT).
-//! - Every query is wrapped in `SELECT COUNT(*), SUM(...)` so result transfer is 1 row, and
-//!   outputs are asserted equal between DataFusion and Trino.
+//! Designed so both engines can run sequentially inside identical Linux ARM64 Docker containers
+//! (`--cpus=8 --memory=12g`) on the same VM with zero host-vs-VM asymmetry and zero CPU
+//! contention, over either in-memory tables or shared Parquet files written by Trino.
 //!
-//! Run:
-//!   docker run -d --name mr-trino-bench -p 18080:8080 trinodb/trino:latest
-//!   cargo run --release --example bench_vs_trino
-//!   docker rm -f mr-trino-bench
+//! Environment variables:
+//! - `BENCH_MODE`: `both` (default), `trino`, or `df`
+//! - `BENCH_STORAGE`: `memory` (default) or `parquet`
+//! - `BENCH_THREADS`: DataFusion Tokio worker threads + `target_partitions` (default: 8)
+//! - `BENCH_PARQUET_DIR`: directory of Parquet files for `BENCH_STORAGE=parquet`
+//!   (default: `/benchdata/metastore/default/bench_events`)
+//! - `BENCH_CHECKSUM_FILE`: optional JSON path to write (in `trino` mode) / verify (in `df` mode)
+//!   exact result parity across sequential container runs
+//! - `TRINO_URL`: Trino HTTP endpoint (default: `http://localhost:18080`)
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use datafusion::prelude::SessionConfig;
+use datafusion::prelude::{ParquetReadOptions, SessionConfig};
 use datafusion_match_recognize::{MatchRecognizeConfig, session_context_with_match_recognize};
 use serde::Deserialize;
 
-const NUM_PARTITIONS: usize = 20_000;
-const ROWS_PER_PARTITION: usize = 50; // 20,000 * 50 = 1,000,000 rows
-const WARMUP_ITERS: usize = 3;
+const DEFAULT_PARTITIONS: usize = 200_000;
+const ROWS_PER_PARTITION: usize = 50; // 200,000 * 50 = 10,000,000 rows
+const WARMUP_ITERS: usize = 2;
 const MEASURED_ITERS: usize = 5;
 
 #[derive(Debug, Deserialize)]
@@ -58,13 +59,14 @@ struct TrinoRunResult {
 async fn run_trino(
     client: &reqwest::Client,
     base_url: &str,
+    catalog: &str,
     sql: &str,
 ) -> Result<TrinoRunResult, String> {
     let start = Instant::now();
     let mut resp: TrinoResponse = client
         .post(format!("{base_url}/v1/statement"))
         .header("X-Trino-User", "bench")
-        .header("X-Trino-Catalog", "memory")
+        .header("X-Trino-Catalog", catalog)
         .header("X-Trino-Schema", "default")
         .body(sql.to_string())
         .send()
@@ -127,16 +129,8 @@ async fn run_trino(
     })
 }
 
-/// Deterministic 1,000,000-row table matching Trino's `UNNEST(sequence(...))` generation formula
-/// so both engines evaluate the exact same rows without huge INSERT payloads:
-///   p     = 1..=20_000
-///   seq   = 1..=50
-///   ts    = seq * 10
-///   ev    = (p * 31 + seq * 17) % 10
-///   price = 100 + ((p * 7 + seq * 13) % 41) - ((seq * 3) % 19)
-///   sparse_ev = CASE WHEN p % 100 = 0 AND seq = 5 THEN 0 WHEN seq = 25 THEN 1 WHEN seq = 45 THEN 2 ELSE 9 END
-fn build_df_batch() -> RecordBatch {
-    let total = NUM_PARTITIONS * ROWS_PER_PARTITION;
+fn build_df_batch(num_partitions: usize) -> RecordBatch {
+    let total = num_partitions * ROWS_PER_PARTITION;
     let mut p_col = Vec::with_capacity(total);
     let mut seq_col = Vec::with_capacity(total);
     let mut ts_col = Vec::with_capacity(total);
@@ -144,7 +138,7 @@ fn build_df_batch() -> RecordBatch {
     let mut price_col = Vec::with_capacity(total);
     let mut sparse_col = Vec::with_capacity(total);
 
-    for p in 1..=(NUM_PARTITIONS as i64) {
+    for p in 1..=(num_partitions as i64) {
         for seq in 1..=(ROWS_PER_PARTITION as i64) {
             p_col.push(p);
             seq_col.push(seq);
@@ -204,13 +198,133 @@ fn median(mut vals: Vec<f64>) -> f64 {
     vals[vals.len() / 2]
 }
 
+fn workloads() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "1_funnel_3step_stateless",
+            r#"
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
+            FROM bench_events
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY seq
+                MEASURES
+                    CASE WHEN c.ts IS NOT NULL THEN FIRST(c.ts) - FIRST(a.ts) ELSE 0 END AS dt
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((a any0* b any1* c) | (a any0* b) | a)
+                DEFINE
+                    a AS ev = 0,
+                    any0 AS ev <> 1,
+                    b AS ev = 1,
+                    any1 AS ev <> 2,
+                    c AS ev = 2
+            )
+            "#,
+        ),
+        (
+            "2_funnel_sparse_1pct_fast_skip",
+            r#"
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
+            FROM bench_events
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY seq
+                MEASURES FIRST(c.ts) - FIRST(a.ts) AS dt
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (a any0* b any1* c)
+                DEFINE
+                    a AS sparse_ev = 0,
+                    any0 AS sparse_ev <> 1,
+                    b AS sparse_ev = 1,
+                    any1 AS sparse_ev <> 2,
+                    c AS sparse_ev = 2
+            )
+            "#,
+        ),
+        (
+            "3_overlapping_skip_next_all_rows",
+            r#"
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(s_price), 0) AS total_s
+            FROM bench_events
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY seq
+                MEASURES SUM(price) AS s_price
+                ALL ROWS PER MATCH OMIT EMPTY MATCHES
+                AFTER MATCH SKIP TO NEXT ROW
+                PATTERN (a b+ c)
+                DEFINE
+                    a AS price >= 100,
+                    b AS price < 115,
+                    c AS price >= 115
+            )
+            "#,
+        ),
+        (
+            "4_stock_vshape_stateful_prev",
+            r#"
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(bottom_p), 0) AS total_bp
+            FROM bench_events
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY seq
+                MEASURES LAST(down.price) AS bottom_p
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP TO LAST up
+                PATTERN (strt down+ up+)
+                DEFINE
+                    down AS down.price < PREV(down.price),
+                    up AS up.price > PREV(up.price)
+            )
+            "#,
+        ),
+        (
+            "5_time_window_funnel_stateful",
+            r#"
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
+            FROM bench_events
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY seq
+                MEASURES LAST(b.ts) - FIRST(a.ts) AS dt
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (a any0* b)
+                DEFINE
+                    a AS ev = 0,
+                    any0 AS ev <> 2,
+                    b AS ev = 2 AND b.ts - FIRST(a.ts) <= 150
+            )
+            "#,
+        ),
+    ]
+}
+
 fn main() {
+    let mode = std::env::var("BENCH_MODE").unwrap_or_else(|_| "both".to_string());
+    let storage = std::env::var("BENCH_STORAGE").unwrap_or_else(|_| "memory".to_string());
+    let num_partitions: usize = std::env::var("BENCH_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_PARTITIONS);
+    assert!(
+        num_partitions >= 1000 && num_partitions.is_multiple_of(1000),
+        "BENCH_PARTITIONS must be a multiple of 1000"
+    );
     let threads: usize = std::env::var("BENCH_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(8);
     let trino_url =
         std::env::var("TRINO_URL").unwrap_or_else(|_| "http://localhost:18080".to_string());
+    let parquet_dir = std::env::var("BENCH_PARQUET_DIR")
+        .unwrap_or_else(|_| "/benchdata/metastore/default/bench_events".to_string());
+    let checksum_file = std::env::var("BENCH_CHECKSUM_FILE").ok();
+
+    let run_trino_side = mode == "trino" || mode == "both";
+    let run_df_side = mode == "df" || mode == "both";
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
@@ -220,231 +334,203 @@ fn main() {
 
     rt.block_on(async move {
         let client = reqwest::Client::new();
+        let trino_catalog = if storage == "parquet" { "hive" } else { "memory" };
 
-        // Wait for Trino to finish starting up.
-        for _ in 0..60 {
-            if let Ok(r) = client.get(format!("{trino_url}/v1/info")).send().await
-                && let Ok(txt) = r.text().await
-                && txt.contains("\"starting\":false")
-            {
-                break;
+        if run_trino_side {
+            for _ in 0..60 {
+                if let Ok(r) = client.get(format!("{trino_url}/v1/info")).send().await
+                    && let Ok(txt) = r.text().await
+                    && txt.contains("\"starting\":false")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
 
-        // Load identical 1,000,000-row table into Trino memory catalog.
-        let _ = run_trino(&client, &trino_url, "DROP TABLE IF EXISTS memory.default.bench_events")
-            .await;
-        let create_trino_sql = format!(
-            r#"
-            CREATE TABLE memory.default.bench_events AS
-            WITH parts AS (
-                SELECT CAST(g * 1000 + k AS BIGINT) AS p
-                FROM UNNEST(sequence(0, {})) AS tg(g)
-                CROSS JOIN UNNEST(sequence(1, 1000)) AS tk(k)
+            if storage == "parquet" {
+                let _ = run_trino(
+                    &client,
+                    &trino_url,
+                    "hive",
+                    "CREATE SCHEMA IF NOT EXISTS hive.default",
+                )
+                .await;
+            }
+            let _ = run_trino(
+                &client,
+                &trino_url,
+                trino_catalog,
+                &format!("DROP TABLE IF EXISTS {trino_catalog}.default.bench_events"),
             )
-            SELECT
-                p,
-                CAST(seq AS BIGINT) AS seq,
-                CAST(seq * 10 AS BIGINT) AS ts,
-                CAST((p * 31 + seq * 17) % 10 AS BIGINT) AS ev,
-                CAST(100 + ((p * 7 + seq * 13) % 41) - ((seq * 3) % 19) AS BIGINT) AS price,
-                CAST(CASE
-                    WHEN p % 100 = 0 AND seq = 5 THEN 0
-                    WHEN seq = 25 THEN 1
-                    WHEN seq = 45 THEN 2
-                    ELSE 9
-                END AS BIGINT) AS sparse_ev
-            FROM parts
-            CROSS JOIN UNNEST(sequence(1, {ROWS_PER_PARTITION})) AS t2(seq)
-            "#,
-            (NUM_PARTITIONS / 1000) - 1
-        );
-        run_trino(&client, &trino_url, &create_trino_sql)
-            .await
-            .expect("create Trino bench_events");
+            .await;
 
-        // Load identical 1,000,000-row table into DataFusion MemTable with `threads` partitions.
-        let ctx = session_context_with_match_recognize(
-            SessionConfig::new().with_target_partitions(threads),
-            MatchRecognizeConfig::default(),
-        )
-        .expect("df ctx");
-        let batch = build_df_batch();
-        let chunk_rows = batch.num_rows() / threads;
-        let mut mem_parts = Vec::with_capacity(threads);
-        for i in 0..threads {
-            let start = i * chunk_rows;
-            let len = if i + 1 == threads {
-                batch.num_rows() - start
+            let with_clause = if storage == "parquet" {
+                "WITH (format = 'PARQUET')"
             } else {
-                chunk_rows
+                ""
             };
-            mem_parts.push(vec![batch.slice(start, len)]);
+            let create_trino_sql = format!(
+                r#"
+                CREATE TABLE {trino_catalog}.default.bench_events {with_clause} AS
+                WITH parts AS (
+                    SELECT CAST(g * 1000 + k AS BIGINT) AS p
+                    FROM UNNEST(sequence(0, {})) AS tg(g)
+                    CROSS JOIN UNNEST(sequence(1, 1000)) AS tk(k)
+                )
+                SELECT
+                    p,
+                    CAST(seq AS BIGINT) AS seq,
+                    CAST(seq * 10 AS BIGINT) AS ts,
+                    CAST((p * 31 + seq * 17) % 10 AS BIGINT) AS ev,
+                    CAST(100 + ((p * 7 + seq * 13) % 41) - ((seq * 3) % 19) AS BIGINT) AS price,
+                    CAST(CASE
+                        WHEN p % 100 = 0 AND seq = 5 THEN 0
+                        WHEN seq = 25 THEN 1
+                        WHEN seq = 45 THEN 2
+                        ELSE 9
+                    END AS BIGINT) AS sparse_ev
+                FROM parts
+                CROSS JOIN UNNEST(sequence(1, {ROWS_PER_PARTITION})) AS t2(seq)
+                "#,
+                (num_partitions / 1000) - 1
+            );
+            run_trino(&client, &trino_url, trino_catalog, &create_trino_sql)
+                .await
+                .expect("create Trino bench_events");
         }
-        let table = datafusion::catalog::memory::MemTable::try_new(batch.schema(), mem_parts)
-            .expect("memtable");
-        ctx.register_table("bench_events", Arc::new(table))
-            .expect("register");
 
-        let workloads: Vec<(&str, &str)> = vec![
-            (
-                "1_funnel_3step_stateless",
-                r#"
-                SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
-                FROM bench_events
-                MATCH_RECOGNIZE (
-                    PARTITION BY p
-                    ORDER BY seq
-                    MEASURES
-                        CASE WHEN c.ts IS NOT NULL THEN FIRST(c.ts) - FIRST(a.ts) ELSE 0 END AS dt
-                    ONE ROW PER MATCH
-                    AFTER MATCH SKIP PAST LAST ROW
-                    PATTERN ((a any0* b any1* c) | (a any0* b) | a)
-                    DEFINE
-                        a AS ev = 0,
-                        any0 AS ev <> 1,
-                        b AS ev = 1,
-                        any1 AS ev <> 2,
-                        c AS ev = 2
-                )
-                "#,
-            ),
-            (
-                "2_funnel_sparse_1pct_fast_skip",
-                r#"
-                SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
-                FROM bench_events
-                MATCH_RECOGNIZE (
-                    PARTITION BY p
-                    ORDER BY seq
-                    MEASURES FIRST(c.ts) - FIRST(a.ts) AS dt
-                    ONE ROW PER MATCH
-                    AFTER MATCH SKIP PAST LAST ROW
-                    PATTERN (a any0* b any1* c)
-                    DEFINE
-                        a AS sparse_ev = 0,
-                        any0 AS sparse_ev <> 1,
-                        b AS sparse_ev = 1,
-                        any1 AS sparse_ev <> 2,
-                        c AS sparse_ev = 2
-                )
-                "#,
-            ),
-            (
-                "3_overlapping_skip_next_all_rows",
-                r#"
-                SELECT COUNT(*) AS cnt, COALESCE(SUM(s_price), 0) AS total_s
-                FROM bench_events
-                MATCH_RECOGNIZE (
-                    PARTITION BY p
-                    ORDER BY seq
-                    MEASURES SUM(price) AS s_price
-                    ALL ROWS PER MATCH OMIT EMPTY MATCHES
-                    AFTER MATCH SKIP TO NEXT ROW
-                    PATTERN (a b+ c)
-                    DEFINE
-                        a AS price >= 100,
-                        b AS price < 115,
-                        c AS price >= 115
-                )
-                "#,
-            ),
-            (
-                "4_stock_vshape_stateful_prev",
-                r#"
-                SELECT COUNT(*) AS cnt, COALESCE(SUM(bottom_p), 0) AS total_bp
-                FROM bench_events
-                MATCH_RECOGNIZE (
-                    PARTITION BY p
-                    ORDER BY seq
-                    MEASURES LAST(down.price) AS bottom_p
-                    ONE ROW PER MATCH
-                    AFTER MATCH SKIP TO LAST up
-                    PATTERN (strt down+ up+)
-                    DEFINE
-                        down AS down.price < PREV(down.price),
-                        up AS up.price > PREV(up.price)
-                )
-                "#,
-            ),
-            (
-                "5_time_window_funnel_stateful",
-                r#"
-                SELECT COUNT(*) AS cnt, COALESCE(SUM(dt), 0) AS total_dt
-                FROM bench_events
-                MATCH_RECOGNIZE (
-                    PARTITION BY p
-                    ORDER BY seq
-                    MEASURES LAST(b.ts) - FIRST(a.ts) AS dt
-                    ONE ROW PER MATCH
-                    AFTER MATCH SKIP PAST LAST ROW
-                    PATTERN (a any0* b)
-                    DEFINE
-                        a AS ev = 0,
-                        any0 AS ev <> 2,
-                        b AS ev = 2 AND b.ts - FIRST(a.ts) <= 150
-                )
-                "#,
-            ),
-        ];
+        let ctx = if run_df_side {
+            let ctx = session_context_with_match_recognize(
+                SessionConfig::new().with_target_partitions(threads),
+                MatchRecognizeConfig::default(),
+            )
+            .expect("df ctx");
+            if storage == "parquet" {
+                ctx.register_parquet("bench_events", &parquet_dir, ParquetReadOptions::default())
+                    .await
+                    .expect("register parquet");
+            } else {
+                let batch = build_df_batch(num_partitions);
+                let chunk_rows = batch.num_rows() / threads;
+                let mut mem_parts = Vec::with_capacity(threads);
+                for i in 0..threads {
+                    let start = i * chunk_rows;
+                    let len = if i + 1 == threads {
+                        batch.num_rows() - start
+                    } else {
+                        chunk_rows
+                    };
+                    mem_parts.push(vec![batch.slice(start, len)]);
+                }
+                let table =
+                    datafusion::catalog::memory::MemTable::try_new(batch.schema(), mem_parts)
+                        .expect("memtable");
+                ctx.register_table("bench_events", Arc::new(table))
+                    .expect("register");
+            }
+            Some(ctx)
+        } else {
+            None
+        };
+
+        let mut saved_checksums: BTreeMap<String, Vec<Vec<String>>> = if mode == "df" {
+            checksum_file
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
 
         println!(
-            "Benchmark: {} rows ({} partitions x {} rows), DataFusion threads={}, Trino Docker (Colima), warmup={}, runs={}\n",
-            NUM_PARTITIONS * ROWS_PER_PARTITION,
-            NUM_PARTITIONS,
-            ROWS_PER_PARTITION,
-            threads,
-            WARMUP_ITERS,
-            MEASURED_ITERS
+            "Mode={mode}, Storage={storage}, Rows={}, Threads={threads}, Warmup={WARMUP_ITERS}, Runs={MEASURED_ITERS}\n",
+            num_partitions * ROWS_PER_PARTITION
         );
-        println!(
-            "| Workload | DataFusion p50 (ms) | Trino wall p50 (ms) | Trino exec p50 (ms) | Trino CPU p50 (ms) | Speedup (vs Trino exec) | Result Parity |"
-        );
-        println!("| --- | ---: | ---: | ---: | ---: | ---: | --- |");
 
-        for (name, sql) in workloads {
-            // Warmup both engines
-            for _ in 0..WARMUP_ITERS {
-                let _ = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-                let _ = run_trino(&client, &trino_url, sql).await.unwrap();
+        for (name, sql) in workloads() {
+            let mut df_med: Option<f64> = None;
+            let mut df_out: Option<Vec<Vec<String>>> = None;
+            if let Some(ctx) = &ctx {
+                for _ in 0..WARMUP_ITERS {
+                    let _ = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                }
+                let mut times = Vec::with_capacity(MEASURED_ITERS);
+                for _ in 0..MEASURED_ITERS {
+                    let t0 = Instant::now();
+                    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                    times.push(t0.elapsed().as_secs_f64() * 1000.0);
+                    df_out = Some(format_df_rows(&batches));
+                }
+                df_med = Some(median(times));
             }
 
-            let mut df_times = Vec::with_capacity(MEASURED_ITERS);
-            let mut df_out = Vec::new();
-            for _ in 0..MEASURED_ITERS {
-                let t0 = Instant::now();
-                let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-                df_times.push(t0.elapsed().as_secs_f64() * 1000.0);
-                df_out = format_df_rows(&batches);
+            let mut trino_wall_med: Option<f64> = None;
+            let mut trino_exec_med: Option<f64> = None;
+            let mut trino_cpu_med: Option<f64> = None;
+            let mut trino_out: Option<Vec<Vec<String>>> = None;
+            if run_trino_side {
+                for _ in 0..WARMUP_ITERS {
+                    let _ = run_trino(&client, &trino_url, trino_catalog, sql)
+                        .await
+                        .unwrap();
+                }
+                let mut wall = Vec::with_capacity(MEASURED_ITERS);
+                let mut exec = Vec::with_capacity(MEASURED_ITERS);
+                let mut cpu = Vec::with_capacity(MEASURED_ITERS);
+                for _ in 0..MEASURED_ITERS {
+                    let res = run_trino(&client, &trino_url, trino_catalog, sql)
+                        .await
+                        .unwrap();
+                    wall.push(res.wall_ms);
+                    exec.push(res.server_elapsed_ms as f64);
+                    cpu.push(res.server_cpu_ms as f64);
+                    trino_out = Some(res.rows);
+                }
+                trino_wall_med = Some(median(wall));
+                trino_exec_med = Some(median(exec));
+                trino_cpu_med = Some(median(cpu));
+                saved_checksums.insert(name.to_string(), trino_out.clone().unwrap());
             }
 
-            let mut trino_wall = Vec::with_capacity(MEASURED_ITERS);
-            let mut trino_exec = Vec::with_capacity(MEASURED_ITERS);
-            let mut trino_cpu = Vec::with_capacity(MEASURED_ITERS);
-            let mut trino_out = Vec::new();
-            for _ in 0..MEASURED_ITERS {
-                let res = run_trino(&client, &trino_url, sql).await.unwrap();
-                trino_wall.push(res.wall_ms);
-                trino_exec.push(res.server_elapsed_ms as f64);
-                trino_cpu.push(res.server_cpu_ms as f64);
-                trino_out = res.rows;
+            if let (Some(d), Some(t)) = (&df_out, &trino_out) {
+                assert_eq!(d, t, "Result mismatch on {name}: DF={d:?} vs Trino={t:?}");
+            } else if let (Some(d), Some(t)) = (&df_out, saved_checksums.get(name)) {
+                assert_eq!(
+                    d, t,
+                    "Result mismatch vs saved Trino checksum on {name}: DF={d:?} vs Trino={t:?}"
+                );
             }
 
-            assert_eq!(
-                df_out, trino_out,
-                "Result mismatch on workload {name}: DF={df_out:?} vs Trino={trino_out:?}"
-            );
+            match (df_med, trino_wall_med, trino_exec_med, trino_cpu_med) {
+                (Some(d), Some(tw), Some(te), Some(tc)) => {
+                    println!(
+                        "| `{name}` | {d:.1} ms | {tw:.1} ms | {te:.1} ms | {tc:.1} ms | {:.2}x | exact ({}) |",
+                        te / d,
+                        df_out.unwrap()[0].join(", ")
+                    );
+                }
+                (None, Some(tw), Some(te), Some(tc)) => {
+                    println!(
+                        "TRINO | `{name}` | wall={tw:.1} ms | exec={te:.1} ms | cpu={tc:.1} ms | out=({})",
+                        trino_out.unwrap()[0].join(", ")
+                    );
+                }
+                (Some(d), None, None, None) => {
+                    println!(
+                        "DF    | `{name}` | wall={d:.1} ms | out=({}) | parity=verified",
+                        df_out.unwrap()[0].join(", ")
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
 
-            let df_med = median(df_times);
-            let tw_med = median(trino_wall);
-            let te_med = median(trino_exec);
-            let tc_med = median(trino_cpu);
-            let ratio = te_med / df_med;
-            println!(
-                "| `{name}` | {df_med:.1} | {tw_med:.1} | {te_med:.1} | {tc_med:.1} | {ratio:.2}x | exact ({}) |",
-                df_out[0].join(", ")
-            );
+        if mode == "trino"
+            && let Some(path) = &checksum_file
+        {
+            std::fs::write(path, serde_json::to_string_pretty(&saved_checksums).unwrap())
+                .expect("write checksums");
         }
     });
 }

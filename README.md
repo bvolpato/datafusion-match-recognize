@@ -68,28 +68,27 @@ cargo run --example stock_vshape
 
 ## Benchmarks
 
-The tables below compare `datafusion-match-recognize` against Trino 484 on five 1,000,000-row workloads (20,000 partitions x 50 rows) and report Criterion microbenchmarks for adversarial backtracking patterns.
+The tables below compare `datafusion-match-recognize` against Trino 484 on five 10,000,000-row Parquet workloads (200,000 partitions x 50 rows) running sequentially in identical Linux ARM64 Docker containers, plus Criterion microbenchmarks for adversarial backtracking patterns.
 
-### Single-node comparison against Trino 484 (1,000,000 rows)
+### Single-node Parquet comparison against Trino 484 (10,000,000 rows)
 
 | Workload | Matched output rows | DataFusion p50 | Trino server exec p50 | Trino CPU p50 | Relative (vs Trino exec) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1_funnel_3step_stateless` | 100,000 | **33.0 ms** | 645.0 ms | 1,688 ms | 19.6x faster |
-| `2_funnel_sparse_1pct_fast_skip` | 200 | **19.8 ms** | 154.0 ms | 411 ms | 7.8x faster |
-| `3_overlapping_skip_next_all_rows` | 1,509,234 | **38.6 ms** | 1,694.0 ms | 4,047 ms | 43.9x faster |
-| `4_stock_vshape_stateful_prev` | 304,390 | **211.3 ms** | 988.0 ms | 2,140 ms | 4.7x faster |
-| `5_time_window_funnel_stateful` | 88,000 | **117.2 ms** | 573.0 ms | 1,400 ms | 4.9x faster |
+| `1_funnel_3step_stateless` | 1,000,000 | **0.85 s** (850 ms) | 8.63 s (8,631 ms) | 21.97 s | 10.2x faster |
+| `2_funnel_sparse_1pct_fast_skip` | 2,000 | **0.43 s** (427 ms) | 3.30 s (3,300 ms) | 9.48 s | 7.7x faster |
+| `3_overlapping_skip_next_all_rows` | 15,092,674 | **2.16 s** (2,161 ms) | 30.89 s (30,892 ms) | 50.81 s | 14.3x faster |
+| `4_stock_vshape_stateful_prev` | 3,043,902 | **2.84 s** (2,845 ms) | 18.49 s (18,486 ms) | 38.33 s | 6.5x faster |
+| `5_time_window_funnel_stateful` | 880,000 | **2.11 s** (2,113 ms) | 12.04 s (12,038 ms) | 26.04 s | 5.7x faster |
+| **Total (all 5 workloads)** | **20,018,576** | **8.40 s** | **73.35 s** | **146.64 s** | **8.7x faster** |
 
-**Conditions and fairness caveats.** Both engines ran on the same Apple Silicon machine over the exact same deterministic 1,000,000-row in-memory table (DataFusion `MemTable` vs. Trino 484 `memory` catalog), wrapped in `SELECT COUNT(*), SUM(...)` so result transfer is 1 row and asserting identical counts and sums on every query. Each engine ran 3 warmup iterations (to warm Trino's JIT) followed by 5 measured runs (median p50 reported), with DataFusion pinned to `target_partitions = 10` and 10 Tokio worker threads to match the 10 vCPU / 20 GiB Colima VM running `trinodb/trino:latest`. Trino's server-side `elapsedTimeMillis` is reported so HTTP client round-trip time is excluded.
+**Conditions.** Both engines ran sequentially (never concurrently) inside identical Linux ARM64 Docker containers (`--cpus=8 --memory=12g`) on the same Colima VM, scanning the exact same 10,000,000-row Parquet files written by Trino's Hive file metastore. DataFusion was pinned to `target_partitions = 8` and 8 Tokio worker threads. Each workload ran 2 warmup iterations (to warm Trino's JIT) followed by 5 measured runs (median p50 reported), wrapped in `SELECT COUNT(*), SUM(...)` so result transfer is 1 row, with exact checksum parity verified across containers on every query. Trino's server-side `elapsedTimeMillis` is reported so HTTP client round-trip time is excluded.
 
-This is a single-node in-memory snapshot, not a general ranking. DataFusion ran natively on macOS while Trino ran inside Colima's Linux ARM64 VM, and single-node `MemTable` vs. `memory` catalog tests operator efficiency rather than Parquet/S3 scan I/O, distributed network shuffles, or multi-tenant cluster scheduling (for cluster-scale comparisons, pair this crate with `datafusion-distributed`). Notice also that Tier 2 stateful `DEFINE` workloads (`4_stock_vshape_stateful_prev`, `5_time_window_funnel_stateful`) are roughly 4-6x slower than Tier 1 stateless workloads because stateful candidate evaluation currently runs through DataFusion's `PhysicalExpr` on 1-row slot batches rather than compiled scalar bytecode.
+This is a single-node local Parquet snapshot, not a cluster benchmark: it measures Parquet scan, hash repartitioning, sorting, and `MATCH_RECOGNIZE` execution on one node, not S3 latency, distributed network shuffles, or multi-tenant cluster scheduling (for cluster scale, pair this crate with `datafusion-distributed`). Note also that Tier 2 stateful `DEFINE` workloads (`4_stock_vshape_stateful_prev`, `5_time_window_funnel_stateful`) evaluate candidate transitions via DataFusion `PhysicalExpr` on 1-row slot batches rather than compiled scalar bytecode, leaving room for further optimization.
 
-Reproduce the Trino comparison locally:
+Reproduce the exact containerized Parquet comparison locally:
 
 ```sh
-docker run -d --name mr-trino-bench -p 18080:8080 trinodb/trino:latest
-cargo run --release --example bench_vs_trino
-docker rm -f mr-trino-bench
+./scripts/bench_vs_trino_docker.sh
 ```
 
 ### Adversarial backtracking microbenchmarks (Criterion)
