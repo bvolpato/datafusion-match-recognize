@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+# Calcite match.iq style patterns + Datadog rum-funnel multi-step drop-off ladder
+
+statement ok
+CREATE TABLE funnel_events (
+  session_id VARCHAR,
+  event_number INT,
+  ts BIGINT,
+  event_name VARCHAR,
+  flag0 INT
+) AS VALUES
+  -- s1: full 3-step conversion (view -> other -> cart -> other -> buy)
+  ('s1', 1, 1000, 'view', 1),
+  ('s1', 2, 1100, 'scroll', 0),
+  ('s1', 3, 1500, 'cart', 0),
+  ('s1', 4, 1800, 'scroll', 0),
+  ('s1', 5, 2200, 'buy', 0),
+  -- s2: drops off after step 2 (view -> cart)
+  ('s2', 1, 100, 'view', 1),
+  ('s2', 2, 350, 'cart', 0),
+  ('s2', 3, 500, 'exit', 0),
+  -- s3: drops off after step 1 (view only)
+  ('s3', 1, 50, 'view', 1),
+  ('s3', 2, 80, 'exit', 0),
+  -- s4: view fails flag0=1 filter, never starts funnel
+  ('s4', 1, 10, 'view', 0),
+  ('s4', 2, 20, 'cart', 0),
+  ('s4', 3, 30, 'buy', 0);
+
+# Datadog rum-funnel drop-off ladder pattern:
+#   ((s0 any0* s1 any1* s2) | (s0 any0* s1) | (s0))
+query TTTTIII
+SELECT * FROM funnel_events
+MATCH_RECOGNIZE (
+  PARTITION BY session_id
+  ORDER BY event_number
+  MEASURES
+    s0.session_id AS s0_matched,
+    s1.session_id AS s1_matched,
+    s2.session_id AS s2_matched,
+    CASE
+      WHEN s1.ts IS NOT NULL AND (FIRST(s1.ts) - FIRST(s0.ts)) <= 1000
+      THEN (FIRST(s1.ts) - FIRST(s0.ts))
+      ELSE NULL
+    END AS time_diff_s0_s1,
+    CASE
+      WHEN s2.ts IS NOT NULL AND (FIRST(s2.ts) - FIRST(s1.ts)) <= 1000
+      THEN (FIRST(s2.ts) - FIRST(s1.ts))
+      ELSE NULL
+    END AS time_diff_s1_s2,
+    CASE
+      WHEN s2.ts IS NOT NULL AND (FIRST(s2.ts) - FIRST(s0.ts)) <= 2000
+      THEN (FIRST(s2.ts) - FIRST(s0.ts))
+      ELSE NULL
+    END AS time_diff_funnel
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((s0 any_row0* s1 any_row1* s2) | (s0 any_row0* s1) | (s0))
+  DEFINE
+    s0 AS event_name = 'view' AND flag0 = 1,
+    any_row0 AS event_name <> 'cart',
+    s1 AS event_name = 'cart',
+    any_row1 AS event_name <> 'buy',
+    s2 AS event_name = 'buy'
+)
+ORDER BY session_id;
+----
+s1 s1 s1 s1 500 700 1200
+s2 s2 s2 NULL 250 NULL NULL
+s3 s3 NULL NULL NULL NULL NULL
+
+# Aggregate funnel conversion counts over MATCH_RECOGNIZE CTE
+query IIII
+WITH matched AS (
+  SELECT * FROM funnel_events
+  MATCH_RECOGNIZE (
+    PARTITION BY session_id
+    ORDER BY event_number
+    MEASURES
+      s0.session_id AS s0_matched,
+      s1.session_id AS s1_matched,
+      s2.session_id AS s2_matched,
+      CASE WHEN s2.ts IS NOT NULL THEN FIRST(s2.ts) - FIRST(s0.ts) ELSE NULL END AS dt
+    ONE ROW PER MATCH
+    PATTERN ((s0 any_row0* s1 any_row1* s2) | (s0 any_row0* s1) | (s0))
+    DEFINE
+      s0 AS event_name = 'view' AND flag0 = 1,
+      any_row0 AS event_name <> 'cart',
+      s1 AS event_name = 'cart',
+      any_row1 AS event_name <> 'buy',
+      s2 AS event_name = 'buy'
+  )
+)
+SELECT
+  COUNT(s0_matched) AS step0,
+  COUNT(s1_matched) AS step1,
+  COUNT(s2_matched) AS step2,
+  MIN(dt) AS min_dt
+FROM matched;
+----
+3 2 1 1200
+
+# Subquery + table alias scoping over MATCH_RECOGNIZE
+query TII
+SELECT mr.session_id, mr.mn, mr.step_cnt
+FROM funnel_events
+MATCH_RECOGNIZE (
+  PARTITION BY session_id
+  ORDER BY event_number
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    COUNT(*) AS step_cnt
+  ONE ROW PER MATCH
+  PATTERN (s0 any_row* s2)
+  DEFINE
+    s0 AS event_name = 'view' AND flag0 = 1,
+    s2 AS event_name = 'buy'
+) AS mr
+WHERE mr.session_id = 's1';
+----
+s1 1 5

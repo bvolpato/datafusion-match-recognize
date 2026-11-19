@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported SQL:2016 / Trino MEASURES, navigation, and scoped aggregate semantics
+
+statement ok
+CREATE TABLE ticks (id INT, sym VARCHAR, price INT) AS VALUES
+  (1, 'A', 10),
+  (2, 'B', 20),
+  (3, 'B', NULL),
+  (4, 'B', 40),
+  (5, 'C', 50);
+
+# 1. Scoped aggregates: COUNT(*), COUNT(b.*), COUNT(b.price), SUM, AVG, MIN, MAX
+query IIIIIRII
+SELECT * FROM ticks
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    COUNT(*) AS cnt_all,
+    COUNT(b.*) AS cnt_b_star,
+    COUNT(b.price) AS cnt_b_nonnull,
+    SUM(b.price) AS sum_b,
+    SUM(price) AS sum_all,
+    AVG(b.price) AS avg_b,
+    MIN(price) AS min_p,
+    MAX(b.price) AS max_b
+  ONE ROW PER MATCH
+  PATTERN (a b+ c)
+  DEFINE
+    a AS sym = 'A',
+    b AS sym = 'B',
+    c AS sym = 'C'
+);
+----
+5 3 2 60 120 30.0 10 40
+
+# 2. Navigation: FIRST, LAST with offsets, PREV and NEXT across partition boundaries
+query IIIIIIII
+SELECT * FROM ticks
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    FIRST(b.price) AS first_b,
+    FIRST(b.price, 2) AS third_b,
+    LAST(b.price) AS last_b,
+    LAST(b.price, 2) AS last_b_2,
+    PREV(FIRST(b.price), 1) AS prev_first_b,
+    NEXT(LAST(b.price), 1) AS next_last_b,
+    PREV(FIRST(a.price), 1) AS prev_before_start,
+    NEXT(LAST(c.price), 1) AS next_after_end
+  ONE ROW PER MATCH
+  PATTERN (a b+ c)
+  DEFINE
+    a AS sym = 'A',
+    b AS sym = 'B',
+    c AS sym = 'C'
+);
+----
+20 40 40 20 10 50 NULL NULL
+
+# 3. RUNNING semantics in ALL ROWS PER MATCH
+query IITIIII
+SELECT id, mn, cls, run_cnt, run_b_cnt, run_sum, run_last_b FROM ticks
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    CLASSIFIER() AS cls,
+    COUNT(*) AS run_cnt,
+    COUNT(b.*) AS run_b_cnt,
+    SUM(price) AS run_sum,
+    b.price AS run_last_b
+  ALL ROWS PER MATCH
+  PATTERN (a b+ c)
+  DEFINE
+    a AS sym = 'A',
+    b AS sym = 'B',
+    c AS sym = 'C'
+)
+ORDER BY id;
+----
+1 1 A 1 0 10 NULL
+2 1 B 2 1 30 20
+3 1 B 3 2 30 NULL
+4 1 B 4 3 70 40
+5 1 C 5 3 120 40
+
+# 4. Arbitrary scalar outer expressions over measure slots (COALESCE, CASE, arithmetic)
+query IIT
+SELECT * FROM ticks
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    FIRST(c.price) - FIRST(a.price) AS spread,
+    COALESCE(SUM(b.price), 0) + FIRST(a.price) AS adj_sum,
+    CASE WHEN COUNT(b.*) >= 2 THEN 'wide' ELSE 'narrow' END AS shape
+  ONE ROW PER MATCH
+  PATTERN (a b+ c)
+  DEFINE
+    a AS sym = 'A',
+    b AS sym = 'B',
+    c AS sym = 'C'
+);
+----
+40 70 wide
+
+# 5. Empty match measures: COUNT = 0, SUM/FIRST/LAST/CLASSIFIER = NULL, MATCH_NUMBER populated
+query IIITII
+WITH t(id, sym) AS (VALUES (1, 'X'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    COUNT(*) AS cnt_star,
+    COUNT(a.*) AS cnt_a,
+    CLASSIFIER() AS cls,
+    SUM(id) AS sum_id,
+    FIRST(a.id) AS first_a
+  ONE ROW PER MATCH
+  PATTERN (a*)
+  DEFINE a AS sym = 'A'
+);
+----
+1 0 0 NULL NULL NULL

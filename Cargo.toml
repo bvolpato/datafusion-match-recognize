@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "datafusion-match-recognize"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+license = "Apache-2.0"
+description = "SQL:2016 MATCH_RECOGNIZE (Row Pattern Recognition) extension for Apache DataFusion"
+repository = "https://github.com/bvolpato/datafusion-match-recognize"
+keywords = ["datafusion", "sql", "match_recognize", "pattern-matching", "arrow"]
+categories = ["database"]
+
+[features]
+default = ["proto"]
+proto = ["dep:datafusion-proto", "dep:prost", "dep:prost-build"]
+
+[dependencies]
+arrow = { version = "60.1.0", features = ["prettyprint", "chrono-tz"] }
+arrow-schema = "60.1.0"
+async-trait = "0.1.89"
+datafusion = { path = "../datafusion/datafusion/core" }
+datafusion-common = { path = "../datafusion/datafusion/common" }
+datafusion-expr = { path = "../datafusion/datafusion/expr", features = ["sql"] }
+datafusion-physical-expr = { path = "../datafusion/datafusion/physical-expr" }
+datafusion-physical-plan = { path = "../datafusion/datafusion/physical-plan" }
+datafusion-proto = { path = "../datafusion/datafusion/proto", optional = true }
+datafusion-sql = { path = "../datafusion/datafusion/sql" }
+futures = "0.3"
+prost = { version = "0.14.1", optional = true }
+sqlparser = { version = "0.63.0", default-features = false, features = ["std", "visitor"] }
+
+[build-dependencies]
+prost-build = { version = "0.14.6", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["async_tokio"] }
+proptest = "1.6"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "http2", "charset", "system-proxy"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqllogictest = "0.29.1"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[[bench]]
+name = "funnel_bench"
+harness = false

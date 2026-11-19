@@ -1,0 +1,15 @@
+datafusion-match-recognize
+Copyright 2026 Bruno Volpato and contributors
+
+This product includes software developed for the Apache DataFusion ecosystem
+(https://datafusion.apache.org/).
+
+Design inspiration and SQL:2016 test cases draw from:
+- Apache DataFusion (https://github.com/apache/datafusion), including
+  RelationPlanner (#18078) and prior MATCH_RECOGNIZE exploration (#16685)
+  by Geoffrey Claude, licensed under the Apache License, Version 2.0.
+- Trino (https://github.com/trinodb/trino), including row pattern bytecode
+  compilation design and TestRowPatternMatching test cases, licensed under
+  the Apache License, Version 2.0.
+- Apache Calcite (https://github.com/apache/calcite), including match.iq
+  SQL test cases, licensed under the Apache License, Version 2.0.

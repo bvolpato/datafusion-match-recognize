@@ -1,0 +1,287 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported SQL:2016 / Trino TestRowPatternMatching pattern & skip semantics
+
+statement ok
+CREATE TABLE events (id INT, part VARCHAR, tag VARCHAR, val INT) AS VALUES
+  (1, 'p1', 'A', 10),
+  (2, 'p1', 'B', 20),
+  (3, 'p1', 'B', 30),
+  (4, 'p1', 'C', 40),
+  (5, 'p1', 'A', 50),
+  (6, 'p1', 'C', 60),
+  (1, 'p2', 'B', 100),
+  (2, 'p2', 'A', 200),
+  (3, 'p2', 'C', 300);
+
+# 1. Basic greedy A B* C with ONE ROW PER MATCH
+query TIIII
+SELECT * FROM events
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    FIRST(a.id) AS first_a,
+    LAST(c.id) AS last_c,
+    COUNT(*) AS match_len
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a b* c)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B',
+    c AS tag = 'C'
+)
+ORDER BY part, mn;
+----
+p1 1 1 4 4
+p1 2 5 6 2
+p2 1 2 3 2
+
+# 2. Ordered alternation: A | A B must pick A (leftmost priority, NOT longest!)
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'B'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    FIRST(id) AS s_id,
+    LAST(id) AS e_id
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a | a b)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B'
+)
+ORDER BY mn;
+----
+1 1 1
+
+# 3. Greedy quantifier A+
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'A'), (3, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  PATTERN (a+)
+  DEFINE a AS tag = 'A'
+)
+ORDER BY mn;
+----
+1 1 3
+
+# 4. Bounded quantifiers {2,3}
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'A'), (3, 'A'), (4, 'A'), (5, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  PATTERN (a{2,3})
+  DEFINE a AS tag = 'A'
+)
+ORDER BY mn;
+----
+1 1 3
+2 4 5
+
+# 5. Anchors ^ and $
+query III
+WITH t(id, tag) AS (VALUES (1, 'X'), (2, 'A'), (3, 'A'), (4, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  PATTERN (^ a+)
+  DEFINE a AS tag = 'A'
+);
+----
+
+query III
+WITH t(id, tag) AS (VALUES (1, 'X'), (2, 'A'), (3, 'A'), (4, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  PATTERN (a+ $)
+  DEFINE a AS tag = 'A'
+);
+----
+1 2 4
+
+# 6. Implicit DEFINE (variable omitted from DEFINE defaults to TRUE)
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'X'), (3, 'Y'), (4, 'B'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(a.id) AS a_id, LAST(b.id) AS b_id
+  ONE ROW PER MATCH
+  PATTERN (a any_row* b)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B'
+);
+----
+1 1 4
+
+# 7. PERMUTE(a, b) with lexicographic priority
+query IITT
+WITH t(id, tag) AS (VALUES (1, 'B'), (2, 'A'), (3, 'A'), (4, 'B'))
+SELECT id, mn, cls, tag FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN (PERMUTE(a, b))
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B'
+)
+ORDER BY id;
+----
+1 1 B B
+2 1 A A
+3 2 A A
+4 2 B B
+
+# 8. AFTER MATCH SKIP TO NEXT ROW (overlapping matches)
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'A'), (3, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO NEXT ROW
+  PATTERN (a{2})
+  DEFINE a AS tag = 'A'
+)
+ORDER BY mn;
+----
+1 1 2
+2 2 3
+
+# 9. AFTER MATCH SKIP TO LAST b (skips to second match starting at row 3; row 3 has another b at row 4)
+query III
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'C'), (5, 'B'), (6, 'C'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s_id, LAST(id) AS e_id
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST b
+  PATTERN ((a | c) a* b c)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B',
+    c AS tag = 'C'
+)
+ORDER BY mn;
+----
+1 1 4
+2 4 6
+
+# 10. Pattern exclusion {- b -} with ALL ROWS PER MATCH
+query IITT
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'B'), (3, 'B'), (4, 'C'))
+SELECT id, mn, cls, tag FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN (a ({- b -})* c)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B',
+    c AS tag = 'C'
+)
+ORDER BY id;
+----
+1 1 A A
+4 1 C C
+
+# 11. Empty matches: SHOW EMPTY MATCHES vs OMIT EMPTY MATCHES
+query IIT
+WITH t(id, tag) AS (VALUES (1, 'X'), (2, 'A'), (3, 'X'))
+SELECT id, mn, cls FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH SHOW EMPTY MATCHES
+  PATTERN (a*)
+  DEFINE a AS tag = 'A'
+)
+ORDER BY mn;
+----
+1 1 NULL
+2 2 A
+3 3 NULL
+
+query IIT
+WITH t(id, tag) AS (VALUES (1, 'X'), (2, 'A'), (3, 'X'))
+SELECT id, mn, cls FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH OMIT EMPTY MATCHES
+  PATTERN (a*)
+  DEFINE a AS tag = 'A'
+)
+ORDER BY mn;
+----
+2 2 A
+
+# 12. ALL ROWS PER MATCH WITH UNMATCHED ROWS
+query IITT
+WITH t(id, tag) AS (VALUES (1, 'X'), (2, 'A'), (3, 'B'), (4, 'Y'))
+SELECT id, mn, cls, tag FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH WITH UNMATCHED ROWS
+  PATTERN (a b)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B'
+)
+ORDER BY id;
+----
+1 NULL NULL X
+2 1 A A
+3 1 B B
+4 NULL NULL Y
+
+# 13. Error cases: SKIP TO FIRST variable that matches at start row (infinite loop)
+statement error cannot skip to the first row
+WITH t(id, tag) AS (VALUES (1, 'A'), (2, 'B'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO FIRST a
+  PATTERN (a b)
+  DEFINE a AS tag = 'A', b AS tag = 'B'
+);
+
+# 14. Error case: exclusion with WITH UNMATCHED ROWS forbidden by SQL:2016
+statement error not allowed with ALL ROWS PER MATCH WITH UNMATCHED ROWS
+WITH t(id, tag) AS (VALUES (1, 'A'))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  ALL ROWS PER MATCH WITH UNMATCHED ROWS
+  PATTERN ({- a -})
+  DEFINE a AS tag = 'A'
+);

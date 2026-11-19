@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: datafusion-match-recognize
+      - uses: actions/checkout@v4
+        with:
+          repository: apache/datafusion
+          path: datafusion
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Format check
+        working-directory: datafusion-match-recognize
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        working-directory: datafusion-match-recognize
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Check without default features
+        working-directory: datafusion-match-recognize
+        run: cargo check --lib --no-default-features
+      - name: Unit, Oracle, SLT, Invariance, and Complexity Tests
+        working-directory: datafusion-match-recognize
+        run: cargo test
+      - name: Compile Benchmarks
+        working-directory: datafusion-match-recognize
+        run: cargo bench --no-run
+
+  trino-oracle:
+    runs-on: ubuntu-latest
+    services:
+      trino:
+        image: trinodb/trino:latest
+        ports:
+          - 18080:8080
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: datafusion-match-recognize
+      - uses: actions/checkout@v4
+        with:
+          repository: apache/datafusion
+          path: datafusion
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Wait for Trino
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:18080/v1/info | grep -q '"starting":false'; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Live Trino Differential Oracle
+        working-directory: datafusion-match-recognize
+        run: cargo test --test trino_oracle -- --ignored --nocapture
