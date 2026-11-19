@@ -114,6 +114,7 @@ message AggSlotProto {
   string udaf_name = 5;
   optional PhysicalNavKindProto arg_physical_nav = 6;
   uint32 arg_physical_offset = 7;
+  bool uses_match_metadata = 8;
 }
 
 message CurrentRowSlotProto {

@@ -740,6 +740,7 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
                     args: vec![],
                     distinct: false,
                     arg_physical_nav: None,
+                    uses_match_metadata: false,
                 },
             }],
         },
@@ -789,12 +790,12 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
     );
     assert!(
         formatted
-            .contains("| 2  | 20      | 30           | 2           | B             | B   | 20  |"),
+            .contains("| 2  | 20      | 30           | 2           | b             | B   | 20  |"),
         "got:\n{formatted}"
     );
     assert!(
         formatted
-            .contains("| 3  | 20      | 30           | 2           | C             | C   | 30  |"),
+            .contains("| 3  | 20      | 30           | 2           | c             | C   | 30  |"),
         "got:\n{formatted}"
     );
 

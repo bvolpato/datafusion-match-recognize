@@ -19,6 +19,7 @@ use datafusion_expr::function::AccumulatorArgs;
 use datafusion_physical_expr::PhysicalExpr;
 
 use crate::ast::{AggKind, EvalSemantics, LogicalNavKind, PhysicalNavKind, RowsPerMatch};
+use crate::logical::build_agg_metadata_arrow_schema;
 use crate::matcher::{FoundMatch, MatchStep, PartitionEvent, StatefulPredicateEvaluator};
 use crate::pattern::{Program, SymbolId, SymbolSet};
 
@@ -50,6 +51,7 @@ pub enum PhysicalMeasureSlotKind {
         args: Vec<Arc<dyn PhysicalExpr>>,
         distinct: bool,
         arg_physical_nav: Option<(PhysicalNavKind, u32)>,
+        uses_match_metadata: bool,
     },
     CurrentRow {
         inner_expr: Arc<dyn PhysicalExpr>,
@@ -94,15 +96,16 @@ struct CompiledStatefulSymbol {
 /// Evaluates Tier 2 stateful `DEFINE` predicates against a partition's precomputed slot arrays.
 pub struct PartitionStatefulEvaluator<'a> {
     program: &'a Program,
+    partition_batch: &'a RecordBatch,
     input_schema: SchemaRef,
     num_part_rows: usize,
     by_symbol: HashMap<SymbolId, CompiledStatefulSymbol>,
 }
 
 impl<'a> PartitionStatefulEvaluator<'a> {
-    /// Pre-evaluates all stateful `DEFINE` inner expressions once for `partition_batch`.
+    /// Pre-evaluates all non-metadata stateful `DEFINE` inner expressions once for `partition_batch`.
     pub fn try_new(
-        partition_batch: &RecordBatch,
+        partition_batch: &'a RecordBatch,
         program: &'a Program,
         stateful_defs: &[StatefulDefineInput<'_>],
     ) -> Result<Self> {
@@ -121,26 +124,35 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                                 .into_array(num_part_rows)?,
                         ]
                     }
-                    PhysicalMeasureSlotKind::Agg { agg_kind, args, .. } => {
-                        let mut evaluated = Vec::with_capacity(args.len());
-                        for (i, e) in args.iter().enumerate() {
-                            let raw = e.evaluate(partition_batch)?.into_array(num_part_rows)?;
-                            let pre = if i == 0 {
-                                match agg_kind {
-                                    AggKind::Avg => {
-                                        compute::cast(raw.as_ref(), &DataType::Float64)?
+                    PhysicalMeasureSlotKind::Agg {
+                        agg_kind,
+                        args,
+                        uses_match_metadata,
+                        ..
+                    } => {
+                        if *uses_match_metadata {
+                            vec![]
+                        } else {
+                            let mut evaluated = Vec::with_capacity(args.len());
+                            for (i, e) in args.iter().enumerate() {
+                                let raw = e.evaluate(partition_batch)?.into_array(num_part_rows)?;
+                                let pre = if i == 0 {
+                                    match agg_kind {
+                                        AggKind::Avg => {
+                                            compute::cast(raw.as_ref(), &DataType::Float64)?
+                                        }
+                                        AggKind::Sum if raw.data_type() != &slot.data_type => {
+                                            compute::cast(raw.as_ref(), &slot.data_type)?
+                                        }
+                                        _ => raw,
                                     }
-                                    AggKind::Sum if raw.data_type() != &slot.data_type => {
-                                        compute::cast(raw.as_ref(), &slot.data_type)?
-                                    }
-                                    _ => raw,
-                                }
-                            } else {
-                                raw
-                            };
-                            evaluated.push(pre);
+                                } else {
+                                    raw
+                                };
+                                evaluated.push(pre);
+                            }
+                            evaluated
                         }
-                        evaluated
                     }
                     PhysicalMeasureSlotKind::MatchNumber
                     | PhysicalMeasureSlotKind::Classifier { .. } => vec![],
@@ -160,6 +172,7 @@ impl<'a> PartitionStatefulEvaluator<'a> {
 
         Ok(Self {
             program,
+            partition_batch,
             input_schema: partition_batch.schema(),
             num_part_rows,
             by_symbol,
@@ -196,6 +209,8 @@ impl<'a> StatefulPredicateEvaluator for PartitionStatefulEvaluator<'a> {
         let mut slot_arrays: Vec<ArrayRef> = Vec::with_capacity(compiled.slots.len());
         for (slot, pre_args) in compiled.slots.iter().zip(&compiled.precomputed_args) {
             let scalar = eval_single_slot_scalar(
+                self.partition_batch,
+                tentative_steps,
                 tentative_steps,
                 candidate_match_number,
                 current_row,
@@ -229,7 +244,9 @@ impl<'a> StatefulPredicateEvaluator for PartitionStatefulEvaluator<'a> {
 
 #[allow(clippy::too_many_arguments)]
 fn eval_single_slot_scalar(
+    partition_batch: &RecordBatch,
     horizon: &[MatchStep],
+    full_steps: &[MatchStep],
     match_number: i64,
     current_row: usize,
     num_part_rows: usize,
@@ -250,6 +267,7 @@ fn eval_single_slot_scalar(
         } => {
             let val = eval_classifier_on_horizon(
                 horizon,
+                full_steps,
                 symbol_set.as_ref(),
                 *logical_nav,
                 *logical_offset as usize,
@@ -296,29 +314,51 @@ fn eval_single_slot_scalar(
             args,
             distinct,
             arg_physical_nav,
+            uses_match_metadata,
             ..
-        } => eval_single_agg_scalar(
-            horizon,
-            num_part_rows,
-            input_schema,
-            agg_kind,
-            symbol_set.as_ref(),
-            args,
-            *distinct,
-            *arg_physical_nav,
-            precomputed_args,
-            &slot.data_type,
-        ),
+        } => {
+            if *uses_match_metadata {
+                eval_metadata_agg_scalar(
+                    partition_batch,
+                    horizon,
+                    match_number,
+                    program,
+                    agg_kind,
+                    symbol_set.as_ref(),
+                    args,
+                    *distinct,
+                    *arg_physical_nav,
+                    &slot.data_type,
+                )
+            } else {
+                eval_single_agg_scalar(
+                    horizon,
+                    num_part_rows,
+                    input_schema,
+                    agg_kind,
+                    symbol_set.as_ref(),
+                    args,
+                    *distinct,
+                    *arg_physical_nav,
+                    precomputed_args,
+                    &slot.data_type,
+                )
+            }
+        }
     }
 }
 
 /// Evaluates `CLASSIFIER([sym])` with optional `FIRST`/`LAST` and `PREV`/`NEXT` navigation.
 ///
-/// Under SQL:2016 / Trino, `PREV(CLASSIFIER(), n)` navigates `n` rows backward in the partition
-/// relative to the base matched row and returns that row's classifier if it lies inside the
-/// match horizon, or `NULL` if it falls outside the match.
+/// Under SQL:2016 / Trino:
+/// - In `MEASURES`, the match is complete so `NEXT(CLASSIFIER(), n)` can access labels past the
+///   current row up to `full_steps.len()`.
+/// - In `DEFINE`, `full_steps == tentative_steps`, so `NEXT(CLASSIFIER(), n)` past the candidate
+///   row returns `NULL`.
+#[allow(clippy::too_many_arguments)]
 fn eval_classifier_on_horizon(
     horizon: &[MatchStep],
+    full_steps: &[MatchStep],
     symbol_set: Option<&SymbolSet>,
     logical_nav: Option<LogicalNavKind>,
     logical_offset: usize,
@@ -359,20 +399,115 @@ fn eval_classifier_on_horizon(
         }
     };
 
-    // Because steps in `horizon` are contiguous partition rows `[start_row .. start_row + len)`,
-    // shifting physically by `physical_offset` stays within the match iff the shifted index lies
-    // inside `0..horizon.len()`.
     let final_idx = match physical_nav {
         None => base_idx,
         Some(PhysicalNavKind::Prev) => base_idx.checked_sub(physical_offset)?,
         Some(PhysicalNavKind::Next) => {
             let t = base_idx.checked_add(physical_offset)?;
-            if t < horizon.len() { t } else { return None }
+            if t < full_steps.len() { t } else { return None }
         }
     };
 
-    let step = horizon.get(final_idx)?;
-    Some(program.id_to_symbol[step.sym as usize].to_ascii_uppercase())
+    let step = full_steps.get(final_idx)?;
+    Some(program.id_to_symbol[step.sym as usize].clone())
+}
+
+/// Evaluates an aggregate whose arguments reference runtime match metadata (`CLASSIFIER()` or
+/// `MATCH_NUMBER()`), such as `ARRAY_AGG(CLASSIFIER())` or `SUM(MATCH_NUMBER() * 100)`.
+#[allow(clippy::too_many_arguments)]
+fn eval_metadata_agg_scalar(
+    partition_batch: &RecordBatch,
+    horizon: &[MatchStep],
+    match_number: i64,
+    program: &Program,
+    agg_kind: &AggKind,
+    symbol_set: Option<&SymbolSet>,
+    arg_exprs: &[Arc<dyn PhysicalExpr>],
+    distinct: bool,
+    arg_physical_nav: Option<(PhysicalNavKind, u32)>,
+    result_type: &DataType,
+) -> Result<ScalarValue> {
+    let num_part_rows = partition_batch.num_rows();
+    let matched_steps: Vec<(Option<usize>, SymbolId)> = horizon
+        .iter()
+        .filter_map(|s| {
+            if let Some(set) = symbol_set
+                && !set.contains(s.sym)
+            {
+                return None;
+            }
+            let row_idx = match arg_physical_nav {
+                None => Some(s.row_idx),
+                Some((kind, off)) => {
+                    navigate_physical(s.row_idx, Some(kind), off as usize, num_part_rows)
+                }
+            };
+            Some((row_idx, s.sym))
+        })
+        .collect();
+
+    let n = matched_steps.len();
+    let ext_schema = Arc::new(build_agg_metadata_arrow_schema(
+        partition_batch.schema().as_ref(),
+    ));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(ext_schema.fields().len());
+    let take_idx = UInt32Array::from_iter(matched_steps.iter().map(|(r, _)| r.map(|i| i as u32)));
+    for col in partition_batch.columns() {
+        cols.push(compute::take(col.as_ref(), &take_idx, None)?);
+    }
+
+    let mut cls_builder = StringBuilder::with_capacity(n, n * 8);
+    let mut mn_builder = Int64Builder::with_capacity(n);
+    for (_, sym) in &matched_steps {
+        cls_builder.append_value(&program.id_to_symbol[*sym as usize]);
+        mn_builder.append_value(match_number);
+    }
+    cols.push(Arc::new(cls_builder.finish()));
+    cols.push(Arc::new(mn_builder.finish()));
+
+    let horizon_batch = RecordBatch::try_new_with_options(
+        Arc::clone(&ext_schema),
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(n)),
+    )?;
+
+    let mut evaluated_args = Vec::with_capacity(arg_exprs.len());
+    for (i, expr) in arg_exprs.iter().enumerate() {
+        let raw = expr.evaluate(&horizon_batch)?.into_array(n)?;
+        let pre = if i == 0 {
+            match agg_kind {
+                AggKind::Avg => compute::cast(raw.as_ref(), &DataType::Float64)?,
+                AggKind::Sum if raw.data_type() != result_type => {
+                    compute::cast(raw.as_ref(), result_type)?
+                }
+                _ => raw,
+            }
+        } else {
+            raw
+        };
+        evaluated_args.push(pre);
+    }
+
+    // Build synthetic 0..n steps so eval_single_agg_scalar indexes directly into `evaluated_args`.
+    let local_steps: Vec<MatchStep> = (0..n)
+        .map(|i| MatchStep {
+            row_idx: i,
+            sym: 0,
+            excluded: false,
+        })
+        .collect();
+    eval_single_agg_scalar(
+        &local_steps,
+        n,
+        ext_schema.as_ref(),
+        agg_kind,
+        None,
+        arg_exprs,
+        distinct,
+        None,
+        &evaluated_args,
+        result_type,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -806,6 +941,7 @@ fn evaluate_slot(
                             let horizon = horizon_steps(found, *step_pos, slot.semantics);
                             match eval_classifier_on_horizon(
                                 horizon,
+                                &found.steps,
                                 symbol_set.as_ref(),
                                 *logical_nav,
                                 *logical_offset as usize,
@@ -889,18 +1025,61 @@ fn evaluate_slot(
             args,
             distinct,
             arg_physical_nav,
+            uses_match_metadata,
             ..
-        } => evaluate_agg_slot(
-            partition_batch,
-            emitted,
-            slot.semantics,
-            agg_kind,
-            symbol_set.as_ref(),
-            args,
-            *distinct,
-            *arg_physical_nav,
-            &slot.data_type,
-        ),
+        } => {
+            if *uses_match_metadata {
+                let mut scalars = Vec::with_capacity(out_len);
+                for row in emitted {
+                    match row {
+                        EmitRow::Unmatched { .. } => {
+                            scalars.push(ScalarValue::try_from(&slot.data_type)?);
+                        }
+                        EmitRow::Matched {
+                            found,
+                            step_pos,
+                            is_empty_match,
+                            ..
+                        } => {
+                            if *is_empty_match {
+                                if matches!(agg_kind, AggKind::Count) {
+                                    scalars.push(ScalarValue::Int64(Some(0)));
+                                } else {
+                                    scalars.push(ScalarValue::try_from(&slot.data_type)?);
+                                }
+                            } else {
+                                let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                                scalars.push(eval_metadata_agg_scalar(
+                                    partition_batch,
+                                    horizon,
+                                    found.match_number,
+                                    program,
+                                    agg_kind,
+                                    symbol_set.as_ref(),
+                                    args,
+                                    *distinct,
+                                    *arg_physical_nav,
+                                    &slot.data_type,
+                                )?);
+                            }
+                        }
+                    }
+                }
+                ScalarValue::iter_to_array(scalars)
+            } else {
+                evaluate_agg_slot(
+                    partition_batch,
+                    emitted,
+                    slot.semantics,
+                    agg_kind,
+                    symbol_set.as_ref(),
+                    args,
+                    *distinct,
+                    *arg_physical_nav,
+                    &slot.data_type,
+                )
+            }
+        }
     }
 }
 

@@ -88,6 +88,7 @@ MATCH_RECOGNIZE (
 1 A C B B NULL 10 40 NULL NULL 30 70
 
 # 4. ALL ROWS PER MATCH with PREV(CLASSIFIER()) and NEXT(CLASSIFIER())
+# Per SQL:2016 / Trino, NEXT(CLASSIFIER()) in MEASURES sees labels past current row within the completed match.
 query ITTT
 SELECT id, cls, p_cls, n_cls FROM seq
 MATCH_RECOGNIZE (
@@ -105,9 +106,9 @@ MATCH_RECOGNIZE (
 )
 ORDER BY id;
 ----
-1 A NULL NULL
-2 B A NULL
-3 B B NULL
+1 A NULL B
+2 B A B
+3 B B C
 4 C B NULL
 
 # 5. Arbitrary DataFusion AggregateUDFs inside MEASURES (ARRAY_AGG, STRING_AGG, STDDEV_SAMP, BOOL_AND)

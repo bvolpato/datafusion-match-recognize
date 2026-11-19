@@ -78,6 +78,10 @@ fn format_json_cell(v: serde_json::Value) -> String {
             }
         }
         serde_json::Value::String(s) => s,
+        serde_json::Value::Array(items) => {
+            let formatted: Vec<String> = items.into_iter().map(format_json_cell).collect();
+            format!("[{}]", formatted.join(", "))
+        }
         other => other.to_string(),
     }
 }
@@ -842,6 +846,152 @@ async fn test_live_trino_differential_oracle() {
             SELECT m1.p, m1.s_id, m2.e_id, m2.cnt
             FROM m1 JOIN m2 ON m1.p = m2.p
             ORDER BY m1.p
+            "#,
+        ),
+        (
+            "trino_back_reference_multi_symbol",
+            r#"
+            WITH t(value) AS (VALUES (1), (2), (3), (4), (5), (6))
+            SELECT value, classy, defining_condition FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY value
+                MEASURES
+                    CLASSIFIER() AS classy,
+                    PREV(LAST(A.value), 3) + FIRST(A.value) + PREV(LAST(B.value), 2) AS defining_condition
+                ALL ROWS PER MATCH
+                PATTERN ((A | B)* X)
+                DEFINE X AS value = PREV(LAST(A.value), 3) + FIRST(A.value) + PREV(LAST(B.value), 2)
+            )
+            ORDER BY value
+            "#,
+        ),
+        (
+            "trino_classifier_past_current_row_measures",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+            SELECT m.id, m.value, m.label, m.next_label FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    CLASSIFIER() AS label,
+                    NEXT(CLASSIFIER()) AS next_label
+                ALL ROWS PER MATCH
+                PATTERN (A B+ C+)
+                DEFINE
+                    B AS B.value < PREV(B.value),
+                    C AS C.value > PREV(C.value)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_classifier_past_current_row_define",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+            SELECT m.id, m.val FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES value AS val
+                ALL ROWS PER MATCH
+                PATTERN (A+)
+                DEFINE A AS NEXT(CLASSIFIER()) = 'A'
+            ) AS m
+            "#,
+        ),
+        (
+            "trino_case_sensitive_labels",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+            SELECT m.id, m.label FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES CLASSIFIER() AS label
+                ALL ROWS PER MATCH
+                PATTERN (a "b"+ C+)
+                DEFINE
+                    "b" AS "b".value < PREV("b".value),
+                    C AS C.value > PREV(C.value)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_balancing_sums",
+            r#"
+            WITH t(id, value) AS (
+                VALUES (1, 4), (2, 6), (3, 10), (4, 1), (5, 1), (6, 1), (7, 10), (8, 5), (9, 1)
+            )
+            SELECT m.id, m.classy, m.running_sum_a, m.running_sum_b FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    sum(A.value) AS running_sum_a,
+                    sum(B.value) AS running_sum_b,
+                    CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B)*)
+                DEFINE A AS sum(A.value) - A.value <= sum(B.value)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_period_length",
+            r#"
+            WITH t(user_id, minute_of_the_day) AS (
+                VALUES (1, 3), (1, 4), (1, 5), (1, 8), (1, 9), (2, 2), (2, 3), (2, 4)
+            )
+            SELECT user_id, CAST(periods_total AS INTEGER) AS pt FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY user_id
+                ORDER BY minute_of_the_day
+                MEASURES COALESCE(sum(C.minute_of_the_day) - sum(A.minute_of_the_day), 0) AS periods_total
+                ONE ROW PER MATCH
+                PATTERN ((A B* C | D)*)
+                DEFINE
+                    B AS minute_of_the_day = PREV(minute_of_the_day) + 1,
+                    C AS minute_of_the_day = PREV(minute_of_the_day) + 1
+            )
+            ORDER BY user_id
+            "#,
+        ),
+        (
+            "trino_set_partitioning_array_agg_classifier",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8))
+            SELECT m.id, m.running_labels FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES array_agg(CLASSIFIER()) AS running_labels
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (^ (A | B)* (LAST_A | LAST_B) $)
+                DEFINE
+                    LAST_A AS sum(A.id) + id = sum(B.id),
+                    LAST_B AS sum(B.id) + id = sum(A.id)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_multiple_aggs_in_define",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8))
+            SELECT m.match_no, m.labels FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    MATCH_NUMBER() AS match_no,
+                    array_agg(CLASSIFIER()) AS labels
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B){4})
+                DEFINE
+                    A AS max(id - 2 * MATCH_NUMBER()) > 1 AND max(CLASSIFIER()) = 'B',
+                    B AS min(lower(CLASSIFIER())) = 'b' OR min(MATCH_NUMBER() + 100) < 0
+            ) AS m
+            ORDER BY m.match_no
             "#,
         ),
     ];

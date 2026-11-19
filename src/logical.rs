@@ -157,6 +157,36 @@ pub fn build_slot_schema(
     DFSchema::try_from(Schema::new(fields))
 }
 
+/// Synthetic column name for `CLASSIFIER()` inside runtime-evaluated aggregate arguments.
+pub const AGG_META_CLASSIFIER_COL: &str = "__mr_agg_classifier";
+/// Synthetic column name for `MATCH_NUMBER()` inside runtime-evaluated aggregate arguments.
+pub const AGG_META_MATCH_NUMBER_COL: &str = "__mr_agg_match_number";
+
+/// Builds the extended `DFSchema` (`input_schema` + `__mr_agg_classifier` + `__mr_agg_match_number`)
+/// used to plan and type-check aggregate arguments referencing `CLASSIFIER()` or `MATCH_NUMBER()`.
+pub fn build_agg_metadata_dfschema(input_schema: &DFSchema) -> Result<DFSchema> {
+    let mut fields: Vec<Field> = input_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new(AGG_META_CLASSIFIER_COL, DataType::Utf8, true));
+    fields.push(Field::new(AGG_META_MATCH_NUMBER_COL, DataType::Int64, true));
+    DFSchema::try_from(Schema::new(fields))
+}
+
+/// Builds the extended Arrow `Schema` matching [`build_agg_metadata_dfschema`].
+pub fn build_agg_metadata_arrow_schema(input_schema: &Schema) -> Schema {
+    let mut fields: Vec<Field> = input_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    fields.push(Field::new(AGG_META_CLASSIFIER_COL, DataType::Utf8, true));
+    fields.push(Field::new(AGG_META_MATCH_NUMBER_COL, DataType::Int64, true));
+    Schema::new(fields)
+}
+
 /// Infers the Arrow `(DataType, nullable)` for a single [`MeasureSlot`].
 pub fn slot_data_type_and_nullability(
     input_schema: &DFSchema,
@@ -175,41 +205,58 @@ pub fn slot_data_type_and_nullability(
             let dt = inner_expr.get_type(input_schema)?;
             Ok((dt, true))
         }
-        MeasureSlotKind::Agg { agg_kind, args, .. } => match agg_kind {
-            AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
-                Ok((DataType::Int64, unmatched))
+        MeasureSlotKind::Agg {
+            agg_kind,
+            args,
+            uses_match_metadata,
+            ..
+        } => {
+            let meta_schema_owned;
+            let eval_schema: &DFSchema = if *uses_match_metadata {
+                meta_schema_owned = build_agg_metadata_dfschema(input_schema)?;
+                &meta_schema_owned
+            } else {
+                input_schema
+            };
+            match agg_kind {
+                AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
+                    Ok((DataType::Int64, unmatched))
+                }
+                AggKind::Sum => {
+                    let expr = args.first().ok_or_else(|| {
+                        plan_datafusion_err!("SUM in MEASURES/DEFINE requires an input expression")
+                    })?;
+                    let inner_dt = expr.get_type(eval_schema)?;
+                    Ok((sum_result_type(&inner_dt)?, true))
+                }
+                AggKind::Avg => Ok((DataType::Float64, true)),
+                AggKind::Min | AggKind::Max => {
+                    let expr = args.first().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "MIN/MAX in MEASURES/DEFINE requires an input expression"
+                        )
+                    })?;
+                    let inner_dt = expr.get_type(eval_schema)?;
+                    Ok((inner_dt, true))
+                }
+                AggKind::Udaf(udaf) => {
+                    let raw_fields: Vec<FieldRef> = args
+                        .iter()
+                        .map(|a| {
+                            let (_, f) = a.to_field(eval_schema)?;
+                            Ok(f)
+                        })
+                        .collect::<Result<_>>()?;
+                    let coerced_fields =
+                        datafusion_expr::type_coercion::functions::fields_with_udf(
+                            &raw_fields,
+                            udaf.as_ref(),
+                        )?;
+                    let ret = udaf.return_field(&coerced_fields)?;
+                    Ok((ret.data_type().clone(), true))
+                }
             }
-            AggKind::Sum => {
-                let expr = args.first().ok_or_else(|| {
-                    plan_datafusion_err!("SUM in MEASURES/DEFINE requires an input expression")
-                })?;
-                let inner_dt = expr.get_type(input_schema)?;
-                Ok((sum_result_type(&inner_dt)?, true))
-            }
-            AggKind::Avg => Ok((DataType::Float64, true)),
-            AggKind::Min | AggKind::Max => {
-                let expr = args.first().ok_or_else(|| {
-                    plan_datafusion_err!("MIN/MAX in MEASURES/DEFINE requires an input expression")
-                })?;
-                let inner_dt = expr.get_type(input_schema)?;
-                Ok((inner_dt, true))
-            }
-            AggKind::Udaf(udaf) => {
-                let raw_fields: Vec<FieldRef> = args
-                    .iter()
-                    .map(|a| {
-                        let (_, f) = a.to_field(input_schema)?;
-                        Ok(f)
-                    })
-                    .collect::<Result<_>>()?;
-                let coerced_fields = datafusion_expr::type_coercion::functions::fields_with_udf(
-                    &raw_fields,
-                    udaf.as_ref(),
-                )?;
-                let ret = udaf.return_field(&coerced_fields)?;
-                Ok((ret.data_type().clone(), true))
-            }
-        },
+        }
     }
 }
 
@@ -294,8 +341,16 @@ fn push_slot_exprs(slots: &[MeasureSlot], exprs: &mut Vec<Expr>) {
             | MeasureSlotKind::CurrentRow { inner_expr } => {
                 exprs.push(inner_expr.clone());
             }
-            MeasureSlotKind::Agg { args, .. } => {
-                exprs.extend(args.iter().cloned());
+            MeasureSlotKind::Agg {
+                args,
+                uses_match_metadata,
+                ..
+            } => {
+                // Skip expressions referencing synthetic match-metadata columns so DataFusion's
+                // input-schema analyzer rules do not complain about `__mr_agg_classifier`.
+                if !uses_match_metadata {
+                    exprs.extend(args.iter().cloned());
+                }
             }
             MeasureSlotKind::MatchNumber | MeasureSlotKind::Classifier { .. } => {}
         }
@@ -337,19 +392,26 @@ fn rebuild_slots_from_iter(
                 args,
                 distinct,
                 arg_physical_nav,
+                uses_match_metadata,
             } => {
-                let mut new_args = Vec::with_capacity(args.len());
-                for _ in 0..args.len() {
-                    new_args.push(iter.next().ok_or_else(|| {
-                        plan_datafusion_err!("MatchRecognize: missing agg slot expression")
-                    })?);
-                }
+                let new_args = if *uses_match_metadata {
+                    args.clone()
+                } else {
+                    let mut v = Vec::with_capacity(args.len());
+                    for _ in 0..args.len() {
+                        v.push(iter.next().ok_or_else(|| {
+                            plan_datafusion_err!("MatchRecognize: missing agg slot expression")
+                        })?);
+                    }
+                    v
+                };
                 MeasureSlotKind::Agg {
                     agg_kind: agg_kind.clone(),
                     symbol: symbol.clone(),
                     args: new_args,
                     distinct: *distinct,
                     arg_physical_nav: *arg_physical_nav,
+                    uses_match_metadata: *uses_match_metadata,
                 }
             }
             other => other.clone(),
@@ -532,12 +594,45 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         let input_schema = self.input.schema();
         let mut needed: HashSet<usize> = HashSet::new();
 
-        for expr in self.expressions() {
+        // Include both standard expressions and any metadata-bearing aggregate args (ignoring
+        // the synthetic `__mr_agg_*` columns when mapping back to input_schema).
+        let mut all_exprs = self.expressions();
+        for def in &self.definitions {
+            if let SymbolDefKind::Stateful { slots, .. } = &def.kind {
+                for slot in slots {
+                    if let MeasureSlotKind::Agg {
+                        args,
+                        uses_match_metadata: true,
+                        ..
+                    } = &slot.kind
+                    {
+                        all_exprs.extend(args.iter().cloned());
+                    }
+                }
+            }
+        }
+        for m in &self.measures {
+            for slot in &m.slots {
+                if let MeasureSlotKind::Agg {
+                    args,
+                    uses_match_metadata: true,
+                    ..
+                } = &slot.kind
+                {
+                    all_exprs.extend(args.iter().cloned());
+                }
+            }
+        }
+
+        for expr in all_exprs {
             let mut cols = HashSet::new();
             if expr_to_columns(&strip_outer_reference(expr), &mut cols).is_err() {
                 return None;
             }
             for col in cols {
+                if col.name == AGG_META_CLASSIFIER_COL || col.name == AGG_META_MATCH_NUMBER_COL {
+                    continue;
+                }
                 if let Ok(idx) = input_schema.index_of_column(&col) {
                     needed.insert(idx);
                 } else {

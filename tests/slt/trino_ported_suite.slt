@@ -1,0 +1,384 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported directly from Trino's TestRowPatternMatching.java and
+# TestAggregationsInRowPatternMatching.java, plus Apache Calcite match.iq.
+
+# 1. Trino testBackReference: stateful DEFINE forcing backtracking across implicit-TRUE alternation
+query IT
+WITH t(value) AS (VALUES (1), (1))
+SELECT value, classy FROM t
+MATCH_RECOGNIZE (
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)* X)
+  DEFINE X AS value = A.value
+);
+----
+1 A
+1 X
+
+query IT
+WITH t(value) AS (VALUES (1), (1))
+SELECT value, classy FROM t
+MATCH_RECOGNIZE (
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)* X)
+  DEFINE X AS value = B.value
+);
+----
+1 B
+1 X
+
+query ITI
+WITH t(value) AS (VALUES (1), (2), (3), (4), (5), (6))
+SELECT value, classy, defining_condition FROM t
+MATCH_RECOGNIZE (
+  ORDER BY value
+  MEASURES
+    CLASSIFIER() AS classy,
+    PREV(LAST(A.value), 3) + FIRST(A.value) + PREV(LAST(B.value), 2) AS defining_condition
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)* X)
+  DEFINE X AS value = PREV(LAST(A.value), 3) + FIRST(A.value) + PREV(LAST(B.value), 2)
+)
+ORDER BY value;
+----
+1 B NULL
+2 A NULL
+3 A NULL
+4 A NULL
+5 B 6
+6 X 6
+
+# 2. Trino testEmptyCycle: quantified anchors ^*, ^+, $*, $+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.match_no, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES match_number() AS match_no, LAST(value) AS val, classifier() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (^* | B)
+  DEFINE B AS B.value < PREV(B.value)
+) AS m
+ORDER BY m.id;
+----
+1 1 NULL NULL
+2 2 NULL NULL
+3 3 NULL NULL
+4 4 NULL NULL
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.match_no, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES match_number() AS match_no, LAST(value) AS val, classifier() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (^+ | B)
+  DEFINE B AS B.value < PREV(B.value)
+) AS m
+ORDER BY m.id;
+----
+1 1 NULL NULL
+2 2 80 B
+3 3 70 B
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.match_no, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES match_number() AS match_no, LAST(value) AS val, classifier() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ($+ | B)
+  DEFINE B AS B.value < PREV(B.value)
+) AS m
+ORDER BY m.id;
+----
+2 1 80 B
+3 2 70 B
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.match_no, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES match_number() AS match_no, LAST(value) AS val, classifier() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (B A $+)
+  DEFINE B AS B.value < PREV(B.value)
+) AS m
+ORDER BY m.id;
+----
+3 1 70 B
+4 1 70 A
+
+# 3. Trino testClassifierFunctionPastCurrentRow: NEXT(CLASSIFIER()) in MEASURES vs DEFINE
+query IITT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+SELECT m.id, m.value, m.label, m.next_label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() AS label,
+    NEXT(CLASSIFIER()) AS next_label
+  ALL ROWS PER MATCH
+  PATTERN (A B+ C+)
+  DEFINE
+    B AS B.value < PREV(B.value),
+    C AS C.value > PREV(C.value)
+) AS m
+ORDER BY m.id;
+----
+1 90 A B
+2 80 B B
+3 70 B C
+4 80 C NULL
+
+query II
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+SELECT m.id, m.val FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES value AS val
+  ALL ROWS PER MATCH
+  PATTERN (A+)
+  DEFINE A AS NEXT(CLASSIFIER()) = 'A'
+) AS m;
+----
+
+# 4. Trino testCaseSensitiveLabels: unquoted folds to UPPER, quoted preserves exact case
+query IT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 80))
+SELECT m.id, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  PATTERN (a "b"+ C+)
+  DEFINE
+    "b" AS "b".value < PREV("b".value),
+    C AS C.value > PREV(C.value)
+) AS m
+ORDER BY m.id;
+----
+1 A
+2 b
+3 b
+4 C
+
+# 5. Trino testOutputLayout: exact column ordering (PARTITION BY, ORDER BY, MEASURES, remaining)
+query TTTI
+WITH t(id, part, value) AS (VALUES ('ordering', 'partitioning', 90))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN (A)
+  DEFINE A AS true
+) AS m;
+----
+partitioning ordering A 90
+
+query TT
+WITH t(id, part, value) AS (VALUES ('ordering', 'partitioning', 90))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES CLASSIFIER() AS classy
+  ONE ROW PER MATCH
+  PATTERN (A)
+  DEFINE A AS true
+) AS m;
+----
+partitioning A
+
+# 6. Trino testMultipleMatchRecognize: cross-joining three MATCH_RECOGNIZE relations
+query TTT
+WITH t1(id) AS (VALUES (1), (2), (3)),
+     t2(id) AS (VALUES (10), (20)),
+     t3(id) AS (VALUES (100))
+SELECT first.classy, second.classy, third.classy
+FROM t1 MATCH_RECOGNIZE (
+  ORDER BY id MEASURES CLASSIFIER() AS classy ALL ROWS PER MATCH PATTERN (A) DEFINE A AS true
+) AS first,
+t2 MATCH_RECOGNIZE (
+  ORDER BY id MEASURES CLASSIFIER() AS classy ALL ROWS PER MATCH PATTERN (B) DEFINE B AS true
+) AS second,
+t3 MATCH_RECOGNIZE (
+  ORDER BY id MEASURES CLASSIFIER() AS classy ALL ROWS PER MATCH PATTERN (C) DEFINE C AS true
+) AS third;
+----
+A B C
+A B C
+A B C
+A B C
+A B C
+A B C
+
+# 7. Trino testBalancingSums: stateful running SUMs across alternating labels
+query ITII
+WITH t(id, value) AS (
+  VALUES (1, 4), (2, 6), (3, 10), (4, 1), (5, 1), (6, 1), (7, 10), (8, 5), (9, 1)
+)
+SELECT m.id, m.classy, m.running_sum_a, m.running_sum_b FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    sum(A.value) AS running_sum_a,
+    sum(B.value) AS running_sum_b,
+    CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)*)
+  DEFINE A AS sum(A.value) - A.value <= sum(B.value)
+) AS m
+ORDER BY m.id;
+----
+1 B NULL 4
+2 A 6 4
+3 B 6 14
+4 A 7 14
+5 A 8 14
+6 A 9 14
+7 A 19 14
+8 B 19 19
+9 A 20 19
+
+# 8. Trino testPeriodLength (StackOverflow heartbeat session time calculation)
+query II
+WITH t(user_id, minute_of_the_day) AS (
+  VALUES (1, 3), (1, 4), (1, 5), (1, 8), (1, 9), (2, 2), (2, 3), (2, 4)
+)
+SELECT user_id, CAST(periods_total AS INT) FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY user_id
+  ORDER BY minute_of_the_day
+  MEASURES COALESCE(sum(C.minute_of_the_day) - sum(A.minute_of_the_day), 0) AS periods_total
+  ONE ROW PER MATCH
+  PATTERN ((A B* C | D)*)
+  DEFINE
+    B AS minute_of_the_day = PREV(minute_of_the_day) + 1,
+    C AS minute_of_the_day = PREV(minute_of_the_day) + 1
+)
+ORDER BY user_id;
+----
+1 3
+2 2
+
+# 9. Trino testSetPartitioning: backtracking NP-style 2-subset equal-sum partition + ARRAY_AGG(CLASSIFIER())
+query IT
+WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8))
+SELECT m.id, m.running_labels FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES array_agg(CLASSIFIER()) AS running_labels
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (^ (A | B)* (LAST_A | LAST_B) $)
+  DEFINE
+    LAST_A AS sum(A.id) + id = sum(B.id),
+    LAST_B AS sum(B.id) + id = sum(A.id)
+) AS m
+ORDER BY m.id;
+----
+1 [A]
+2 [A, A]
+3 [A, A, A]
+4 [A, A, A, A]
+5 [A, A, A, A, B]
+6 [A, A, A, A, B, B]
+7 [A, A, A, A, B, B, B]
+8 [A, A, A, A, B, B, B, LAST_A]
+
+# 10. Trino testForkingThreads: ARRAY_AGG(CLASSIFIER()) inside DEFINE
+query IT
+WITH t(id) AS (VALUES (1), (2), (3), (4))
+SELECT m.id, m.running_labels FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES array_agg(CLASSIFIER()) AS running_labels
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B | C)* X)
+  DEFINE X AS array_agg(CLASSIFIER()) = ['C', 'A', 'B', 'X']
+) AS m
+ORDER BY m.id;
+----
+1 [C]
+2 [C, A]
+3 [C, A, B]
+4 [C, A, B, X]
+
+# 11. Trino testMultipleAggregationsInDefine: runtime-evaluated MATCH_NUMBER() and LOWER(CLASSIFIER()) inside DEFINE aggs
+query IT
+WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8))
+SELECT m.match_no, m.labels FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS match_no,
+    array_agg(CLASSIFIER()) AS labels
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B){4})
+  DEFINE
+    A AS max(id - 2 * MATCH_NUMBER()) > 1 AND max(CLASSIFIER()) = 'B',
+    B AS min(lower(CLASSIFIER())) = 'b' OR min(MATCH_NUMBER() + 100) < 0
+) AS m
+ORDER BY m.match_no;
+----
+1 [B, B, B, A]
+2 [B, A, A, A]
+
+# 12. Apache Calcite match.iq: SCOTT emp running string-length packing
+query TIIIT
+WITH emp(deptno, empno, ename) AS (
+  VALUES
+    (10, 7782, 'CLARK'),
+    (10, 7839, 'KING'),
+    (20, 7369, 'SMITH'),
+    (20, 7566, 'JONES'),
+    (20, 7788, 'SCOTT'),
+    (20, 7876, 'ADAMS'),
+    (30, 7499, 'ALLEN'),
+    (30, 7521, 'WARD'),
+    (30, 7654, 'MARTIN'),
+    (30, 7698, 'BLAKE'),
+    (30, 7844, 'TURNER'),
+    (30, 7900, 'JAMES')
+)
+SELECT deptno, empno, mno, pattern_vrb, ename FROM emp
+MATCH_RECOGNIZE (
+  PARTITION BY deptno
+  ORDER BY empno
+  MEASURES
+    match_number() AS mno,
+    classifier() AS pattern_vrb
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (S B+)
+  DEFINE B AS CHAR_LENGTH(S.ename) + SUM(CHAR_LENGTH(b.ename || ';')) + CHAR_LENGTH(';') <= 15
+)
+ORDER BY deptno, empno;
+----
+10 7782 1 S CLARK
+10 7839 1 B KING
+20 7369 1 S SMITH
+20 7566 1 B JONES
+20 7788 2 S SCOTT
+20 7876 2 B ADAMS
+30 7499 1 S ALLEN
+30 7521 1 B WARD
+30 7654 2 S MARTIN
+30 7698 2 B BLAKE
+30 7844 3 S TURNER
+30 7900 3 B JAMES

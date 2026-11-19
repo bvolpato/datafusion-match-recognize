@@ -48,7 +48,9 @@ use crate::ast::{
     AfterMatchSkip, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, Pattern, RowsPerMatch,
     SubsetDef, SymbolDefKind,
 };
-use crate::logical::{MatchRecognizeNode, slot_data_type_and_nullability};
+use crate::logical::{
+    MatchRecognizeNode, build_agg_metadata_dfschema, slot_data_type_and_nullability,
+};
 use crate::matcher::{Matcher, PartitionSymbols};
 use crate::measures::{
     PartitionStatefulEvaluator, PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind,
@@ -184,10 +186,18 @@ fn compile_physical_slots(
                 args,
                 distinct,
                 arg_physical_nav,
+                uses_match_metadata,
             } => {
+                let meta_schema_owned;
+                let eval_schema: &DFSchema = if *uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_dfschema(input_dfschema)?;
+                    &meta_schema_owned
+                } else {
+                    input_dfschema
+                };
                 let phys_args = args
                     .iter()
-                    .map(|e| create_physical_expr(e, input_dfschema, exec_props, planning_ctx))
+                    .map(|e| create_physical_expr(e, eval_schema, exec_props, planning_ctx))
                     .collect::<Result<Vec<_>>>()?;
                 PhysicalMeasureSlotKind::Agg {
                     agg_kind: agg_kind.clone(),
@@ -196,6 +206,7 @@ fn compile_physical_slots(
                     args: phys_args,
                     distinct: *distinct,
                     arg_physical_nav: *arg_physical_nav,
+                    uses_match_metadata: *uses_match_metadata,
                 }
             }
             MeasureSlotKind::CurrentRow { inner_expr } => {

@@ -26,8 +26,22 @@ use crate::ast::{
     MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SymbolDef,
     SymbolDefKind, SymbolRef,
 };
-use crate::logical::{MatchRecognizeNode, build_slot_schema};
+use crate::logical::{
+    AGG_META_CLASSIFIER_COL, AGG_META_MATCH_NUMBER_COL, MatchRecognizeNode,
+    build_agg_metadata_dfschema, build_slot_schema,
+};
 use crate::pattern::Program;
+
+/// Normalizes a SQL:2016 row pattern variable identifier:
+/// - Unquoted identifiers fold to uppercase (`a` -> `"A"`), matching SQL:2016 and Trino `CLASSIFIER()`.
+/// - Quoted identifiers preserve exact case (`"b"` -> `"b"`).
+fn normalize_pattern_ident(id: Ident) -> String {
+    if id.quote_style.is_some() {
+        id.value
+    } else {
+        id.value.to_ascii_uppercase()
+    }
+}
 
 /// DataFusion [`RelationPlanner`] handling SQL:2016 `MATCH_RECOGNIZE`.
 #[derive(Debug, Clone, Default)]
@@ -93,8 +107,8 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             .collect::<Result<Vec<_>>>()?;
 
         let planned_rows_per_match = lower_rows_per_match(rows_per_match);
-        let planned_skip = lower_after_match_skip(after_match_skip, ctx);
-        let planned_pattern = lower_pattern(pattern, ctx)?;
+        let planned_skip = lower_after_match_skip(after_match_skip);
+        let planned_pattern = lower_pattern(pattern)?;
 
         if planned_rows_per_match.include_unmatched_rows() && planned_pattern.has_exclusion() {
             return plan_err!(
@@ -112,7 +126,7 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
         let mut planned_definitions = Vec::with_capacity(symbols.len());
         let mut seen_defs: HashSet<String> = HashSet::new();
         for sym_def in symbols {
-            let name = ctx.normalize_ident(sym_def.symbol);
+            let name = normalize_pattern_ident(sym_def.symbol);
             if !known_symbols.contains(&name) {
                 return plan_err!(
                     "Defined variable '{name}' is not a primary pattern variable in PATTERN"
@@ -142,7 +156,7 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                     kind: SymbolDefKind::Stateful { outer_expr, slots },
                 });
             } else {
-                let stripped = strip_self_qualifier(sym_def.definition, &name, ctx);
+                let stripped = strip_self_qualifier(sym_def.definition, &name);
                 let predicate = ctx.sql_to_expr(stripped, input_schema.as_ref())?;
                 planned_definitions.push(SymbolDef {
                     name,
@@ -223,48 +237,45 @@ fn lower_rows_per_match(rpm: Option<SqlRowsPerMatch>) -> RowsPerMatch {
     }
 }
 
-fn lower_after_match_skip(
-    skip: Option<SqlSkip>,
-    ctx: &dyn RelationPlannerContext,
-) -> AfterMatchSkip {
+fn lower_after_match_skip(skip: Option<SqlSkip>) -> AfterMatchSkip {
     match skip {
         None | Some(SqlSkip::PastLastRow) => AfterMatchSkip::PastLastRow,
         Some(SqlSkip::ToNextRow) => AfterMatchSkip::ToNextRow,
-        Some(SqlSkip::ToFirst(id)) => AfterMatchSkip::ToFirst(ctx.normalize_ident(id)),
-        Some(SqlSkip::ToLast(id)) => AfterMatchSkip::ToLast(ctx.normalize_ident(id)),
+        Some(SqlSkip::ToFirst(id)) => AfterMatchSkip::ToFirst(normalize_pattern_ident(id)),
+        Some(SqlSkip::ToLast(id)) => AfterMatchSkip::ToLast(normalize_pattern_ident(id)),
     }
 }
 
-fn lower_pattern(pattern: SqlPattern, ctx: &dyn RelationPlannerContext) -> Result<Pattern> {
+fn lower_pattern(pattern: SqlPattern) -> Result<Pattern> {
     match pattern {
-        SqlPattern::Symbol(sym) => Ok(Pattern::Symbol(lower_symbol(sym, ctx))),
+        SqlPattern::Symbol(sym) => Ok(Pattern::Symbol(lower_symbol(sym))),
         SqlPattern::Exclude(sym) => Ok(Pattern::Exclude(Box::new(Pattern::Symbol(lower_symbol(
-            sym, ctx,
+            sym,
         ))))),
         SqlPattern::Permute(syms) => Ok(Pattern::Permute(
             syms.into_iter()
-                .map(|s| Pattern::Symbol(lower_symbol(s, ctx)))
+                .map(|s| Pattern::Symbol(lower_symbol(s)))
                 .collect(),
         )),
         SqlPattern::Concat(items) => {
             let mut lowered = Vec::with_capacity(items.len());
             for item in items {
-                lowered.push(lower_pattern(item, ctx)?);
+                lowered.push(lower_pattern(item)?);
             }
             Ok(Pattern::Concat(lowered))
         }
-        SqlPattern::Group(inner) => lower_pattern(*inner, ctx),
+        SqlPattern::Group(inner) => lower_pattern(*inner),
         SqlPattern::Alternation(items) => {
             let mut lowered = Vec::with_capacity(items.len());
             for item in items {
-                lowered.push(lower_pattern(item, ctx)?);
+                lowered.push(lower_pattern(item)?);
             }
             Ok(Pattern::Alternation(lowered))
         }
         SqlPattern::Repetition(inner, quant) => {
             let (min, max, reluctant) = lower_quantifier(quant);
             Ok(Pattern::Repetition {
-                inner: Box::new(lower_pattern(*inner, ctx)?),
+                inner: Box::new(lower_pattern(*inner)?),
                 min,
                 max,
                 reluctant,
@@ -273,9 +284,9 @@ fn lower_pattern(pattern: SqlPattern, ctx: &dyn RelationPlannerContext) -> Resul
     }
 }
 
-fn lower_symbol(sym: SqlSymbol, ctx: &dyn RelationPlannerContext) -> SymbolRef {
+fn lower_symbol(sym: SqlSymbol) -> SymbolRef {
     match sym {
-        SqlSymbol::Named(id) => SymbolRef::Named(ctx.normalize_ident(id)),
+        SqlSymbol::Named(id) => SymbolRef::Named(normalize_pattern_ident(id)),
         SqlSymbol::Start => SymbolRef::Start,
         SqlSymbol::End => SymbolRef::End,
     }
@@ -307,7 +318,7 @@ fn is_stateful_define(
     match expr {
         SqlExpr::CompoundIdentifier(idents) => {
             if idents.len() == 2 {
-                let prefix = ctx.normalize_ident(idents[0].clone());
+                let prefix = normalize_pattern_ident(idents[0].clone());
                 if prefix != current_symbol && known_symbols.contains(&prefix) {
                     return true;
                 }
@@ -379,14 +390,10 @@ fn is_stateful_define(
     }
 }
 
-fn strip_self_qualifier(
-    expr: SqlExpr,
-    current_symbol: &str,
-    ctx: &dyn RelationPlannerContext,
-) -> SqlExpr {
+fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
     match expr {
         SqlExpr::CompoundIdentifier(mut idents) => {
-            if idents.len() == 2 && ctx.normalize_ident(idents[0].clone()) == current_symbol {
+            if idents.len() == 2 && normalize_pattern_ident(idents[0].clone()) == current_symbol {
                 return SqlExpr::Identifier(idents.pop().expect("len 2"));
             }
             SqlExpr::CompoundIdentifier(idents)
@@ -398,7 +405,7 @@ fn strip_self_qualifier(
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
                             let owned =
                                 std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
-                            *e = strip_self_qualifier(owned, current_symbol, ctx);
+                            *e = strip_self_qualifier(owned, current_symbol);
                         }
                     }
                     FunctionArguments::List(list)
@@ -408,22 +415,22 @@ fn strip_self_qualifier(
             SqlExpr::Function(ast::Function { args, ..func })
         }
         SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
-            left: Box::new(strip_self_qualifier(*left, current_symbol, ctx)),
+            left: Box::new(strip_self_qualifier(*left, current_symbol)),
             op,
-            right: Box::new(strip_self_qualifier(*right, current_symbol, ctx)),
+            right: Box::new(strip_self_qualifier(*right, current_symbol)),
         },
         SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
             op,
-            expr: Box::new(strip_self_qualifier(*expr, current_symbol, ctx)),
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
         },
         SqlExpr::Nested(inner) => {
-            SqlExpr::Nested(Box::new(strip_self_qualifier(*inner, current_symbol, ctx)))
+            SqlExpr::Nested(Box::new(strip_self_qualifier(*inner, current_symbol)))
         }
         SqlExpr::IsNull(inner) => {
-            SqlExpr::IsNull(Box::new(strip_self_qualifier(*inner, current_symbol, ctx)))
+            SqlExpr::IsNull(Box::new(strip_self_qualifier(*inner, current_symbol)))
         }
         SqlExpr::IsNotNull(inner) => {
-            SqlExpr::IsNotNull(Box::new(strip_self_qualifier(*inner, current_symbol, ctx)))
+            SqlExpr::IsNotNull(Box::new(strip_self_qualifier(*inner, current_symbol)))
         }
         SqlExpr::Between {
             expr,
@@ -431,20 +438,20 @@ fn strip_self_qualifier(
             low,
             high,
         } => SqlExpr::Between {
-            expr: Box::new(strip_self_qualifier(*expr, current_symbol, ctx)),
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
             negated,
-            low: Box::new(strip_self_qualifier(*low, current_symbol, ctx)),
-            high: Box::new(strip_self_qualifier(*high, current_symbol, ctx)),
+            low: Box::new(strip_self_qualifier(*low, current_symbol)),
+            high: Box::new(strip_self_qualifier(*high, current_symbol)),
         },
         SqlExpr::InList {
             expr,
             list,
             negated,
         } => SqlExpr::InList {
-            expr: Box::new(strip_self_qualifier(*expr, current_symbol, ctx)),
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
             list: list
                 .into_iter()
-                .map(|e| strip_self_qualifier(e, current_symbol, ctx))
+                .map(|e| strip_self_qualifier(e, current_symbol))
                 .collect(),
             negated,
         },
@@ -457,16 +464,15 @@ fn strip_self_qualifier(
         } => SqlExpr::Case {
             case_token,
             end_token,
-            operand: operand.map(|e| Box::new(strip_self_qualifier(*e, current_symbol, ctx))),
+            operand: operand.map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
             conditions: conditions
                 .into_iter()
                 .map(|c| ast::CaseWhen {
-                    condition: strip_self_qualifier(c.condition, current_symbol, ctx),
-                    result: strip_self_qualifier(c.result, current_symbol, ctx),
+                    condition: strip_self_qualifier(c.condition, current_symbol),
+                    result: strip_self_qualifier(c.result, current_symbol),
                 })
                 .collect(),
-            else_result: else_result
-                .map(|e| Box::new(strip_self_qualifier(*e, current_symbol, ctx))),
+            else_result: else_result.map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
         },
         SqlExpr::Cast {
             kind,
@@ -475,7 +481,7 @@ fn strip_self_qualifier(
             format,
         } => SqlExpr::Cast {
             kind,
-            expr: Box::new(strip_self_qualifier(*expr, current_symbol, ctx)),
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
             data_type,
             format,
         },
@@ -514,7 +520,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             0 => Ok(None),
             1 => match &arg_exprs[0] {
                 FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
-                    let sym = self.ctx.normalize_ident(id.clone());
+                    let sym = normalize_pattern_ident(id.clone());
                     if !self.known_symbols.contains(&sym) {
                         return plan_err!("CLASSIFIER({sym}) references unknown pattern variable");
                     }
@@ -585,7 +591,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             }
             SqlExpr::CompoundIdentifier(idents) => {
                 if idents.len() == 2 {
-                    let prefix = self.ctx.normalize_ident(idents[0].clone());
+                    let prefix = normalize_pattern_ident(idents[0].clone());
                     if self.known_symbols.contains(&prefix) {
                         let col_ident = idents[1].clone();
                         let inner_expr = self
@@ -768,7 +774,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                     });
                 }
                 let (symbol, stripped) =
-                    extract_single_symbol_qualifier(target_sql, self.known_symbols, self.ctx)?;
+                    extract_single_symbol_qualifier(target_sql, self.known_symbols)?;
                 let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
                 Ok(MeasureSlotKind::Nav {
                     logical_nav: Some(logical_nav),
@@ -847,7 +853,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 }
 
                 let (symbol, stripped) =
-                    extract_single_symbol_qualifier(inner_target, self.known_symbols, self.ctx)?;
+                    extract_single_symbol_qualifier(inner_target, self.known_symbols)?;
                 let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
                 Ok(MeasureSlotKind::Nav {
                     logical_nav,
@@ -891,6 +897,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         args: vec![],
                         distinct: false,
                         arg_physical_nav: None,
+                        uses_match_metadata: false,
                     });
                 }
                 FunctionArgExpr::QualifiedWildcard(obj_name) => {
@@ -904,7 +911,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         .ok_or_else(|| {
                             plan_datafusion_err!("Invalid qualified wildcard in COUNT")
                         })?;
-                    let sym = self.ctx.normalize_ident(ident.clone());
+                    let sym = normalize_pattern_ident(ident.clone());
                     if !self.known_symbols.contains(&sym) {
                         return plan_err!(
                             "COUNT({sym}.*) references unknown pattern variable '{sym}'"
@@ -916,6 +923,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         args: vec![],
                         distinct: false,
                         arg_physical_nav: None,
+                        uses_match_metadata: false,
                     });
                 }
                 _ => {}
@@ -936,7 +944,8 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
 
         let mut shared_symbol: Option<String> = None;
         let mut arg_physical_nav: Option<(PhysicalNavKind, u32)> = None;
-        let mut planned_args = Vec::with_capacity(arg_exprs.len());
+        let mut uses_match_metadata = false;
+        let mut rewritten_sql_args = Vec::with_capacity(arg_exprs.len());
 
         for (i, arg) in arg_exprs.into_iter().enumerate() {
             let sql_expr = match arg {
@@ -944,8 +953,6 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 _ => return plan_err!("Wildcard arguments are not supported in {fname}()"),
             };
 
-            // Unwrap top-level PREV(expr [, n]) / NEXT(expr [, n]) inside an aggregate argument
-            // (e.g. SUM(PREV(a.price)), AVG(NEXT(b.val, 2))).
             let (phys_nav, unwrapped_sql) = unwrap_arg_physical_nav(sql_expr)?;
             if let Some(pn) = phys_nav {
                 if i == 0 {
@@ -958,7 +965,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             }
 
             let (sym, stripped) =
-                extract_single_symbol_qualifier(unwrapped_sql, self.known_symbols, self.ctx)?;
+                extract_single_symbol_qualifier(unwrapped_sql, self.known_symbols)?;
             if let Some(s) = sym {
                 if let Some(existing) = &shared_symbol
                     && existing != &s
@@ -969,9 +976,25 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 }
                 shared_symbol = Some(s);
             }
-            let expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
-            planned_args.push(expr);
+            let (replaced, has_meta) = rewrite_match_metadata_in_agg_arg(stripped)?;
+            if has_meta {
+                uses_match_metadata = true;
+            }
+            rewritten_sql_args.push(replaced);
         }
+
+        let meta_schema_owned;
+        let eval_schema: &DFSchema = if uses_match_metadata {
+            meta_schema_owned = build_agg_metadata_dfschema(self.input_schema)?;
+            &meta_schema_owned
+        } else {
+            self.input_schema
+        };
+
+        let planned_args = rewritten_sql_args
+            .into_iter()
+            .map(|e| self.ctx.sql_to_expr(e, eval_schema))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(MeasureSlotKind::Agg {
             agg_kind,
@@ -979,6 +1002,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             args: planned_args,
             distinct,
             arg_physical_nav,
+            uses_match_metadata,
         })
     }
 }
@@ -1054,26 +1078,126 @@ fn parse_non_negative_u32(expr: &SqlExpr) -> Result<u32> {
     }
 }
 
+/// Rewrites `CLASSIFIER()` and `MATCH_NUMBER()` inside an aggregate argument expression to
+/// synthetic columns `__mr_agg_classifier` and `__mr_agg_match_number`.
+fn rewrite_match_metadata_in_agg_arg(expr: SqlExpr) -> Result<(SqlExpr, bool)> {
+    let mut found = false;
+    let rewritten = rewrite_meta_inner(expr, &mut found)?;
+    Ok((rewritten, found))
+}
+
+fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
+    match expr {
+        SqlExpr::Function(func) => {
+            let fname = func.name.to_string().to_ascii_lowercase();
+            if fname == "classifier" {
+                let (args, _) = extract_unnamed_args(&func.args)?;
+                if !args.is_empty() {
+                    return plan_err!(
+                        "CLASSIFIER() inside aggregate arguments currently takes no arguments"
+                    );
+                }
+                *found = true;
+                return Ok(SqlExpr::Identifier(Ident::new(AGG_META_CLASSIFIER_COL)));
+            }
+            if fname == "match_number" {
+                let (args, _) = extract_unnamed_args(&func.args)?;
+                if !args.is_empty() {
+                    return plan_err!("MATCH_NUMBER() takes no arguments");
+                }
+                *found = true;
+                return Ok(SqlExpr::Identifier(Ident::new(AGG_META_MATCH_NUMBER_COL)));
+            }
+            let args = match func.args {
+                FunctionArguments::List(mut list) => {
+                    for arg in &mut list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            let owned =
+                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
+                            *e = rewrite_meta_inner(owned, found)?;
+                        }
+                    }
+                    FunctionArguments::List(list)
+                }
+                other => other,
+            };
+            Ok(SqlExpr::Function(ast::Function { args, ..func }))
+        }
+        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+            left: Box::new(rewrite_meta_inner(*left, found)?),
+            op,
+            right: Box::new(rewrite_meta_inner(*right, found)?),
+        }),
+        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+            op,
+            expr: Box::new(rewrite_meta_inner(*expr, found)?),
+        }),
+        SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(rewrite_meta_inner(
+            *inner, found,
+        )?))),
+        SqlExpr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => Ok(SqlExpr::Cast {
+            kind,
+            expr: Box::new(rewrite_meta_inner(*expr, found)?),
+            data_type,
+            format,
+        }),
+        SqlExpr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let operand = operand
+                .map(|e| rewrite_meta_inner(*e, found))
+                .transpose()?
+                .map(Box::new);
+            let mut new_conditions = Vec::with_capacity(conditions.len());
+            for c in conditions {
+                new_conditions.push(ast::CaseWhen {
+                    condition: rewrite_meta_inner(c.condition, found)?,
+                    result: rewrite_meta_inner(c.result, found)?,
+                });
+            }
+            let else_result = else_result
+                .map(|e| rewrite_meta_inner(*e, found))
+                .transpose()?
+                .map(Box::new);
+            Ok(SqlExpr::Case {
+                case_token,
+                end_token,
+                operand,
+                conditions: new_conditions,
+                else_result,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
 fn extract_single_symbol_qualifier(
     expr: SqlExpr,
     known_symbols: &HashSet<String>,
-    ctx: &dyn RelationPlannerContext,
 ) -> Result<(Option<String>, SqlExpr)> {
     let mut found: Option<String> = None;
-    let stripped = strip_symbol_inner(expr, known_symbols, ctx, &mut found)?;
+    let stripped = strip_symbol_inner(expr, known_symbols, &mut found)?;
     Ok((found, stripped))
 }
 
 fn strip_symbol_inner(
     expr: SqlExpr,
     known_symbols: &HashSet<String>,
-    ctx: &dyn RelationPlannerContext,
     found: &mut Option<String>,
 ) -> Result<SqlExpr> {
     match expr {
         SqlExpr::CompoundIdentifier(mut idents) => {
             if idents.len() == 2 {
-                let prefix = ctx.normalize_ident(idents[0].clone());
+                let prefix = normalize_pattern_ident(idents[0].clone());
                 if known_symbols.contains(&prefix) {
                     if let Some(existing) = found
                         && existing != &prefix
@@ -1089,18 +1213,17 @@ fn strip_symbol_inner(
             Ok(SqlExpr::CompoundIdentifier(idents))
         }
         SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
-            left: Box::new(strip_symbol_inner(*left, known_symbols, ctx, found)?),
+            left: Box::new(strip_symbol_inner(*left, known_symbols, found)?),
             op: op_clone(op),
-            right: Box::new(strip_symbol_inner(*right, known_symbols, ctx, found)?),
+            right: Box::new(strip_symbol_inner(*right, known_symbols, found)?),
         }),
         SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
             op,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, ctx, found)?),
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
         }),
         SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(strip_symbol_inner(
             *inner,
             known_symbols,
-            ctx,
             found,
         )?))),
         SqlExpr::Cast {
@@ -1110,7 +1233,7 @@ fn strip_symbol_inner(
             format,
         } => Ok(SqlExpr::Cast {
             kind,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, ctx, found)?),
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
             data_type,
             format,
         }),
@@ -1121,7 +1244,7 @@ fn strip_symbol_inner(
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
                             let owned =
                                 std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
-                            *e = strip_symbol_inner(owned, known_symbols, ctx, found)?;
+                            *e = strip_symbol_inner(owned, known_symbols, found)?;
                         }
                     }
                     FunctionArguments::List(list)
@@ -1138,18 +1261,18 @@ fn strip_symbol_inner(
             else_result,
         } => {
             let operand = operand
-                .map(|e| strip_symbol_inner(*e, known_symbols, ctx, found))
+                .map(|e| strip_symbol_inner(*e, known_symbols, found))
                 .transpose()?
                 .map(Box::new);
             let mut new_conditions = Vec::with_capacity(conditions.len());
             for c in conditions {
                 new_conditions.push(ast::CaseWhen {
-                    condition: strip_symbol_inner(c.condition, known_symbols, ctx, found)?,
-                    result: strip_symbol_inner(c.result, known_symbols, ctx, found)?,
+                    condition: strip_symbol_inner(c.condition, known_symbols, found)?,
+                    result: strip_symbol_inner(c.result, known_symbols, found)?,
                 });
             }
             let else_result = else_result
-                .map(|e| strip_symbol_inner(*e, known_symbols, ctx, found))
+                .map(|e| strip_symbol_inner(*e, known_symbols, found))
                 .transpose()?
                 .map(Box::new);
             Ok(SqlExpr::Case {

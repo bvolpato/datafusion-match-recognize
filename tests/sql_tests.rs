@@ -141,3 +141,10 @@ async fn test_slt_edge_cases() {
         run_slt_file("tests/slt/edge_cases.slt", bs, tp).await;
     }
 }
+
+#[tokio::test]
+async fn test_slt_trino_ported_suite() {
+    for &(bs, tp) in &[(8192, 1), (2, 4)] {
+        run_slt_file("tests/slt/trino_ported_suite.slt", bs, tp).await;
+    }
+}

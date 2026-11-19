@@ -294,6 +294,9 @@ pub enum MeasureSlotKind {
         args: Vec<Expr>,
         distinct: bool,
         arg_physical_nav: Option<(PhysicalNavKind, u32)>,
+        /// True when any argument references synthetic per-match metadata columns
+        /// (`__mr_agg_classifier` for `CLASSIFIER()` or `__mr_agg_match_number` for `MATCH_NUMBER()`).
+        uses_match_metadata: bool,
     },
     /// Bare input-column reference evaluated on the current row.
     CurrentRow { inner_expr: Expr },

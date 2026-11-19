@@ -285,6 +285,7 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
             args,
             distinct,
             arg_physical_nav,
+            uses_match_metadata,
         } => match agg_kind {
             AggKind::CountStar => Ok(make_func(
                 "COUNT",
@@ -311,9 +312,23 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
                     AggKind::Udaf(u) => u.name(),
                     AggKind::CountStar | AggKind::CountSymbol => unreachable!(),
                 };
+                let mut meta_map = HashMap::new();
+                if *uses_match_metadata {
+                    meta_map.insert(
+                        crate::logical::AGG_META_CLASSIFIER_COL.to_string(),
+                        make_func("CLASSIFIER", vec![], false),
+                    );
+                    meta_map.insert(
+                        crate::logical::AGG_META_MATCH_NUMBER_COL.to_string(),
+                        make_func("MATCH_NUMBER", vec![], false),
+                    );
+                }
                 let mut fn_args = Vec::with_capacity(args.len());
                 for a in args {
                     let mut sql_a = unparser.expr_to_sql(a)?;
+                    if *uses_match_metadata {
+                        sql_a = substitute_slots(sql_a, &meta_map);
+                    }
                     if let Some(sym) = symbol {
                         sql_a = qualify_identifiers(sql_a, sym);
                     }

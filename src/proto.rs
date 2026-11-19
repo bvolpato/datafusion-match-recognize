@@ -34,7 +34,7 @@ use crate::ast::{
     MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern,
     PhysicalNavKind, RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind, SymbolRef,
 };
-use crate::logical::MatchRecognizeNode;
+use crate::logical::{MatchRecognizeNode, build_agg_metadata_arrow_schema};
 use crate::measures::{
     PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind, build_physical_slot_schema,
 };
@@ -107,6 +107,7 @@ fn decode_logical_slots(
                     arg_physical_nav: a
                         .arg_physical_nav
                         .map(|pn| (decode_physical_nav(pn), a.arg_physical_offset)),
+                    uses_match_metadata: a.uses_match_metadata,
                 },
                 pb::measure_slot_proto::Kind::CurrentRow(cr) => MeasureSlotKind::CurrentRow {
                     inner_expr: decode_expr(&cr.inner_expr)?,
@@ -163,6 +164,7 @@ fn encode_logical_slots(
                 args,
                 distinct,
                 arg_physical_nav,
+                uses_match_metadata,
             } => {
                 let (kind_i32, udaf_name) = encode_agg_kind(agg_kind);
                 pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
@@ -173,6 +175,7 @@ fn encode_logical_slots(
                     udaf_name,
                     arg_physical_nav: arg_physical_nav.map(|(pn, _)| encode_physical_nav(pn)),
                     arg_physical_offset: arg_physical_nav.map(|(_, off)| off).unwrap_or(0),
+                    uses_match_metadata: *uses_match_metadata,
                 })
             }
             MeasureSlotKind::CurrentRow { inner_expr } => {
@@ -517,10 +520,17 @@ fn decode_physical_slots(
             }
             pb::measure_slot_proto::Kind::Agg(a) => {
                 let agg_kind = decode_agg_kind(a.agg_kind, &a.udaf_name, ctx)?;
+                let meta_schema_owned;
+                let eval_schema: &Schema = if a.uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_arrow_schema(input_schema);
+                    &meta_schema_owned
+                } else {
+                    input_schema
+                };
                 let args = a
                     .args
                     .iter()
-                    .map(|b| decode_phys(b, input_schema))
+                    .map(|b| decode_phys(b, eval_schema))
                     .collect::<Result<Vec<_>>>()?;
                 let (dt, null) = match &agg_kind {
                     AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
@@ -528,7 +538,7 @@ fn decode_physical_slots(
                     }
                     AggKind::Avg => (DataType::Float64, true),
                     AggKind::Sum => {
-                        let inner_dt = args[0].data_type(input_schema)?;
+                        let inner_dt = args[0].data_type(eval_schema)?;
                         let sum_dt = match inner_dt {
                             DataType::Int8
                             | DataType::Int16
@@ -546,7 +556,7 @@ fn decode_physical_slots(
                         };
                         (sum_dt, true)
                     }
-                    AggKind::Min | AggKind::Max => (args[0].data_type(input_schema)?, true),
+                    AggKind::Min | AggKind::Max => (args[0].data_type(eval_schema)?, true),
                     AggKind::Udaf(udaf) => {
                         let raw_fields: Vec<FieldRef> = args
                             .iter()
@@ -554,8 +564,8 @@ fn decode_physical_slots(
                             .map(|(i, e)| {
                                 Ok(Arc::new(Field::new(
                                     format!("arg_{i}"),
-                                    e.data_type(input_schema)?,
-                                    e.nullable(input_schema)?,
+                                    e.data_type(eval_schema)?,
+                                    e.nullable(eval_schema)?,
                                 )))
                             })
                             .collect::<Result<_>>()?;
@@ -581,6 +591,7 @@ fn decode_physical_slots(
                         arg_physical_nav: a
                             .arg_physical_nav
                             .map(|pn| (decode_physical_nav(pn), a.arg_physical_offset)),
+                        uses_match_metadata: a.uses_match_metadata,
                     },
                     dt,
                     null,
@@ -647,6 +658,7 @@ fn encode_physical_slots(
                 args,
                 distinct,
                 arg_physical_nav,
+                uses_match_metadata,
                 ..
             } => {
                 let (kind_i32, udaf_name) = encode_agg_kind(agg_kind);
@@ -658,6 +670,7 @@ fn encode_physical_slots(
                     udaf_name,
                     arg_physical_nav: arg_physical_nav.map(|(pn, _)| encode_physical_nav(pn)),
                     arg_physical_offset: arg_physical_nav.map(|(_, off)| off).unwrap_or(0),
+                    uses_match_metadata: *uses_match_metadata,
                 })
             }
             PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
