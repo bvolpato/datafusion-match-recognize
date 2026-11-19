@@ -34,6 +34,11 @@ jobs:
       - name: Unit, Oracle, SLT, Invariance, and Complexity Tests
         working-directory: datafusion-match-recognize
         run: cargo test
+      - name: Run Examples
+        working-directory: datafusion-match-recognize
+        run: |
+          cargo run --example funnel
+          cargo run --example stock_vshape
       - name: Compile Benchmarks
         working-directory: datafusion-match-recognize
         run: cargo bench --no-run

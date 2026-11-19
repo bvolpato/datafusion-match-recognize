@@ -1,19 +1,21 @@
-# datafusion-match-recognize
+# DataFusion Match Recognize
 
-SQL:2016 `MATCH_RECOGNIZE` (Row Pattern Recognition) extension crate for [Apache DataFusion](https://datafusion.apache.org/).
+[![CI][ci-badge]][ci-url]
+[![Apache licensed][license-badge]][license-url]
 
-This crate builds `MATCH_RECOGNIZE` purely on top of DataFusion public extension APIs (`RelationPlanner`, `UserDefinedLogicalNode`, `ExtensionPlanner`, `ExecutionPlan`, `OptimizerRule`, `LogicalExtensionCodec`, and `PhysicalExtensionCodec`) without modifying DataFusion core. It targets `datafusion-contrib` under the `Apache-2.0` license.
+SQL:2016 `MATCH_RECOGNIZE` (Row Pattern Recognition) for [Apache DataFusion](https://github.com/apache/datafusion), built purely on DataFusion public extension APIs.
 
-## Architecture
+> [!NOTE]
+> This project is not part of Apache DataFusion.
 
-- **SQL Planning (`MatchRecognizeRelationPlanner`):** Intercepts `sqlparser::ast::TableFactor::MatchRecognize` via DataFusion `RelationPlanner`, validates SQL:2016 variable rules, and builds a `MatchRecognizeNode`.
-- **Hybrid Two-Tier `DEFINE` Evaluation:** Row-local `DEFINE` predicates evaluate once per partition in vectorized Arrow packed into per-row `u64` bitmasks with O(1) start-symbol fast skipping. Match-state `DEFINE` predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, and cross-symbol references) precompute inner expressions once per partition and evaluate lazily on candidate transitions.
-- **Measure Slot Decomposition and UDAFs:** Extracts pattern-recognition leaves (`MATCH_NUMBER()`, `CLASSIFIER()` with `FIRST`/`LAST`/`PREV`/`NEXT` navigation, `FIRST`/`LAST`/`PREV`/`NEXT` with offsets, symbol-qualified and `SUBSET`-qualified columns, built-in `[DISTINCT]` aggregates, and arbitrary registered DataFusion `AggregateUDF`s via `Accumulator`) into synthetic slots while preserving arbitrary outer DataFusion scalar expressions (`CASE WHEN`, arithmetic, `COALESCE`, `CAST`, and UDFs) with automatic type coercion.
-- **Priority-Ordered PikeVM Matcher:** Compiles patterns into NFA bytecode preserving SQL:2016 leftmost-ordered alternation and greedy vs. reluctant quantifier priority. Uses per-position `pc` deduplication in Tier 1 (linear worst-case matching time), per-thread epsilon-cycle detection with configurable thread caps in Tier 2, and a flat arena for O(1)-stack match histories.
-- **Partition-Streaming Execution and Disk Spilling (`MatchRecognizeExec`):** Declares `Distribution::KeyPartitioned` (or `SinglePartition`) and `[PARTITION BY..., ORDER BY...]` ordering requirements so DataFusion inserts or elides `RepartitionExec` and `SortExec`. Streams one partition at a time with `MemoryReservation` accounting and automatic Arrow IPC temp-file spilling via DataFusion's `SpillManager` when memory limits are tight.
-- **Optimizer, Serialization, and Unparsing:** Includes `MatchRecognizeFilterPushdown` (pushes partition-only predicates below `MatchRecognizeNode`), `necessary_children_exprs` column pruning, composable `proto` codecs (`MatchRecognizeLogicalCodec::with_delegate` and `MatchRecognizePhysicalCodec::with_delegate`), and `MatchRecognizeUnparser` (`UserDefinedLogicalNodeUnparser`).
+`datafusion-match-recognize` is a library for adding SQL:2016 row pattern recognition to any DataFusion application without forking DataFusion core. Register it on a `SessionContext`, and `MATCH_RECOGNIZE` queries plan through `RelationPlanner`, optimize alongside normal DataFusion rules, and run as a regular `ExecutionPlan` with Arrow memory accounting, disk spilling, and optional protobuf serialization for distributed engines.
 
-## Quick Start
+## Getting started
+
+Enabling `MATCH_RECOGNIZE` takes two steps:
+
+1. Wire the query planner and partition-filter pushdown optimizer onto your `SessionStateBuilder` with `configure_session_state`.
+2. Register `MatchRecognizeRelationPlanner` on your `SessionContext` with `register_relation_planner` (or call `session_context_with_match_recognize` to do both at once).
 
 ```rust
 use datafusion::prelude::SessionConfig;
@@ -57,46 +59,72 @@ async fn main() -> datafusion_common::Result<()> {
 }
 ```
 
-## Verification Suite
-
-The test suite uses a 4-layer oracle strategy:
-
-1. **Layer 1 (`tests/oracle.rs`):** Independent recursive backtracking reference implementation of SQL:2016 row pattern semantics fuzz-tested against the PikeVM matcher across 1,500 random patterns, skip modes, and output modes.
-2. **Layer 2a (`tests/sql_tests.rs`, `tests/slt/`):** SQL Logic Tests ported from Trino and Calcite plus multi-step funnel queries, executed across multiple batch sizes and partition counts.
-3. **Layer 2b (`tests/trino_oracle.rs`):** Live differential SQL oracle executing hand-crafted corner cases and randomized multi-partition queries against a real Trino Docker container (`trinodb/trino`).
-4. **Layer 3 (`tests/invariance.rs`):** Matrix tests across batch sizes (`1, 2, 3, 7, 8192`), partition counts (`1, 4`), sliced Arrow batches, diverse Arrow types, optimizer pushdown equivalence, `GreedyMemoryPool` limits, and logical/physical protobuf round-trips.
-5. **Layer 4 (`tests/complexity.rs`, `benches/funnel_bench.rs`):** Adversarial anti-backtracking complexity tests (`(A+)+ B`, `(A*)* B`, `(A | A)* B`, `(A?){25} A{25} B`) and Criterion throughput benchmarks.
-
-### Running Tests
+Runnable examples live in [`examples/`](./examples):
 
 ```sh
-# Run Layers 1, 2a, 3, and 4 (no external services required)
+cargo run --example funnel
+cargo run --example stock_vshape
+```
+
+## Benchmarks
+
+The table below shows Criterion median timings on Apple Silicon (`cargo bench --bench funnel_bench -- --quick`) for two workloads: an adversarial backtracking pattern `(A+)+ B` against non-matching rows of `A`, and a full end-to-end SQL 3-step drop-off funnel (`(a any0* b any1* c) | (a any0* b) | a`, including SQL parsing, planning, repartitioning, sorting, pattern matching, and measure evaluation).
+
+| Benchmark | Rows | Median time | Throughput |
+| --- | ---: | ---: | ---: |
+| `nfa_adversarial/(A+)+B_no_match` | 1,000 | 18.3 us | ~54.6M rows/s |
+| `nfa_adversarial/(A+)+B_no_match` | 10,000 | 192.3 us | ~52.0M rows/s |
+| `sql_3step_funnel` (100 users x 50 events) | 5,000 | 2.44 ms | ~2.0M rows/s |
+| `sql_3step_funnel` (1,000 users x 50 events) | 50,000 | 11.14 ms | ~4.5M rows/s |
+
+These numbers are a local snapshot on synthetic in-memory Arrow batches, not a general cross-engine ranking. Reproduce them locally with `cargo bench --bench funnel_bench`.
+
+## Core tenets of the project
+
+- Stay on DataFusion public extension APIs (`RelationPlanner`, `UserDefinedLogicalNodeCore`, `ExtensionPlanner`, `ExecutionPlan`, `OptimizerRule`, `LogicalExtensionCodec`, `PhysicalExtensionCodec`, and `UserDefinedLogicalNodeUnparser`) with zero core fork.
+- Keep simple row-local `DEFINE` patterns fast. Row-local predicates evaluate once per partition in vectorized Arrow into per-row `u64` bitmasks with O(1) start-symbol fast skipping and linear-time PikeVM thread deduplication. Stateful `DEFINE` predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, cross-symbol references) precompute inner expressions once per partition and evaluate lazily on candidate transitions.
+- Reuse DataFusion instead of rebuilding it. Partitioning and sorting go through `EnforceDistribution` and `EnforceSorting`, `MEASURES` outer expressions run as standard DataFusion `PhysicalExpr`s with native type coercion, custom aggregates bridge to DataFusion's `Accumulator` trait, and large partitions spill through `SpillManager`.
+- Verify against independent oracles, not just hand-written tests. Every commit runs a recursive backtracking reference oracle with `proptest`, multi-batch/multi-partition Arrow invariance tests, disk-spill and memory-pool tests, protobuf round-trips, and a live differential SQL oracle against Trino 484 in CI.
+
+## Verification
+
+```sh
+# Offline suites: reference oracle + proptest, SLT suites, Arrow/proto/spill invariance, complexity
 cargo test
 
-# Run Layer 2b live differential oracle against Trino in Docker
+# Live differential SQL oracle against Trino in Docker
 docker run -d --name mr-trino-oracle -p 18080:8080 trinodb/trino:latest
 cargo test --test trino_oracle -- --ignored --nocapture
 docker rm -f mr-trino-oracle
 ```
 
-## Current Scope, Divergences, and Upstream PRs
+## Documentation and upstream tracking
 
-See [tests/divergences.md](tests/divergences.md) for the full parity matrix, remaining roadmap items, and tracked upstream `sqlparser-rs` / DataFusion PRs:
+- Coverage matrix, intentional supersets over Trino, and upstream parser/API blockers: [tests/divergences.md](./tests/divergences.md)
+- Contributing guide: [CONTRIBUTING.md](./CONTRIBUTING.md)
+- Agent and repository map: [AGENTS.md](./AGENTS.md)
 
-- Reluctant quantifiers in SQL: [apache/datafusion-sqlparser-rs#2510](https://github.com/apache/datafusion-sqlparser-rs/pull/2510) (merged in `0.64.0`), DataFusion adoption in [apache/datafusion#27063](https://github.com/apache/datafusion/pull/27063).
-- Derived tables, unparenthesized `a {- b -}` exclusions, and case-insensitive `permute`: [apache/datafusion-sqlparser-rs#3017](https://github.com/apache/datafusion-sqlparser-rs/pull/3017) (draft).
+Upstream SQL syntax PRs tracked for full SQL:2016 parsing in DataFusion:
+
+- Reluctant quantifiers (`*?`, `+?`, `??`, `{n,m}?`): [apache/datafusion-sqlparser-rs#2510](https://github.com/apache/datafusion-sqlparser-rs/pull/2510) (merged in `0.64.0`), DataFusion adoption in [apache/datafusion#27063](https://github.com/apache/datafusion/pull/27063).
+- Derived tables, unparenthesized `a {- b -}` exclusions, and lowercase `permute`: [apache/datafusion-sqlparser-rs#3017](https://github.com/apache/datafusion-sqlparser-rs/pull/3017) (draft).
 - SQL:2016 `SUBSET` union variables: [apache/datafusion-sqlparser-rs#3018](https://github.com/apache/datafusion-sqlparser-rs/pull/3018) (draft).
-- SQL:2016 `RUNNING` / `FINAL` measure modifiers: [apache/datafusion-sqlparser-rs#3019](https://github.com/apache/datafusion-sqlparser-rs/pull/3019) (draft).
+- SQL:2016 `RUNNING` and `FINAL` measure modifiers: [apache/datafusion-sqlparser-rs#3019](https://github.com/apache/datafusion-sqlparser-rs/pull/3019) (draft).
 
 ## Acknowledgments
 
-This project builds on prior work and design discussions across the Apache DataFusion, Trino, and Apache Calcite communities:
+This crate builds on work across the Apache DataFusion, Trino, and Apache Calcite communities:
 
-- **Geoffrey Claude (`geoffreyclaude`)** for designing and contributing DataFusion's `RelationPlanner` extension API ([apache/datafusion#18078](https://github.com/apache/datafusion/issues/18078)) and exploring the initial `MATCH_RECOGNIZE` prototype ([apache/datafusion#16685](https://github.com/apache/datafusion/pull/16685)).
-- **Andrew Lamb (`alamb`) and the Apache DataFusion maintainers** for guiding SQL extensions toward modular `datafusion-contrib` crates built on public extension APIs.
-- **Trino (`trinodb/trino`)** for its SQL:2016 row pattern recognition bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` test suite, which informed our NFA compilation strategy and live differential oracle.
-- **Apache Calcite (`apache/calcite`)** for its `match.iq` SQL:2016 test cases.
+- Geoffrey Claude (`geoffreyclaude`) for designing DataFusion's `RelationPlanner` extension API ([apache/datafusion#18078](https://github.com/apache/datafusion/issues/18078)) and exploring the earlier `MATCH_RECOGNIZE` prototype ([apache/datafusion#16685](https://github.com/apache/datafusion/pull/16685)).
+- Andrew Lamb (`alamb`) and the Apache DataFusion maintainers for steering SQL extensions toward modular `datafusion-contrib` crates.
+- Trino (`trinodb/trino`) for its SQL:2016 row pattern bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` test suite, which shaped our NFA compilation and live differential oracle.
+- Apache Calcite (`apache/calcite`) for its `match.iq` SQL:2016 test cases.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Licensed under the [Apache License, Version 2.0](./LICENSE).
+
+[ci-badge]: https://github.com/bvolpato/datafusion-match-recognize/actions/workflows/ci.yml/badge.svg
+[ci-url]: https://github.com/bvolpato/datafusion-match-recognize/actions/workflows/ci.yml
+[license-badge]: https://img.shields.io/badge/license-Apache%202.0-blue.svg
+[license-url]: https://github.com/bvolpato/datafusion-match-recognize/blob/main/LICENSE

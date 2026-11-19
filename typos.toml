@@ -1,0 +1,13 @@
+[default.extend-words]
+# SQL:2016 pattern variable names used in tests and examples
+strt = "strt"
+dups = "dups"
+# DataFusion abbreviation for AggregateUDF
+udaf = "udaf"
+udafs = "udafs"
+
+[files]
+extend-exclude = [
+    "*.lock",
+    "proptest-regressions/",
+]
