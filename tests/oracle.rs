@@ -918,9 +918,205 @@ fn test_start_symbol_fast_skip_and_subset_skip() {
     );
 }
 
+#[test]
+fn test_trino_pattern_matching_machine_cases() {
+    // Ported directly from Trino's TestPatternMatchingMachine.java:
+    // verifies exact matched labels AND exact per-step `excluded` flags across nested exclusions,
+    // quantifiers, anchors, permutations, reluctant `?`, and long exponential-trap patterns.
+    let declared = vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into()];
+    let sym = |name: &str| Pattern::Symbol(SymbolRef::Named(name.into()));
+    let excl = |p: Pattern| Pattern::Exclude(Box::new(p));
+    let cat = |items: Vec<Pattern>| Pattern::Concat(items);
+    let star = |p: Pattern, greedy: bool| Pattern::Repetition {
+        inner: Box::new(p),
+        min: 0,
+        max: None,
+        reluctant: !greedy,
+    };
+    let plus = |p: Pattern, greedy: bool| Pattern::Repetition {
+        inner: Box::new(p),
+        min: 1,
+        max: None,
+        reluctant: !greedy,
+    };
+    let opt = |p: Pattern, greedy: bool| Pattern::Repetition {
+        inner: Box::new(p),
+        min: 0,
+        max: Some(1),
+        reluctant: !greedy,
+    };
+
+    let make_input = |s: &str| -> PartitionSymbols {
+        let bitmasks: Vec<u64> = s
+            .chars()
+            .map(|c| match c {
+                'A' => 1 << 0,
+                'B' => 1 << 1,
+                'C' => 1 << 2,
+                'D' => 1 << 3,
+                'E' => 1 << 4,
+                _ => 0,
+            })
+            .collect();
+        PartitionSymbols::from_bitmasks(bitmasks, 5)
+    };
+
+    let check = |pat: Pattern, input: &str, expected: Option<&[(char, bool)]>| {
+        let program = Program::compile(&pat, &declared, MatchRecognizeConfig::default()).unwrap();
+        let symbols = make_input(input);
+        let mut matcher = Matcher::new(&program);
+        let mut stats = Default::default();
+        let actual = matcher.find_match_at(&symbols, 0, &mut stats);
+        let ref_actual = ref_find_match_at(&pat, &symbols, &program, 0);
+        assert_eq!(actual, ref_actual, "oracle mismatch for {pat} on {input}");
+        match (actual, expected) {
+            (None, None) => {}
+            (Some(steps), Some(exp)) => {
+                let got: Vec<(char, bool)> = steps
+                    .iter()
+                    .map(|st| {
+                        (
+                            program.id_to_symbol[st.sym as usize]
+                                .chars()
+                                .next()
+                                .unwrap(),
+                            st.excluded,
+                        )
+                    })
+                    .collect();
+                assert_eq!(got, exp, "mismatch for {pat} on {input}");
+            }
+            (got, exp) => {
+                panic!("match presence mismatch for {pat} on {input}: got={got:?}, exp={exp:?}")
+            }
+        }
+    };
+
+    // testCaptures (exact excluded row spans)
+    check(
+        cat(vec![excl(sym("A")), sym("B")]),
+        "ABCD",
+        Some(&[('A', true), ('B', false)]),
+    );
+    check(
+        excl(cat(vec![sym("A"), sym("B")])),
+        "ABCD",
+        Some(&[('A', true), ('B', true)]),
+    );
+    check(
+        cat(vec![sym("A"), excl(sym("B"))]),
+        "ABCD",
+        Some(&[('A', false), ('B', true)]),
+    );
+    check(
+        cat(vec![sym("A"), star(excl(sym("B")), true)]),
+        "ABBBCD",
+        Some(&[('A', false), ('B', true), ('B', true), ('B', true)]),
+    );
+    check(
+        cat(vec![sym("A"), excl(star(sym("B"), true))]),
+        "ABBBCD",
+        Some(&[('A', false), ('B', true), ('B', true), ('B', true)]),
+    );
+    check(
+        cat(vec![
+            sym("A"),
+            star(excl(sym("B")), true),
+            sym("C"),
+            excl(star(sym("D"), true)),
+        ]),
+        "ABBCDDDE",
+        Some(&[
+            ('A', false),
+            ('B', true),
+            ('B', true),
+            ('C', false),
+            ('D', true),
+            ('D', true),
+            ('D', true),
+        ]),
+    );
+    check(
+        cat(vec![
+            sym("A"),
+            star(
+                cat(vec![
+                    excl(cat(vec![sym("B"), sym("C")])),
+                    sym("D"),
+                    excl(sym("E")),
+                ]),
+                true,
+            ),
+        ]),
+        "ABCDEBCDEBCDE",
+        Some(&[
+            ('A', false),
+            ('B', true),
+            ('C', true),
+            ('D', false),
+            ('E', true),
+            ('B', true),
+            ('C', true),
+            ('D', false),
+            ('E', true),
+            ('B', true),
+            ('C', true),
+            ('D', false),
+            ('E', true),
+        ]),
+    );
+
+    // testEmptyMatch & testNoMatch
+    check(cat(vec![]), "ABCD", Some(&[]));
+    check(sym("A"), "B", None);
+
+    // testLabels: greedy/reluctant ?, anchors, PERMUTE
+    check(
+        cat(vec![sym("A"), opt(sym("B"), true)]),
+        "ABCD",
+        Some(&[('A', false), ('B', false)]),
+    );
+    check(
+        cat(vec![sym("A"), opt(sym("B"), false)]),
+        "ABCD",
+        Some(&[('A', false)]),
+    );
+    check(
+        cat(vec![Pattern::Symbol(SymbolRef::Start), sym("A"), sym("B")]),
+        "ABCD",
+        Some(&[('A', false), ('B', false)]),
+    );
+    check(
+        cat(vec![sym("A"), sym("B"), Pattern::Symbol(SymbolRef::End)]),
+        "AB",
+        Some(&[('A', false), ('B', false)]),
+    );
+    check(
+        Pattern::Permute(vec![sym("A"), sym("B"), sym("C")]),
+        "ABCD",
+        Some(&[('A', false), ('B', false), ('C', false)]),
+    );
+
+    // testLongMatch: linear-time no-match on ^ (A+)+ $ against 40 A's + B
+    let program = Program::compile(
+        &cat(vec![
+            Pattern::Symbol(SymbolRef::Start),
+            plus(plus(sym("A"), true), true),
+            Pattern::Symbol(SymbolRef::End),
+        ]),
+        &declared,
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+    let mut matcher = Matcher::new(&program);
+    let mut stats = Default::default();
+    let long_input = make_input("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB");
+    assert_eq!(matcher.find_match_at(&long_input, 0, &mut stats), None);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 600,
+        cases: 1000,
         max_shrink_iters: 1000,
         .. ProptestConfig::default()
     })]

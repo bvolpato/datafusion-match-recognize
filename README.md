@@ -134,12 +134,13 @@ Upstream SQL syntax PRs tracked for full SQL:2016 parsing in DataFusion:
 
 ## Acknowledgments
 
-This crate builds on work across the Apache DataFusion, Trino, and Apache Calcite communities:
+This crate builds on work across the Apache DataFusion, Trino, Apache Calcite, and Apache Flink communities:
 
 - Geoffrey Claude (`geoffreyclaude`) for designing DataFusion's `RelationPlanner` extension API ([apache/datafusion#18078](https://github.com/apache/datafusion/issues/18078)) and exploring the earlier `MATCH_RECOGNIZE` prototype ([apache/datafusion#16685](https://github.com/apache/datafusion/pull/16685)).
 - Andrew Lamb (`alamb`) and the Apache DataFusion maintainers for steering SQL extensions toward modular `datafusion-contrib` crates.
-- Trino (`trinodb/trino`) for its SQL:2016 row pattern bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` test suite, which shaped our NFA compilation and live differential oracle.
+- Trino (`trinodb/trino`) for its SQL:2016 row pattern bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` / `TestAggregationsInRowPatternMatching` / `TestPatternMatchingMachine` test suites, which shaped our NFA compilation and live differential oracle.
 - Apache Calcite (`apache/calcite`) for its `match.iq` SQL:2016 test cases.
+- Apache Flink (`apache/flink`) for its `MatchRecognizeITCase` batch and streaming SQL test cases.
 
 ## License
 

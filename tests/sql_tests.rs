@@ -148,3 +148,17 @@ async fn test_slt_trino_ported_suite() {
         run_slt_file("tests/slt/trino_ported_suite.slt", bs, tp).await;
     }
 }
+
+#[tokio::test]
+async fn test_slt_trino_aggs_and_exclusions() {
+    for &(bs, tp) in &[(8192, 1), (2, 4)] {
+        run_slt_file("tests/slt/trino_aggs_and_exclusions.slt", bs, tp).await;
+    }
+}
+
+#[tokio::test]
+async fn test_slt_flink_ported_suite() {
+    for &(bs, tp) in &[(8192, 1), (2, 4)] {
+        run_slt_file("tests/slt/flink_ported_suite.slt", bs, tp).await;
+    }
+}

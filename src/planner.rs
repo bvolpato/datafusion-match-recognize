@@ -353,9 +353,61 @@ fn is_stateful_define(
         | SqlExpr::Nested(expr)
         | SqlExpr::IsNull(expr)
         | SqlExpr::IsNotNull(expr)
-        | SqlExpr::Cast { expr, .. } => {
+        | SqlExpr::IsTrue(expr)
+        | SqlExpr::IsFalse(expr)
+        | SqlExpr::IsNotTrue(expr)
+        | SqlExpr::IsNotFalse(expr)
+        | SqlExpr::IsUnknown(expr)
+        | SqlExpr::IsNotUnknown(expr)
+        | SqlExpr::Cast { expr, .. }
+        | SqlExpr::Extract { expr, .. }
+        | SqlExpr::Ceil { expr, .. }
+        | SqlExpr::Floor { expr, .. } => {
             is_stateful_define(expr, current_symbol, known_symbols, ctx)
         }
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
+            is_stateful_define(left, current_symbol, known_symbols, ctx)
+                || is_stateful_define(right, current_symbol, known_symbols, ctx)
+        }
+        SqlExpr::Like { expr, pattern, .. }
+        | SqlExpr::ILike { expr, pattern, .. }
+        | SqlExpr::SimilarTo { expr, pattern, .. } => {
+            is_stateful_define(expr, current_symbol, known_symbols, ctx)
+                || is_stateful_define(pattern, current_symbol, known_symbols, ctx)
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            is_stateful_define(expr, current_symbol, known_symbols, ctx)
+                || substring_from
+                    .as_deref()
+                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+                || substring_for
+                    .as_deref()
+                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+        }
+        SqlExpr::Trim {
+            expr, trim_what, ..
+        } => {
+            is_stateful_define(expr, current_symbol, known_symbols, ctx)
+                || trim_what
+                    .as_deref()
+                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+        }
+        SqlExpr::Position { expr, r#in } => {
+            is_stateful_define(expr, current_symbol, known_symbols, ctx)
+                || is_stateful_define(r#in, current_symbol, known_symbols, ctx)
+        }
+        SqlExpr::Array(arr) => arr
+            .elem
+            .iter()
+            .any(|e| is_stateful_define(e, current_symbol, known_symbols, ctx)),
+        SqlExpr::Tuple(elems) => elems
+            .iter()
+            .any(|e| is_stateful_define(e, current_symbol, known_symbols, ctx)),
         SqlExpr::Between {
             expr, low, high, ..
         } => {
@@ -432,6 +484,133 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
         SqlExpr::IsNotNull(inner) => {
             SqlExpr::IsNotNull(Box::new(strip_self_qualifier(*inner, current_symbol)))
         }
+        SqlExpr::IsTrue(inner) => {
+            SqlExpr::IsTrue(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsFalse(inner) => {
+            SqlExpr::IsFalse(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsNotTrue(inner) => {
+            SqlExpr::IsNotTrue(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsNotFalse(inner) => {
+            SqlExpr::IsNotFalse(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsUnknown(inner) => {
+            SqlExpr::IsUnknown(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsNotUnknown(inner) => {
+            SqlExpr::IsNotUnknown(Box::new(strip_self_qualifier(*inner, current_symbol)))
+        }
+        SqlExpr::IsDistinctFrom(l, r) => SqlExpr::IsDistinctFrom(
+            Box::new(strip_self_qualifier(*l, current_symbol)),
+            Box::new(strip_self_qualifier(*r, current_symbol)),
+        ),
+        SqlExpr::IsNotDistinctFrom(l, r) => SqlExpr::IsNotDistinctFrom(
+            Box::new(strip_self_qualifier(*l, current_symbol)),
+            Box::new(strip_self_qualifier(*r, current_symbol)),
+        ),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::Like {
+            negated,
+            any,
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            pattern: Box::new(strip_self_qualifier(*pattern, current_symbol)),
+            escape_char,
+        },
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::ILike {
+            negated,
+            any,
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            pattern: Box::new(strip_self_qualifier(*pattern, current_symbol)),
+            escape_char,
+        },
+        SqlExpr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::SimilarTo {
+            negated,
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            pattern: Box::new(strip_self_qualifier(*pattern, current_symbol)),
+            escape_char,
+        },
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            special,
+            shorthand,
+        } => SqlExpr::Substring {
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            substring_from: substring_from
+                .map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
+            substring_for: substring_for
+                .map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
+            special,
+            shorthand,
+        },
+        SqlExpr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => SqlExpr::Trim {
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            trim_where,
+            trim_what: trim_what.map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
+            trim_characters: trim_characters.map(|v| {
+                v.into_iter()
+                    .map(|e| strip_self_qualifier(e, current_symbol))
+                    .collect()
+            }),
+        },
+        SqlExpr::Position { expr, r#in } => SqlExpr::Position {
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            r#in: Box::new(strip_self_qualifier(*r#in, current_symbol)),
+        },
+        SqlExpr::Extract {
+            field,
+            syntax,
+            expr,
+        } => SqlExpr::Extract {
+            field,
+            syntax,
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+        },
+        SqlExpr::Ceil { expr, field } => SqlExpr::Ceil {
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            field,
+        },
+        SqlExpr::Floor { expr, field } => SqlExpr::Floor {
+            expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
+            field,
+        },
+        SqlExpr::Array(ast::Array { elem, named }) => SqlExpr::Array(ast::Array {
+            elem: elem
+                .into_iter()
+                .map(|e| strip_self_qualifier(e, current_symbol))
+                .collect(),
+            named,
+        }),
+        SqlExpr::Tuple(elems) => SqlExpr::Tuple(
+            elems
+                .into_iter()
+                .map(|e| strip_self_qualifier(e, current_symbol))
+                .collect(),
+        ),
         SqlExpr::Between {
             expr,
             negated,
@@ -635,6 +814,138 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             SqlExpr::IsNotNull(inner) => {
                 Ok(SqlExpr::IsNotNull(Box::new(self.rewrite_outer(*inner)?)))
             }
+            SqlExpr::IsTrue(inner) => Ok(SqlExpr::IsTrue(Box::new(self.rewrite_outer(*inner)?))),
+            SqlExpr::IsFalse(inner) => Ok(SqlExpr::IsFalse(Box::new(self.rewrite_outer(*inner)?))),
+            SqlExpr::IsNotTrue(inner) => {
+                Ok(SqlExpr::IsNotTrue(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsNotFalse(inner) => {
+                Ok(SqlExpr::IsNotFalse(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsUnknown(inner) => {
+                Ok(SqlExpr::IsUnknown(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsNotUnknown(inner) => {
+                Ok(SqlExpr::IsNotUnknown(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
+                Box::new(self.rewrite_outer(*l)?),
+                Box::new(self.rewrite_outer(*r)?),
+            )),
+            SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
+                Box::new(self.rewrite_outer(*l)?),
+                Box::new(self.rewrite_outer(*r)?),
+            )),
+            SqlExpr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::Like {
+                negated,
+                any,
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                pattern: Box::new(self.rewrite_outer(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::ILike {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::ILike {
+                negated,
+                any,
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                pattern: Box::new(self.rewrite_outer(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::SimilarTo {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::SimilarTo {
+                negated,
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                pattern: Box::new(self.rewrite_outer(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                special,
+                shorthand,
+            } => Ok(SqlExpr::Substring {
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                substring_from: substring_from
+                    .map(|e| self.rewrite_outer(*e))
+                    .transpose()?
+                    .map(Box::new),
+                substring_for: substring_for
+                    .map(|e| self.rewrite_outer(*e))
+                    .transpose()?
+                    .map(Box::new),
+                special,
+                shorthand,
+            }),
+            SqlExpr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => Ok(SqlExpr::Trim {
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                trim_where,
+                trim_what: trim_what
+                    .map(|e| self.rewrite_outer(*e))
+                    .transpose()?
+                    .map(Box::new),
+                trim_characters: trim_characters
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|e| self.rewrite_outer(e))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?,
+            }),
+            SqlExpr::Position { expr, r#in } => Ok(SqlExpr::Position {
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                r#in: Box::new(self.rewrite_outer(*r#in)?),
+            }),
+            SqlExpr::Extract {
+                field,
+                syntax,
+                expr,
+            } => Ok(SqlExpr::Extract {
+                field,
+                syntax,
+                expr: Box::new(self.rewrite_outer(*expr)?),
+            }),
+            SqlExpr::Ceil { expr, field } => Ok(SqlExpr::Ceil {
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                field,
+            }),
+            SqlExpr::Floor { expr, field } => Ok(SqlExpr::Floor {
+                expr: Box::new(self.rewrite_outer(*expr)?),
+                field,
+            }),
+            SqlExpr::Array(ast::Array { elem, named }) => Ok(SqlExpr::Array(ast::Array {
+                elem: elem
+                    .into_iter()
+                    .map(|e| self.rewrite_outer(e))
+                    .collect::<Result<Vec<_>>>()?,
+                named,
+            })),
+            SqlExpr::Tuple(elems) => Ok(SqlExpr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.rewrite_outer(e))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
             SqlExpr::Cast {
                 kind,
                 expr,
@@ -875,6 +1186,16 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
         args: &FunctionArguments,
     ) -> Result<MeasureSlotKind> {
         let (arg_exprs, distinct) = extract_unnamed_args(args)?;
+        if udaf.is_none() && fname == "count" && arg_exprs.is_empty() && !distinct {
+            return Ok(MeasureSlotKind::Agg {
+                agg_kind: AggKind::CountStar,
+                symbol: None,
+                args: vec![],
+                distinct: false,
+                arg_physical_nav: None,
+                uses_match_metadata: false,
+            });
+        }
         if udaf.is_none() && arg_exprs.len() != 1 {
             return plan_err!(
                 "{fname}() in MATCH_RECOGNIZE expects 1 argument, got {}",
@@ -976,7 +1297,18 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 }
                 shared_symbol = Some(s);
             }
-            let (replaced, has_meta) = rewrite_match_metadata_in_agg_arg(stripped)?;
+            let (replaced, has_meta, meta_sym) =
+                rewrite_match_metadata_in_agg_arg(stripped, self.known_symbols)?;
+            if let Some(s) = meta_sym {
+                if let Some(existing) = &shared_symbol
+                    && existing != &s
+                {
+                    return plan_err!(
+                        "Aggregate {fname}() cannot reference multiple pattern variables ('{existing}' and '{s}')"
+                    );
+                }
+                shared_symbol = Some(s);
+            }
             if has_meta {
                 uses_match_metadata = true;
             }
@@ -1078,24 +1410,56 @@ fn parse_non_negative_u32(expr: &SqlExpr) -> Result<u32> {
     }
 }
 
-/// Rewrites `CLASSIFIER()` and `MATCH_NUMBER()` inside an aggregate argument expression to
-/// synthetic columns `__mr_agg_classifier` and `__mr_agg_match_number`.
-fn rewrite_match_metadata_in_agg_arg(expr: SqlExpr) -> Result<(SqlExpr, bool)> {
+/// Rewrites `CLASSIFIER([sym])` and `MATCH_NUMBER()` inside an aggregate argument expression to
+/// synthetic columns `__mr_agg_classifier` and `__mr_agg_match_number`, returning any pattern
+/// variable symbol referenced by `CLASSIFIER(sym)`.
+fn rewrite_match_metadata_in_agg_arg(
+    expr: SqlExpr,
+    known_symbols: &HashSet<String>,
+) -> Result<(SqlExpr, bool, Option<String>)> {
     let mut found = false;
-    let rewritten = rewrite_meta_inner(expr, &mut found)?;
-    Ok((rewritten, found))
+    let mut classifier_sym: Option<String> = None;
+    let rewritten = rewrite_meta_inner(expr, known_symbols, &mut found, &mut classifier_sym)?;
+    Ok((rewritten, found, classifier_sym))
 }
 
-fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
+fn rewrite_meta_inner(
+    expr: SqlExpr,
+    known_symbols: &HashSet<String>,
+    found: &mut bool,
+    classifier_sym: &mut Option<String>,
+) -> Result<SqlExpr> {
     match expr {
         SqlExpr::Function(func) => {
             let fname = func.name.to_string().to_ascii_lowercase();
             if fname == "classifier" {
                 let (args, _) = extract_unnamed_args(&func.args)?;
-                if !args.is_empty() {
-                    return plan_err!(
-                        "CLASSIFIER() inside aggregate arguments currently takes no arguments"
-                    );
+                match args.len() {
+                    0 => {}
+                    1 => match &args[0] {
+                        FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
+                            let sym = normalize_pattern_ident(id.clone());
+                            if !known_symbols.contains(&sym) {
+                                return plan_err!(
+                                    "CLASSIFIER({sym}) references unknown pattern variable"
+                                );
+                            }
+                            if let Some(existing) = classifier_sym.as_ref()
+                                && existing != &sym
+                            {
+                                return plan_err!(
+                                    "Aggregate argument cannot reference multiple pattern variables ('{existing}' and '{sym}')"
+                                );
+                            }
+                            *classifier_sym = Some(sym);
+                        }
+                        _ => {
+                            return plan_err!(
+                                "CLASSIFIER() argument must be a pattern variable identifier"
+                            );
+                        }
+                    },
+                    _ => return plan_err!("CLASSIFIER() takes at most 1 argument"),
                 }
                 *found = true;
                 return Ok(SqlExpr::Identifier(Ident::new(AGG_META_CLASSIFIER_COL)));
@@ -1114,7 +1478,7 @@ fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
                             let owned =
                                 std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
-                            *e = rewrite_meta_inner(owned, found)?;
+                            *e = rewrite_meta_inner(owned, known_symbols, found, classifier_sym)?;
                         }
                     }
                     FunctionArguments::List(list)
@@ -1124,17 +1488,164 @@ fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
             Ok(SqlExpr::Function(ast::Function { args, ..func }))
         }
         SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
-            left: Box::new(rewrite_meta_inner(*left, found)?),
+            left: Box::new(rewrite_meta_inner(
+                *left,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
             op,
-            right: Box::new(rewrite_meta_inner(*right, found)?),
+            right: Box::new(rewrite_meta_inner(
+                *right,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
         }),
         SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
             op,
-            expr: Box::new(rewrite_meta_inner(*expr, found)?),
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
         }),
         SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(rewrite_meta_inner(
-            *inner, found,
+            *inner,
+            known_symbols,
+            found,
+            classifier_sym,
         )?))),
+        SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(rewrite_meta_inner(
+            *inner,
+            known_symbols,
+            found,
+            classifier_sym,
+        )?))),
+        SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(rewrite_meta_inner(
+            *inner,
+            known_symbols,
+            found,
+            classifier_sym,
+        )?))),
+        SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
+            Box::new(rewrite_meta_inner(
+                *l,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            Box::new(rewrite_meta_inner(
+                *r,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+        )),
+        SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
+            Box::new(rewrite_meta_inner(
+                *l,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            Box::new(rewrite_meta_inner(
+                *r,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+        )),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::Like {
+            negated,
+            any,
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            pattern: Box::new(rewrite_meta_inner(
+                *pattern,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            escape_char,
+        }),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::ILike {
+            negated,
+            any,
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            pattern: Box::new(rewrite_meta_inner(
+                *pattern,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            escape_char,
+        }),
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(SqlExpr::Between {
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            negated,
+            low: Box::new(rewrite_meta_inner(
+                *low,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            high: Box::new(rewrite_meta_inner(
+                *high,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+        }),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(SqlExpr::InList {
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
+            list: list
+                .into_iter()
+                .map(|e| rewrite_meta_inner(e, known_symbols, found, classifier_sym))
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        }),
         SqlExpr::Cast {
             kind,
             expr,
@@ -1142,7 +1653,12 @@ fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
             format,
         } => Ok(SqlExpr::Cast {
             kind,
-            expr: Box::new(rewrite_meta_inner(*expr, found)?),
+            expr: Box::new(rewrite_meta_inner(
+                *expr,
+                known_symbols,
+                found,
+                classifier_sym,
+            )?),
             data_type,
             format,
         }),
@@ -1154,18 +1670,23 @@ fn rewrite_meta_inner(expr: SqlExpr, found: &mut bool) -> Result<SqlExpr> {
             else_result,
         } => {
             let operand = operand
-                .map(|e| rewrite_meta_inner(*e, found))
+                .map(|e| rewrite_meta_inner(*e, known_symbols, found, classifier_sym))
                 .transpose()?
                 .map(Box::new);
             let mut new_conditions = Vec::with_capacity(conditions.len());
             for c in conditions {
                 new_conditions.push(ast::CaseWhen {
-                    condition: rewrite_meta_inner(c.condition, found)?,
-                    result: rewrite_meta_inner(c.result, found)?,
+                    condition: rewrite_meta_inner(
+                        c.condition,
+                        known_symbols,
+                        found,
+                        classifier_sym,
+                    )?,
+                    result: rewrite_meta_inner(c.result, known_symbols, found, classifier_sym)?,
                 });
             }
             let else_result = else_result
-                .map(|e| rewrite_meta_inner(*e, found))
+                .map(|e| rewrite_meta_inner(*e, known_symbols, found, classifier_sym))
                 .transpose()?
                 .map(Box::new);
             Ok(SqlExpr::Case {
@@ -1226,6 +1747,73 @@ fn strip_symbol_inner(
             known_symbols,
             found,
         )?))),
+        SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(strip_symbol_inner(
+            *inner,
+            known_symbols,
+            found,
+        )?))),
+        SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(strip_symbol_inner(
+            *inner,
+            known_symbols,
+            found,
+        )?))),
+        SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
+            Box::new(strip_symbol_inner(*l, known_symbols, found)?),
+            Box::new(strip_symbol_inner(*r, known_symbols, found)?),
+        )),
+        SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
+            Box::new(strip_symbol_inner(*l, known_symbols, found)?),
+            Box::new(strip_symbol_inner(*r, known_symbols, found)?),
+        )),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::Like {
+            negated,
+            any,
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
+            pattern: Box::new(strip_symbol_inner(*pattern, known_symbols, found)?),
+            escape_char,
+        }),
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Ok(SqlExpr::ILike {
+            negated,
+            any,
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
+            pattern: Box::new(strip_symbol_inner(*pattern, known_symbols, found)?),
+            escape_char,
+        }),
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(SqlExpr::Between {
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
+            negated,
+            low: Box::new(strip_symbol_inner(*low, known_symbols, found)?),
+            high: Box::new(strip_symbol_inner(*high, known_symbols, found)?),
+        }),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(SqlExpr::InList {
+            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
+            list: list
+                .into_iter()
+                .map(|e| strip_symbol_inner(e, known_symbols, found))
+                .collect::<Result<Vec<_>>>()?,
+            negated,
+        }),
         SqlExpr::Cast {
             kind,
             expr,

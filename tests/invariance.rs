@@ -893,6 +893,73 @@ async fn test_udaf_and_classifier_nav_proto_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_metadata_agg_and_quoted_labels_proto_roundtrip() {
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new()
+            .with_batch_size(2)
+            .with_target_partitions(2),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+
+    let sql = r#"
+        WITH seq(id, val) AS (
+            VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')
+        )
+        SELECT * FROM seq
+        MATCH_RECOGNIZE (
+            ORDER BY id
+            MEASURES
+                MATCH_NUMBER() AS mn,
+                CLASSIFIER() AS cls,
+                NEXT(CLASSIFIER()) AS next_cls,
+                ARRAY_AGG(val || CLASSIFIER()) AS tagged,
+                ARRAY_AGG(CLASSIFIER("b")) AS b_labels,
+                MAX(id + MATCH_NUMBER()) AS max_id_mn
+            ALL ROWS PER MATCH
+            PATTERN (a "b"+ C)
+            DEFINE
+                a AS id = 1,
+                "b" AS id IN (2, 3) AND max(id - 2 * MATCH_NUMBER()) >= 0,
+                C AS id = 4
+        )
+        ORDER BY id
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+    let expected = pretty_format_batches(&df.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    let lplan = df.clone().into_optimized_plan().unwrap();
+    let lcodec = MatchRecognizeLogicalCodec::new();
+    let lbytes = logical_plan_to_bytes_with_extension_codec(&lplan, &lcodec).unwrap();
+    let ldecoded =
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+    let lout = pretty_format_batches(
+        &ctx.execute_logical_plan(ldecoded)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    assert_eq!(lout, expected);
+
+    let pplan = df.create_physical_plan().await.unwrap();
+    let pcodec = MatchRecognizePhysicalCodec::new();
+    let pbytes = physical_plan_to_bytes_with_extension_codec(pplan, &pcodec).unwrap();
+    let pdecoded =
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+    let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
+        .unwrap()
+        .to_string();
+    assert_eq!(pout, expected);
+}
+
+#[tokio::test]
 async fn test_sql_unparser_roundtrip() {
     use datafusion_expr::logical_plan::LogicalPlan;
     use datafusion_match_recognize::MatchRecognizeUnparser;

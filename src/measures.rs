@@ -758,10 +758,8 @@ pub fn build_partition_output_batch(
                         });
                     }
                 } else {
-                    let mut emitted_any = false;
                     for (idx, step) in found.steps.iter().enumerate() {
                         if !step.excluded {
-                            emitted_any = true;
                             emitted.push(EmitRow::Matched {
                                 found,
                                 step_pos: Some(idx),
@@ -769,14 +767,6 @@ pub fn build_partition_output_batch(
                                 is_empty_match: false,
                             });
                         }
-                    }
-                    if !emitted_any && rows_per_match.show_empty_matches() {
-                        emitted.push(EmitRow::Matched {
-                            found,
-                            step_pos: None,
-                            source_row: found.start_row,
-                            is_empty_match: true,
-                        });
                     }
                 }
             }

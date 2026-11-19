@@ -994,13 +994,345 @@ async fn test_live_trino_differential_oracle() {
             ORDER BY m.match_no
             "#,
         ),
+        (
+            "trino_all_excluded_all_rows_show_empty",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT m.id, m.mn, m.v FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES MATCH_NUMBER() AS mn
+                ALL ROWS PER MATCH SHOW EMPTY MATCHES
+                PATTERN (({- A -}) ({- B -}))
+                DEFINE A AS true, B AS true
+            ) AS m
+            "#,
+        ),
+        (
+            "trino_all_excluded_one_row",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT m.mn, m.cls, m.s FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls, SUM(v) AS s
+                ONE ROW PER MATCH
+                PATTERN (({- A -}) ({- B -}))
+                DEFINE A AS true, B AS true
+            ) AS m
+            "#,
+        ),
+        (
+            "trino_mixed_excluded_match_number",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20), (3, 30))
+            SELECT m.id, m.mn, m.cls FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+                ALL ROWS PER MATCH SHOW EMPTY MATCHES
+                PATTERN (({- A -}) | B)
+                DEFINE A AS v = 10, B AS v > 10
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_exclusions_array_agg_classifier",
+            r#"
+            WITH t(part, id, value) AS (
+                VALUES
+                    ('p1', 1, '1a'), ('p1', 2, '1b'), ('p1', 3, '1c'), ('p1', 4, '1d'), ('p1', 5, '1e'),
+                    ('p2', 1, '2a'), ('p2', 2, '2b'), ('p2', 3, '2c'), ('p2', 4, '2d'), ('p2', 5, '2e')
+            )
+            SELECT m.part, m.measure_1, m.measure_2 FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY part
+                ORDER BY id
+                MEASURES
+                    array_agg(value) AS measure_1,
+                    array_agg(value || CLASSIFIER()) AS measure_2
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (P ({- Q -}) ({- R -}) S)
+                DEFINE P AS id > 1
+            ) AS m
+            ORDER BY m.part, m.id
+            "#,
+        ),
+        (
+            "trino_tentative_label_avg_b",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 4), (2, 6), (3, 0))
+            SELECT m.id, m.classy, m.running_avg_b FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES avg(B.value) AS running_avg_b, CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B)*)
+                DEFINE A AS avg(B.value) = 5
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_tentative_label_avg_a",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 4), (2, 6), (3, 0), (4, 5))
+            SELECT m.id, m.classy, m.running_avg_a FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES avg(A.value) AS running_avg_a, CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B)*)
+                DEFINE A AS avg(A.value) = 5
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_tentative_label_runtime_match_number",
+            r#"
+            WITH t(id, part, val) AS (
+                VALUES
+                    (1, 'p1', CAST(1 AS INTEGER)), (2, 'p1', 2), (3, 'p1', 3), (4, 'p1', 4), (5, 'p1', 5),
+                    (1, 'p2', 2), (2, 'p2', 4), (3, 'p2', 6), (4, 'p2', 8), (5, 'p2', 10)
+            )
+            SELECT m.part, m.id, m.classy, m.running_max FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY part
+                ORDER BY id
+                MEASURES max(val) AS running_max, CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B)*)
+                DEFINE A AS max(val + MATCH_NUMBER()) > 5
+            ) AS m
+            ORDER BY m.part, m.id
+            "#,
+        ),
+        (
+            "trino_agg_args_duplicate_col_and_qualified_classifier",
+            r#"
+            WITH t(id, value) AS (VALUES (1, 'a'), (2, 'b'), (3, 'c'))
+            SELECT m.id, m.dup, m.a_cls, m.b_tagged FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    array_agg(value || value || CLASSIFIER()) AS dup,
+                    array_agg(CLASSIFIER(A)) AS a_cls,
+                    array_agg(B.value || CLASSIFIER(B)) AS b_tagged
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (A B A)
+                DEFINE A AS true
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_count_empty_and_label_column_collision",
+            r#"
+            WITH t(id, a) AS (VALUES (1, 'p'), (2, 'q'), (3, CAST(NULL AS VARCHAR)), (4, 's'))
+            SELECT m.id, m.classy, m.m1, m.m2, m.m3, m.m4 FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    CLASSIFIER() AS classy,
+                    count(A.a) AS m1,
+                    count(a) AS m2,
+                    count(A.*) AS m3,
+                    count() AS m4
+                ALL ROWS PER MATCH
+                PATTERN (A B A A)
+                DEFINE A AS true
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_set_partitioning_3way",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6))
+            SELECT m.id, m.running_labels FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES array_agg(CLASSIFIER()) AS running_labels
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (^ (A | B | C)* (LAST_A | LAST_B | LAST_C) $)
+                DEFINE
+                    LAST_A AS sum(A.id) + id = sum(B.id) AND sum(B.id) = sum(C.id),
+                    LAST_B AS sum(B.id) + id = sum(A.id) AND sum(A.id) = sum(C.id),
+                    LAST_C AS sum(C.id) + id = sum(A.id) AND sum(A.id) = sum(B.id)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_scalar_in_and_like_predicates",
+            r#"
+            WITH t(id, tag, value) AS (
+                VALUES (1, 'alpha_1', 100), (2, 'alpha_2', 200), (3, 'beta_3', 300), (4, 'beta_4', 400)
+            )
+            SELECT m.id, m.v1, m.v2, m.v3, m.is_a, m.diff_prev FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    FIRST(A.value) IN (100, LAST(A.value)) AS v1,
+                    CLASSIFIER() IN ('X', lower(CLASSIFIER())) AS v2,
+                    MATCH_NUMBER() IN (0, MATCH_NUMBER()) AS v3,
+                    CLASSIFIER() LIKE 'A%' AS is_a,
+                    value IS DISTINCT FROM PREV(value) AS diff_prev
+                ALL ROWS PER MATCH
+                PATTERN (A+ B+)
+                DEFINE
+                    A AS A.tag LIKE 'alpha%',
+                    B AS LAST(A.tag) LIKE 'alpha%' AND B.value IS DISTINCT FROM LAST(A.value)
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_exponential_match_and_kill_thread",
+            r#"
+            WITH t(value) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9))
+            SELECT m.classy FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY value
+                MEASURES CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                PATTERN ((A | B)+ LAST)
+                DEFINE LAST AS
+                    FIRST(CLASSIFIER()) = 'B' AND
+                    FIRST(CLASSIFIER(), 1) = 'B' AND
+                    FIRST(CLASSIFIER(), 2) = 'B' AND
+                    FIRST(CLASSIFIER(), 3) = 'B' AND
+                    FIRST(CLASSIFIER(), 4) = 'B' AND
+                    FIRST(CLASSIFIER(), 5) = 'B' AND
+                    FIRST(CLASSIFIER(), 6) = 'B' AND
+                    FIRST(CLASSIFIER(), 7) = 'B'
+            ) AS m
+            ORDER BY m.value
+            "#,
+        ),
+        (
+            "trino_kill_thread_nullable_loop",
+            r#"
+            WITH t(x) AS (VALUES (1), (2), (3), (4), (5))
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                MEASURES 'foo' AS foo
+                PATTERN ((Y?){2,})
+                DEFINE Y AS true
+            )
+            "#,
+        ),
+        (
+            "flink_logical_offsets_backtracking",
+            r#"
+            WITH ticker(symbol, tstamp, price, tax) AS (
+                VALUES
+                    ('ACME', 1, 19, 1), ('ACME', 2, 17, 2), ('ACME', 3, 13, 3), ('ACME', 4, 20, 4),
+                    ('ACME', 5, 20, 5), ('ACME', 6, 26, 6), ('ACME', 7, 20, 7), ('ACME', 8, 25, 8)
+            )
+            SELECT * FROM ticker
+            MATCH_RECOGNIZE (
+                ORDER BY tstamp
+                MEASURES
+                    FIRST(DOWN.tstamp) AS start_tstamp,
+                    LAST(DOWN.tstamp) AS bottom_tstamp,
+                    UP.tstamp AS end_tstamp,
+                    FIRST(DOWN.price + DOWN.tax + 1) AS bottom_total,
+                    UP.price + UP.tax AS end_total
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (DOWN{2,} UP)
+                DEFINE
+                    DOWN AS price < LAST(DOWN.price, 1) OR LAST(DOWN.price, 1) IS NULL,
+                    UP AS price < FIRST(DOWN.price)
+            ) AS T
+            ORDER BY start_tstamp
+            "#,
+        ),
+        (
+            "flink_logical_offsets_and_star_variable",
+            r#"
+            WITH ticker(id, symbol, tstamp, price) AS (
+                VALUES
+                    (1, 'ACME', 1, 20), (2, 'ACME', 2, 19), (3, 'ACME', 3, 18), (4, 'ACME', 4, 17),
+                    (5, 'ACME', 5, 16), (6, 'ACME', 6, 15), (7, 'ACME', 7, 14), (8, 'ACME', 8, 20)
+            )
+            SELECT * FROM ticker
+            MATCH_RECOGNIZE (
+                ORDER BY tstamp
+                MEASURES
+                    FIRST(id, 0) AS id0, FIRST(id, 3) AS id3, FIRST(id, 7) AS id7,
+                    LAST(id, 0) AS id8, LAST(id, 3) AS id11, LAST(id, 7) AS id15
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ("DOWN_Q"{2,} UP)
+                DEFINE
+                    "DOWN_Q" AS price < LAST(price, 1) OR LAST(price, 1) IS NULL,
+                    UP AS price = FIRST(price) AND price > FIRST(price, 3) AND price = LAST(price, 7)
+            ) AS T
+            "#,
+        ),
+        (
+            "flink_aggregates_and_null_inputs",
+            r#"
+            WITH my_table(id, name, price) AS (
+                VALUES
+                    (1, 'a', 10), (2, 'z', 10),
+                    (3, 'b', CAST(NULL AS INTEGER)), (4, 'c', CAST(NULL AS INTEGER)),
+                    (5, 'd', 3), (6, 'c', 3), (7, 'c', 3), (8, 'c', 3), (9, 'c', 2)
+            )
+            SELECT * FROM my_table
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    SUM(A.price) AS sum_a,
+                    COUNT(A.id) AS count_a_id,
+                    COUNT(A.price) AS count_a_price,
+                    COUNT(*) AS count_all,
+                    COUNT(price) AS count_all_price,
+                    LAST(id) AS end_id
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (A+ C)
+                DEFINE
+                    A AS SUM(A.price) < 30,
+                    C AS C.name = 'c'
+            ) AS T
+            "#,
+        ),
+        (
+            "flink_multi_column_order_by",
+            r#"
+            WITH my_table(ts, secondary_order, ternary_order, name, id) AS (
+                VALUES
+                    (2, 12, 1, 'a', 1), (1, 11, 2, 'b', 2), (3, 10, 3, 'c', 3),
+                    (4,  8, 4, 'a', 4), (4,  9, 5, 'b', 5), (5,  7, 6, 'c', 6),
+                    (6,  6, 8, 'a', 7), (6,  6, 7, 'b', 8), (8,  4, 9, 'c', 9),
+                    (9,  3, 10, 'a', 10), (10, 2, 11, 'b', 11), (11, 1, 12, 'c', 12)
+            )
+            SELECT T.aid, T.bid, T.cid FROM my_table
+            MATCH_RECOGNIZE (
+                ORDER BY ts, secondary_order DESC, ternary_order ASC
+                MEASURES A.id AS aid, B.id AS bid, C.id AS cid
+                PATTERN (A B C)
+                DEFINE A AS name = 'a', B AS name = 'b', C AS name = 'c'
+            ) AS T
+            "#,
+        ),
     ];
 
     for (name, sql) in &edge_cases {
         assert_matches_trino(&client, &base_url, name, sql).await;
     }
 
-    // 6. Seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (50 queries)
+    // 6. Seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (100 queries)
     let mut rng_state: u64 = 0x5EED_CAFE_1234_ABCD;
     let mut next_u64 = || -> u64 {
         rng_state ^= rng_state << 13;
@@ -1009,19 +1341,28 @@ async fn test_live_trino_differential_oracle() {
         rng_state
     };
 
-    let rand_patterns: &[(&str, &str)] = &[
+    let rand_patterns: &[(&str, &str, bool)] = &[
         (
             "a b* c?",
             "a AS v >= 1 AND v <= 4, b AS v >= 3 AND v <= 6, c AS v >= 5",
+            false,
         ),
-        ("(a | a b)", "a AS v <= 4, b AS v >= 3"),
-        ("s d+ u+", "d AS d.v < PREV(d.v), u AS u.v > PREV(u.v)"),
-        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)"),
+        ("(a | a b)", "a AS v <= 4, b AS v >= 3", false),
+        (
+            "s d+ u+",
+            "d AS d.v < PREV(d.v), u AS u.v > PREV(u.v)",
+            false,
+        ),
+        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)", false),
         (
             "a b+",
             "a AS v >= 2, b AS b.v - FIRST(a.v) <= 3 AND COUNT(b.*) <= 3",
+            false,
         ),
-        ("PERMUTE(a, b)", "a AS v <= 4, b AS v >= 4"),
+        ("PERMUTE(a, b)", "a AS v <= 4, b AS v >= 4", false),
+        ("a*", "a AS v >= 2 AND v <= 6", false),
+        ("({- a -}) b+", "a AS v <= 4, b AS v >= 3", true),
+        ("({- a -}) | b", "a AS v <= 3, b AS v >= 5", true),
     ];
     let rand_orders = ["ORDER BY id ASC", "ORDER BY id DESC NULLS FIRST"];
     let rand_skips = [
@@ -1030,7 +1371,7 @@ async fn test_live_trino_differential_oracle() {
     ];
 
     let mut random_checked = 0usize;
-    for q in 0..50usize {
+    for q in 0..100usize {
         let num_parts = (next_u64() % 3 + 1) as usize;
         let mut value_rows = Vec::new();
         for p in 1..=num_parts {
@@ -1046,16 +1387,28 @@ async fn test_live_trino_differential_oracle() {
             }
         }
         let values_sql = value_rows.join(", ");
-        let (pat, defs) = rand_patterns[(next_u64() as usize) % rand_patterns.len()];
+        let (pat, defs, has_excl) = rand_patterns[(next_u64() as usize) % rand_patterns.len()];
         let ord = rand_orders[(next_u64() as usize) % rand_orders.len()];
         let skip = rand_skips[(next_u64() as usize) % rand_skips.len()];
-        let (mode, outer_ord) = if (next_u64() % 2) == 0 {
-            ("ONE ROW PER MATCH", "ORDER BY p, mn")
-        } else {
-            (
+        let mode_choice = (next_u64() % 4) as usize;
+        let (mode, outer_ord) = match mode_choice {
+            0 => ("ONE ROW PER MATCH", "ORDER BY p, mn"),
+            1 => (
                 "ALL ROWS PER MATCH OMIT EMPTY MATCHES",
                 "ORDER BY p, mn, id",
-            )
+            ),
+            2 => (
+                "ALL ROWS PER MATCH SHOW EMPTY MATCHES",
+                "ORDER BY p, mn, id NULLS FIRST",
+            ),
+            _ if !has_excl => (
+                "ALL ROWS PER MATCH WITH UNMATCHED ROWS",
+                "ORDER BY p, id, mn NULLS FIRST",
+            ),
+            _ => (
+                "ALL ROWS PER MATCH SHOW EMPTY MATCHES",
+                "ORDER BY p, mn, id NULLS FIRST",
+            ),
         };
 
         let sql = format!(
@@ -1069,6 +1422,8 @@ async fn test_live_trino_differential_oracle() {
                     MATCH_NUMBER() AS mn,
                     FIRST(CLASSIFIER()) AS f_cls,
                     LAST(CLASSIFIER()) AS l_cls,
+                    NEXT(CLASSIFIER()) AS n_cls,
+                    ARRAY_AGG(CLASSIFIER()) AS cls_arr,
                     FIRST(v) AS fv,
                     LAST(v) AS lv,
                     COUNT(*) AS cnt,

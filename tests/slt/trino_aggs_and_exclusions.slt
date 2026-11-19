@@ -1,0 +1,517 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported from Trino's TestRowPatternMatching.java and TestAggregationsInRowPatternMatching.java:
+# exclusions, tentative label matching, aggregation arguments, label/column collisions,
+# scalar functions, IN predicates, LIKE/IS DISTINCT FROM, and exponential backtracking cases.
+
+# 1. Exclusion syntax: all-excluded non-empty match emits 0 rows in ALL ROWS PER MATCH
+#    (even under SHOW EMPTY MATCHES), while ONE ROW PER MATCH emits 1 row with full measures.
+query III
+WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+SELECT m.id, m.mn, m.v FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  ALL ROWS PER MATCH SHOW EMPTY MATCHES
+  PATTERN (({- A -}) ({- B -}))
+  DEFINE A AS true, B AS true
+) AS m;
+----
+
+query III
+WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+SELECT m.id, m.mn, m.v FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  ALL ROWS PER MATCH OMIT EMPTY MATCHES
+  PATTERN (({- A -}) ({- B -}))
+  DEFINE A AS true, B AS true
+) AS m;
+----
+
+query ITI
+WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+SELECT m.mn, m.cls, m.s FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls, SUM(v) AS s
+  ONE ROW PER MATCH
+  PATTERN (({- A -}) ({- B -}))
+  DEFINE A AS true, B AS true
+) AS m;
+----
+1 B 30
+
+# Mixed excluded and non-excluded alternation: excluded match #1 emits 0 rows yet increments MATCH_NUMBER()
+query IIT
+WITH t(id, v) AS (VALUES (1, 10), (2, 20), (3, 30))
+SELECT m.id, m.mn, m.cls FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH SHOW EMPTY MATCHES
+  PATTERN (({- A -}) | B)
+  DEFINE A AS v = 10, B AS v > 10
+) AS m
+ORDER BY m.id;
+----
+2 2 B
+3 3 B
+
+# 2. Trino testExclusions: excluded rows still contribute to aggregates (including runtime CLASSIFIER())
+query TTT
+WITH t(part, id, value) AS (
+  VALUES
+    ('p1', 1, '1a'), ('p1', 2, '1b'), ('p1', 3, '1c'), ('p1', 4, '1d'), ('p1', 5, '1e'),
+    ('p2', 1, '2a'), ('p2', 2, '2b'), ('p2', 3, '2c'), ('p2', 4, '2d'), ('p2', 5, '2e')
+)
+SELECT m.part, m.measure_1, m.measure_2 FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES
+    array_agg(value) AS measure_1,
+    array_agg(value || CLASSIFIER()) AS measure_2
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (P ({- Q -}) ({- R -}) S)
+  DEFINE P AS id > 1
+) AS m
+ORDER BY m.part, m.id;
+----
+p1 [1b] [1bP]
+p1 [1b, 1c, 1d, 1e] [1bP, 1cQ, 1dR, 1eS]
+p2 [2b] [2bP]
+p2 [2b, 2c, 2d, 2e] [2bP, 2cQ, 2dR, 2eS]
+
+# 3. Trino testRowPattern: impossible anchors (A^, ^A^, $A, $A$), ordered alternation, PERMUTE tie-breaking, deep grouping
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.mn, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, LAST(value) AS val, CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  PATTERN (A ^)
+  DEFINE A AS true
+) AS m;
+----
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.mn, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, LAST(value) AS val, CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  PATTERN ($ A)
+  DEFINE A AS true
+) AS m;
+----
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.mn, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, LAST(value) AS val, CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (B | C | A)
+  DEFINE
+    B AS B.value < PREV(B.value),
+    C AS C.value <= PREV(C.value)
+) AS m
+ORDER BY m.id;
+----
+1 1 90 A
+2 2 80 B
+3 3 70 B
+4 4 70 C
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.mn, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, LAST(value) AS val, CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (PERMUTE(B, C))
+  DEFINE
+    B AS B.value < PREV(B.value),
+    C AS C.value < PREV(C.value)
+) AS m
+ORDER BY m.id;
+----
+2 1 80 B
+3 1 70 C
+
+query IIIT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 70), (4, 70))
+SELECT m.id, m.mn, m.val, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, LAST(value) AS val, CLASSIFIER() AS label
+  ALL ROWS PER MATCH
+  PATTERN ((((A) (B (C)))))
+  DEFINE
+    B AS B.value < PREV(B.value),
+    C AS C.value = PREV(C.value)
+) AS m
+ORDER BY m.id;
+----
+2 1 80 A
+3 1 70 B
+4 1 70 C
+
+# 4. Trino testKillThread: nullable body inside unbounded repetition ((Y?){2,})
+query T
+WITH t(x) AS (VALUES (1), (2), (3), (4), (5))
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  MEASURES 'foo' AS foo
+  PATTERN ((Y?){2,})
+  DEFINE Y AS true
+);
+----
+foo
+
+# 5. Trino testTentativeLabelMatch (all 5 variants + runtime-evaluated MATCH_NUMBER() arg)
+query ITR
+WITH t(id, value) AS (VALUES (1, 4), (2, 6), (3, 0))
+SELECT m.id, m.classy, m.running_avg_b FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    avg(B.value) AS running_avg_b,
+    CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)*)
+  DEFINE A AS avg(B.value) = 5
+) AS m
+ORDER BY m.id;
+----
+1 B 4.0
+2 B 5.0
+3 A 5.0
+
+query ITR
+WITH t(id, value) AS (VALUES (1, 4), (2, 6), (3, 0), (4, 5))
+SELECT m.id, m.classy, m.running_avg_a FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    avg(A.value) AS running_avg_a,
+    CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)*)
+  DEFINE A AS avg(A.value) = 5
+) AS m
+ORDER BY m.id;
+----
+1 B NULL
+2 B NULL
+3 B NULL
+4 A 5.0
+
+query TII
+WITH t(id, part, value) AS (
+  VALUES
+    (1, 'p1', 1), (2, 'p1', 1), (6, 'p1', 1),
+    (2, 'p2', 10), (2, 'p3', 100), (1, 'p3', 100),
+    (3, 'p1', 1), (4, 'p1', 1), (5, 'p1', 1),
+    (1, 'p2', 10), (3, 'p3', 100), (3, 'p2', 10)
+)
+SELECT m.part, m.id, m.running_sum FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES sum(value) AS running_sum
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (B (A | B) B)
+  DEFINE A AS sum(value) > 1000
+) AS m
+ORDER BY m.part, m.id;
+----
+p1 1 1
+p1 2 2
+p1 3 3
+p1 4 1
+p1 5 2
+p1 6 3
+p2 1 10
+p2 2 20
+p2 3 30
+p3 1 100
+p3 2 200
+p3 3 300
+
+query TITI
+WITH t(id, part, value) AS (
+  VALUES
+    (1, 'p1', 1), (2, 'p1', 1), (3, 'p1', 1), (4, 'p1', 1), (5, 'p1', 1),
+    (1, 'p2', 2), (2, 'p2', 2), (3, 'p2', 2), (4, 'p2', 2), (5, 'p2', 2)
+)
+SELECT m.part, m.id, m.classy, m.running_sum FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES
+    sum(value) AS running_sum,
+    CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)*)
+  DEFINE A AS sum(value) > 4
+) AS m
+ORDER BY m.part, m.id;
+----
+p1 1 B 1
+p1 2 B 2
+p1 3 B 3
+p1 4 B 4
+p1 5 A 5
+p2 1 B 2
+p2 2 B 4
+p2 3 A 6
+p2 4 A 8
+p2 5 A 10
+
+# Mixed-type Int32 column + Int64 MATCH_NUMBER() inside DEFINE aggregate
+statement ok
+CREATE TABLE tentative_i32 (id INT, part VARCHAR, val INT) AS VALUES
+  (1, 'p1', 1), (2, 'p1', 2), (3, 'p1', 3), (4, 'p1', 4), (5, 'p1', 5),
+  (1, 'p2', 2), (2, 'p2', 4), (3, 'p2', 6), (4, 'p2', 8), (5, 'p2', 10);
+
+query TITI
+SELECT m.part, m.id, m.classy, m.running_max FROM tentative_i32
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES
+    max(val) AS running_max,
+    CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)*)
+  DEFINE A AS max(val + MATCH_NUMBER()) > 5
+) AS m
+ORDER BY m.part, m.id;
+----
+p1 1 B 1
+p1 2 B 2
+p1 3 B 3
+p1 4 B 4
+p1 5 A 5
+p2 1 B 2
+p2 2 B 4
+p2 3 A 6
+p2 4 A 8
+p2 5 A 10
+
+# 6. Trino testAggregationArguments: duplicate input column, symbol-qualified CLASSIFIER(A), empty symbol agg
+query IT
+WITH t(id, value) AS (VALUES (1, 'a'), (2, 'b'), (3, 'c'))
+SELECT m.id, m.measure FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES array_agg(value || value || CLASSIFIER()) AS measure
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (X Y Z)
+  DEFINE X AS true
+) AS m
+ORDER BY m.id;
+----
+1 [aaX]
+2 [aaX, bbY]
+3 [aaX, bbY, ccZ]
+
+query ITT
+WITH t(id, value) AS (VALUES (1, 'a'), (2, 'b'), (3, 'c'))
+SELECT m.id, m.a_cls, m.b_tagged FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    array_agg(CLASSIFIER(A)) AS a_cls,
+    array_agg(B.value || CLASSIFIER(B)) AS b_tagged
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (A B A)
+  DEFINE A AS true
+) AS m
+ORDER BY m.id;
+----
+1 [A] NULL
+2 [A] [bB]
+3 [A, A] [bB]
+
+# 7. Trino testCountAggregation (COUNT(*), 0-arg COUNT(), COUNT(C.*)) and testLabelAndColumnNames (column A vs label A)
+query IIII
+WITH t(id, value) AS (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'))
+SELECT m.id, m.c_star, m.c_empty, m.c_sym FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    count(*) AS c_star,
+    count() AS c_empty,
+    count(Z.*) AS c_sym
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (X Y Z)
+  DEFINE X AS id > 1
+) AS m
+ORDER BY m.id;
+----
+2 1 1 0
+3 2 2 0
+4 3 3 1
+
+query ITIII
+WITH t(id, a) AS (VALUES (1, 'p'), (2, 'q'), (3, CAST(NULL AS VARCHAR)), (4, 's'))
+SELECT m.id, m.classy, m.m1, m.m2, m.m3 FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() AS classy,
+    count(A.a) AS m1,
+    count(a) AS m2,
+    count(A.*) AS m3
+  ALL ROWS PER MATCH
+  PATTERN (A B A A)
+  DEFINE A AS true
+) AS m
+ORDER BY m.id;
+----
+1 A 1 1 1
+2 B 1 2 1
+3 A 1 2 2
+4 A 2 3 3
+
+# 8. Trino testSetPartitioning (3-subset equal-sum partition)
+query IT
+WITH t(id) AS (VALUES (1), (2), (3), (4), (5), (6))
+SELECT m.id, m.running_labels FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES array_agg(CLASSIFIER()) AS running_labels
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (^ (A | B | C)* (LAST_A | LAST_B | LAST_C) $)
+  DEFINE
+    LAST_A AS sum(A.id) + id = sum(B.id) AND sum(B.id) = sum(C.id),
+    LAST_B AS sum(B.id) + id = sum(A.id) AND sum(A.id) = sum(C.id),
+    LAST_C AS sum(C.id) + id = sum(A.id) AND sum(A.id) = sum(B.id)
+) AS m
+ORDER BY m.id;
+----
+1 [A]
+2 [A, B]
+3 [A, B, C]
+4 [A, B, C, C]
+5 [A, B, C, C, B]
+6 [A, B, C, C, B, LAST_A]
+
+# 9. Trino testScalarFunctions, testInPredicateWithoutSubquery, and LIKE / IS DISTINCT FROM
+query IT
+WITH t(id, value) AS (VALUES (1, 90), (2, 80), (3, 60))
+SELECT m.id, m.label FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES lower(LAST(CLASSIFIER())) || '_label' AS label
+  ALL ROWS PER MATCH
+  PATTERN (A B+)
+  DEFINE B AS B.value + 10 < abs(PREV(B.value))
+) AS m
+ORDER BY m.id;
+----
+2 a_label
+3 b_label
+
+query BBB
+WITH t(id, value) AS (VALUES (1, 100), (2, 200), (3, 300), (4, 400))
+SELECT m.v1, m.v2, m.v3 FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    FIRST(A.value) IN (300, LAST(A.value)) AS v1,
+    CLASSIFIER() IN ('X', lower(CLASSIFIER())) AS v2,
+    MATCH_NUMBER() IN (0, MATCH_NUMBER()) AS v3
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO NEXT ROW
+  PATTERN (A+)
+  DEFINE A AS true
+) AS m;
+----
+false false true
+false false true
+true false true
+true false true
+
+query IBB
+WITH t(id, tag, v) AS (
+  VALUES (1, 'alpha_1', 10), (2, 'alpha_2', 10), (3, 'beta_3', CAST(NULL AS INT))
+)
+SELECT m.id, m.is_a, m.diff_prev FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() LIKE 'A%' AS is_a,
+    v IS DISTINCT FROM PREV(v) AS diff_prev
+  ALL ROWS PER MATCH
+  PATTERN (A+ B)
+  DEFINE
+    A AS A.tag LIKE 'alpha%',
+    B AS LAST(A.tag) LIKE 'alpha%' AND B.v IS DISTINCT FROM LAST(A.v)
+) AS m
+ORDER BY m.id;
+----
+1 true true
+2 true false
+3 false true
+
+# 10. Trino testPotentiallyExponentialMatch and testExponentialMatch
+query T
+WITH t(value) AS (
+  VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1),(1)
+)
+SELECT m.classy FROM t
+MATCH_RECOGNIZE (
+  MEASURES CLASSIFIER() AS classy
+  PATTERN ((A+)+ B)
+  DEFINE A AS value = 1, B AS value = 2
+) AS m;
+----
+
+query T
+WITH t(value) AS (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9))
+SELECT m.classy FROM t
+MATCH_RECOGNIZE (
+  ORDER BY value
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)+ LAST)
+  DEFINE LAST AS
+    FIRST(CLASSIFIER()) = 'B' AND
+    FIRST(CLASSIFIER(), 1) = 'B' AND
+    FIRST(CLASSIFIER(), 2) = 'B' AND
+    FIRST(CLASSIFIER(), 3) = 'B' AND
+    FIRST(CLASSIFIER(), 4) = 'B' AND
+    FIRST(CLASSIFIER(), 5) = 'B' AND
+    FIRST(CLASSIFIER(), 6) = 'B' AND
+    FIRST(CLASSIFIER(), 7) = 'B'
+) AS m;
+----
+B
+B
+B
+B
+B
+B
+B
+B
+LAST

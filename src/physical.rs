@@ -529,10 +529,16 @@ fn apply_slot_exprs(
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
-            PhysicalMeasureSlotKind::Agg { args, .. } => {
-                for e in args {
-                    if f(e)? == TreeNodeRecursion::Stop {
-                        return Ok(TreeNodeRecursion::Stop);
+            PhysicalMeasureSlotKind::Agg {
+                args,
+                uses_match_metadata,
+                ..
+            } => {
+                if !uses_match_metadata {
+                    for e in args {
+                        if f(e)? == TreeNodeRecursion::Stop {
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
                     }
                 }
             }

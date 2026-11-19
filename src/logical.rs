@@ -84,15 +84,54 @@ impl MatchRecognizeNode {
         definitions: Vec<SymbolDef>,
         config: MatchRecognizeConfig,
     ) -> Result<Self> {
+        let meta_schema = build_agg_metadata_dfschema(input.schema())?;
+        let coerce_meta_slots = |slots: Vec<MeasureSlot>| -> Result<Vec<MeasureSlot>> {
+            let mut out = Vec::with_capacity(slots.len());
+            for slot in slots {
+                let kind = match slot.kind {
+                    MeasureSlotKind::Agg {
+                        agg_kind,
+                        symbol,
+                        args,
+                        distinct,
+                        arg_physical_nav,
+                        uses_match_metadata: true,
+                    } => {
+                        let mut rewriter = TypeCoercionRewriter::new(&meta_schema);
+                        let coerced_args = args
+                            .into_iter()
+                            .map(|e| Ok(e.rewrite(&mut rewriter)?.data))
+                            .collect::<Result<Vec<_>>>()?;
+                        MeasureSlotKind::Agg {
+                            agg_kind,
+                            symbol,
+                            args: coerced_args,
+                            distinct,
+                            arg_physical_nav,
+                            uses_match_metadata: true,
+                        }
+                    }
+                    other => other,
+                };
+                out.push(MeasureSlot {
+                    slot_name: slot.slot_name,
+                    semantics: slot.semantics,
+                    kind,
+                });
+            }
+            Ok(out)
+        };
+
         let mut coerced_measures = Vec::with_capacity(measures.len());
         for m in measures {
-            let slot_schema = build_slot_schema(input.schema(), &m.slots, rows_per_match)?;
+            let slots = coerce_meta_slots(m.slots)?;
+            let slot_schema = build_slot_schema(input.schema(), &slots, rows_per_match)?;
             let mut rewriter = TypeCoercionRewriter::new(&slot_schema);
             let outer_expr = m.outer_expr.rewrite(&mut rewriter)?.data;
             coerced_measures.push(MeasureSpec {
                 alias: m.alias,
                 outer_expr,
-                slots: m.slots,
+                slots,
             });
         }
 
@@ -101,6 +140,7 @@ impl MatchRecognizeNode {
             let kind = match def.kind {
                 SymbolDefKind::Stateless { predicate } => SymbolDefKind::Stateless { predicate },
                 SymbolDefKind::Stateful { outer_expr, slots } => {
+                    let slots = coerce_meta_slots(slots)?;
                     let slot_schema =
                         build_slot_schema(input.schema(), &slots, RowsPerMatch::OneRow)?;
                     let mut rewriter = TypeCoercionRewriter::new(&slot_schema);
