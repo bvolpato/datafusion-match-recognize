@@ -21,6 +21,7 @@ pub mod physical;
 pub mod planner;
 #[cfg(feature = "proto")]
 pub mod proto;
+pub mod unparser;
 
 pub use ast::{
     AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig, MeasureSlot,
@@ -35,6 +36,7 @@ pub use physical::{
 pub use planner::MatchRecognizeRelationPlanner;
 #[cfg(feature = "proto")]
 pub use proto::{MatchRecognizeLogicalCodec, MatchRecognizePhysicalCodec};
+pub use unparser::{MatchRecognizeUnparser, match_recognize_to_table_factor};
 
 /// Configures a [`SessionStateBuilder`] with `MATCH_RECOGNIZE` physical planning and
 /// partition-filter pushdown optimization.

@@ -2,18 +2,15 @@
 
 //! Protobuf serialization codecs ([`LogicalExtensionCodec`] and [`PhysicalExtensionCodec`])
 //! for distributed execution (e.g., `datafusion-distributed`) and plan persistence.
-//!
-//! Both codecs support optional delegation (`with_delegate(...)`) so downstream engines can
-//! chain `MATCH_RECOGNIZE` serialization with custom `TableProvider`, `FileFormat`, or other
-//! extension plan codecs.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::compute::SortOptions;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::file_format::FileFormatFactory;
+use datafusion::execution::FunctionRegistry;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::{
@@ -53,20 +50,16 @@ pub mod pb {
     ));
 }
 
-/// [`LogicalExtensionCodec`] for serializing and deserializing [`MatchRecognizeNode`].
 #[derive(Debug, Default)]
 pub struct MatchRecognizeLogicalCodec {
     delegate: Option<Arc<dyn LogicalExtensionCodec>>,
 }
 
 impl MatchRecognizeLogicalCodec {
-    /// Creates a codec handling [`MatchRecognizeNode`] without a fallback delegate.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a codec that delegates non-`MatchRecognize` extensions, table providers, and
-    /// file formats to `delegate`.
     pub fn with_delegate(delegate: Arc<dyn LogicalExtensionCodec>) -> Self {
         Self {
             delegate: Some(delegate),
@@ -76,6 +69,7 @@ impl MatchRecognizeLogicalCodec {
 
 fn decode_logical_slots(
     proto_slots: &[pb::MeasureSlotProto],
+    ctx: &TaskContext,
     decode_expr: &dyn Fn(&[u8]) -> Result<datafusion_expr::Expr>,
 ) -> Result<Vec<MeasureSlot>> {
     let mut slots = Vec::with_capacity(proto_slots.len());
@@ -88,6 +82,10 @@ fn decode_logical_slots(
                 pb::measure_slot_proto::Kind::MatchNumber(_) => MeasureSlotKind::MatchNumber,
                 pb::measure_slot_proto::Kind::Classifier(c) => MeasureSlotKind::Classifier {
                     symbol: c.symbol.clone(),
+                    logical_nav: c.logical_nav.map(decode_logical_nav),
+                    logical_offset: c.logical_offset,
+                    physical_nav: c.physical_nav.map(decode_physical_nav),
+                    physical_offset: c.physical_offset,
                 },
                 pb::measure_slot_proto::Kind::Nav(n) => MeasureSlotKind::Nav {
                     logical_nav: n.logical_nav.map(decode_logical_nav),
@@ -98,10 +96,17 @@ fn decode_logical_slots(
                     inner_expr: decode_expr(&n.inner_expr)?,
                 },
                 pb::measure_slot_proto::Kind::Agg(a) => MeasureSlotKind::Agg {
-                    agg_kind: decode_agg_kind(a.agg_kind)?,
+                    agg_kind: decode_agg_kind(a.agg_kind, &a.udaf_name, ctx)?,
                     symbol: a.symbol.clone(),
-                    inner_expr: a.inner_expr.as_deref().map(decode_expr).transpose()?,
+                    args: a
+                        .args
+                        .iter()
+                        .map(|b| decode_expr(b))
+                        .collect::<Result<Vec<_>>>()?,
                     distinct: a.distinct,
+                    arg_physical_nav: a
+                        .arg_physical_nav
+                        .map(|pn| (decode_physical_nav(pn), a.arg_physical_offset)),
                 },
                 pb::measure_slot_proto::Kind::CurrentRow(cr) => MeasureSlotKind::CurrentRow {
                     inner_expr: decode_expr(&cr.inner_expr)?,
@@ -124,11 +129,19 @@ fn encode_logical_slots(
     for s in slots {
         let kind = match &s.kind {
             MeasureSlotKind::MatchNumber => pb::measure_slot_proto::Kind::MatchNumber(true),
-            MeasureSlotKind::Classifier { symbol } => {
-                pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
-                    symbol: symbol.clone(),
-                })
-            }
+            MeasureSlotKind::Classifier {
+                symbol,
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+            } => pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
+                symbol: symbol.clone(),
+                logical_nav: logical_nav.map(encode_logical_nav),
+                logical_offset: *logical_offset,
+                physical_nav: physical_nav.map(encode_physical_nav),
+                physical_offset: *physical_offset,
+            }),
             MeasureSlotKind::Nav {
                 logical_nav,
                 logical_offset,
@@ -147,14 +160,21 @@ fn encode_logical_slots(
             MeasureSlotKind::Agg {
                 agg_kind,
                 symbol,
-                inner_expr,
+                args,
                 distinct,
-            } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
-                agg_kind: encode_agg_kind(*agg_kind),
-                symbol: symbol.clone(),
-                inner_expr: inner_expr.as_ref().map(encode_expr).transpose()?,
-                distinct: *distinct,
-            }),
+                arg_physical_nav,
+            } => {
+                let (kind_i32, udaf_name) = encode_agg_kind(agg_kind);
+                pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
+                    agg_kind: kind_i32,
+                    symbol: symbol.clone(),
+                    args: args.iter().map(encode_expr).collect::<Result<Vec<_>>>()?,
+                    distinct: *distinct,
+                    udaf_name,
+                    arg_physical_nav: arg_physical_nav.map(|(pn, _)| encode_physical_nav(pn)),
+                    arg_physical_offset: arg_physical_nav.map(|(_, off)| off).unwrap_or(0),
+                })
+            }
             MeasureSlotKind::CurrentRow { inner_expr } => {
                 pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
                     inner_expr: encode_expr(inner_expr)?,
@@ -234,7 +254,7 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             let kind = if let Some(st) = &d.stateful {
                 SymbolDefKind::Stateful {
                     outer_expr: decode_expr(&st.outer_expr)?,
-                    slots: decode_logical_slots(&st.slots, &decode_expr)?,
+                    slots: decode_logical_slots(&st.slots, ctx, &decode_expr)?,
                 }
             } else {
                 SymbolDefKind::Stateless {
@@ -252,7 +272,7 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             measures.push(MeasureSpec {
                 alias: m.alias.clone(),
                 outer_expr: decode_expr(&m.outer_expr)?,
-                slots: decode_logical_slots(&m.slots, &decode_expr)?,
+                slots: decode_logical_slots(&m.slots, ctx, &decode_expr)?,
             });
         }
 
@@ -417,19 +437,16 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
     }
 }
 
-/// [`PhysicalExtensionCodec`] for serializing and deserializing [`MatchRecognizeExec`].
 #[derive(Debug, Default)]
 pub struct MatchRecognizePhysicalCodec {
     delegate: Option<Arc<dyn PhysicalExtensionCodec>>,
 }
 
 impl MatchRecognizePhysicalCodec {
-    /// Creates a codec handling [`MatchRecognizeExec`] without a fallback delegate.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a codec that delegates non-`MatchRecognizeExec` physical nodes to `delegate`.
     pub fn with_delegate(delegate: Arc<dyn PhysicalExtensionCodec>) -> Self {
         Self {
             delegate: Some(delegate),
@@ -447,6 +464,7 @@ fn decode_physical_slots(
     input_schema: &Schema,
     program: &Program,
     unmatched: bool,
+    ctx: &TaskContext,
     decode_phys: PhysExprDecoder<'_>,
 ) -> Result<Vec<PhysicalMeasureSlot>> {
     let mut phys_slots = Vec::with_capacity(proto_slots.len());
@@ -469,6 +487,10 @@ fn decode_physical_slots(
                         .as_ref()
                         .and_then(|sym| program.resolve_symbol_set(sym)),
                     symbol: c.symbol.clone(),
+                    logical_nav: c.logical_nav.map(decode_logical_nav),
+                    logical_offset: c.logical_offset,
+                    physical_nav: c.physical_nav.map(decode_physical_nav),
+                    physical_offset: c.physical_offset,
                 },
                 DataType::Utf8,
                 true,
@@ -494,22 +516,19 @@ fn decode_physical_slots(
                 )
             }
             pb::measure_slot_proto::Kind::Agg(a) => {
-                let agg_kind = decode_agg_kind(a.agg_kind)?;
-                let inner_expr = a
-                    .inner_expr
-                    .as_deref()
+                let agg_kind = decode_agg_kind(a.agg_kind, &a.udaf_name, ctx)?;
+                let args = a
+                    .args
+                    .iter()
                     .map(|b| decode_phys(b, input_schema))
-                    .transpose()?;
-                let (dt, null) = match agg_kind {
+                    .collect::<Result<Vec<_>>>()?;
+                let (dt, null) = match &agg_kind {
                     AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
                         (DataType::Int64, unmatched)
                     }
                     AggKind::Avg => (DataType::Float64, true),
                     AggKind::Sum => {
-                        let inner_dt = inner_expr
-                            .as_ref()
-                            .expect("SUM has inner_expr")
-                            .data_type(input_schema)?;
+                        let inner_dt = args[0].data_type(input_schema)?;
                         let sum_dt = match inner_dt {
                             DataType::Int8
                             | DataType::Int16
@@ -527,12 +546,26 @@ fn decode_physical_slots(
                         };
                         (sum_dt, true)
                     }
-                    AggKind::Min | AggKind::Max => {
-                        let inner_dt = inner_expr
-                            .as_ref()
-                            .expect("MIN/MAX has inner_expr")
-                            .data_type(input_schema)?;
-                        (inner_dt, true)
+                    AggKind::Min | AggKind::Max => (args[0].data_type(input_schema)?, true),
+                    AggKind::Udaf(udaf) => {
+                        let raw_fields: Vec<FieldRef> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| {
+                                Ok(Arc::new(Field::new(
+                                    format!("arg_{i}"),
+                                    e.data_type(input_schema)?,
+                                    e.nullable(input_schema)?,
+                                )))
+                            })
+                            .collect::<Result<_>>()?;
+                        let coerced_fields =
+                            datafusion_expr::type_coercion::functions::fields_with_udf(
+                                &raw_fields,
+                                udaf.as_ref(),
+                            )?;
+                        let ret = udaf.return_field(&coerced_fields)?;
+                        (ret.data_type().clone(), true)
                     }
                 };
                 (
@@ -543,8 +576,11 @@ fn decode_physical_slots(
                             .as_ref()
                             .and_then(|sym| program.resolve_symbol_set(sym)),
                         symbol: a.symbol.clone(),
-                        inner_expr,
+                        args,
                         distinct: a.distinct,
+                        arg_physical_nav: a
+                            .arg_physical_nav
+                            .map(|pn| (decode_physical_nav(pn), a.arg_physical_offset)),
                     },
                     dt,
                     null,
@@ -575,11 +611,20 @@ fn encode_physical_slots(
     for s in slots {
         let kind = match &s.kind {
             PhysicalMeasureSlotKind::MatchNumber => pb::measure_slot_proto::Kind::MatchNumber(true),
-            PhysicalMeasureSlotKind::Classifier { symbol, .. } => {
-                pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
-                    symbol: symbol.clone(),
-                })
-            }
+            PhysicalMeasureSlotKind::Classifier {
+                symbol,
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+                ..
+            } => pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
+                symbol: symbol.clone(),
+                logical_nav: logical_nav.map(encode_logical_nav),
+                logical_offset: *logical_offset,
+                physical_nav: physical_nav.map(encode_physical_nav),
+                physical_offset: *physical_offset,
+            }),
             PhysicalMeasureSlotKind::Nav {
                 logical_nav,
                 logical_offset,
@@ -599,15 +644,22 @@ fn encode_physical_slots(
             PhysicalMeasureSlotKind::Agg {
                 agg_kind,
                 symbol,
-                inner_expr,
+                args,
                 distinct,
+                arg_physical_nav,
                 ..
-            } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
-                agg_kind: encode_agg_kind(*agg_kind),
-                symbol: symbol.clone(),
-                inner_expr: inner_expr.as_ref().map(encode_phys).transpose()?,
-                distinct: *distinct,
-            }),
+            } => {
+                let (kind_i32, udaf_name) = encode_agg_kind(agg_kind);
+                pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
+                    agg_kind: kind_i32,
+                    symbol: symbol.clone(),
+                    args: args.iter().map(encode_phys).collect::<Result<Vec<_>>>()?,
+                    distinct: *distinct,
+                    udaf_name,
+                    arg_physical_nav: arg_physical_nav.map(|(pn, _)| encode_physical_nav(pn)),
+                    arg_physical_offset: arg_physical_nav.map(|(_, off)| off).unwrap_or(0),
+                })
+            }
             PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
                 pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
                     inner_expr: encode_phys(inner_expr)?,
@@ -720,6 +772,7 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
                     input_schema.as_ref(),
                     &program,
                     false,
+                    ctx,
                     &decode_phys,
                 )?;
                 let slot_schema = build_physical_slot_schema(&slots);
@@ -748,6 +801,7 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
                 input_schema.as_ref(),
                 &program,
                 unmatched,
+                ctx,
                 &decode_phys,
             )?;
             let slot_schema = build_physical_slot_schema(&phys_slots);
@@ -1118,19 +1172,20 @@ fn decode_physical_nav(v: i32) -> PhysicalNavKind {
     }
 }
 
-fn encode_agg_kind(a: AggKind) -> i32 {
+fn encode_agg_kind(a: &AggKind) -> (i32, String) {
     match a {
-        AggKind::CountStar => pb::AggKindProto::AggCountStar as i32,
-        AggKind::CountSymbol => pb::AggKindProto::AggCountSymbol as i32,
-        AggKind::Count => pb::AggKindProto::AggCount as i32,
-        AggKind::Sum => pb::AggKindProto::AggSum as i32,
-        AggKind::Avg => pb::AggKindProto::AggAvg as i32,
-        AggKind::Min => pb::AggKindProto::AggMin as i32,
-        AggKind::Max => pb::AggKindProto::AggMax as i32,
+        AggKind::CountStar => (pb::AggKindProto::AggCountStar as i32, String::new()),
+        AggKind::CountSymbol => (pb::AggKindProto::AggCountSymbol as i32, String::new()),
+        AggKind::Count => (pb::AggKindProto::AggCount as i32, String::new()),
+        AggKind::Sum => (pb::AggKindProto::AggSum as i32, String::new()),
+        AggKind::Avg => (pb::AggKindProto::AggAvg as i32, String::new()),
+        AggKind::Min => (pb::AggKindProto::AggMin as i32, String::new()),
+        AggKind::Max => (pb::AggKindProto::AggMax as i32, String::new()),
+        AggKind::Udaf(u) => (pb::AggKindProto::AggUdaf as i32, u.name().to_string()),
     }
 }
 
-fn decode_agg_kind(v: i32) -> Result<AggKind> {
+fn decode_agg_kind(v: i32, udaf_name: &str, ctx: &TaskContext) -> Result<AggKind> {
     match pb::AggKindProto::try_from(v) {
         Ok(pb::AggKindProto::AggCountStar) => Ok(AggKind::CountStar),
         Ok(pb::AggKindProto::AggCountSymbol) => Ok(AggKind::CountSymbol),
@@ -1139,6 +1194,10 @@ fn decode_agg_kind(v: i32) -> Result<AggKind> {
         Ok(pb::AggKindProto::AggAvg) => Ok(AggKind::Avg),
         Ok(pb::AggKindProto::AggMin) => Ok(AggKind::Min),
         Ok(pb::AggKindProto::AggMax) => Ok(AggKind::Max),
+        Ok(pb::AggKindProto::AggUdaf) => {
+            let udaf = ctx.udaf(udaf_name)?;
+            Ok(AggKind::Udaf(udaf))
+        }
         Err(_) => internal_err!("Invalid AggKindProto enum value: {v}"),
     }
 }

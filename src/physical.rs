@@ -2,7 +2,8 @@
 
 //! Physical execution plan (`MatchRecognizeExec`), [`ExtensionPlanner`], and [`QueryPlanner`]
 //! for `MATCH_RECOGNIZE`, supporting Tier 1 stateless bitmask matching, Tier 2 hybrid stateful
-//! `DEFINE` evaluation, `SUBSET` union variables, and `DISTINCT` measure aggregates.
+//! `DEFINE` evaluation, `SUBSET` union variables, `DISTINCT` aggregates, arbitrary DataFusion
+//! `AggregateUDF`s, and automatic disk spilling via DataFusion's [`SpillManager`].
 
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
@@ -12,22 +13,27 @@ use std::task::{Context, Poll};
 
 use arrow::array::{Array, BooleanArray, RecordBatch};
 use arrow::compute::{self, SortOptions};
+use arrow::ipc::reader::StreamReader;
 use arrow::row::{RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::spill_file::SpillFile;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
+};
+use datafusion::physical_plan::spill::SpillManager;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
     ExecutionPlanProperties, InputDistributionRequirements, PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{DFSchema, DataFusionError, Result, internal_err};
+use datafusion_common::{DFSchema, DataFusionError, Result, exec_datafusion_err, internal_err};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, UserDefinedLogicalNode};
@@ -50,12 +56,11 @@ use crate::measures::{
 };
 use crate::pattern::Program;
 
-/// Physical representation of a `DEFINE <name> AS <predicate>` entry.
 #[derive(Debug, Clone)]
 pub enum PhysicalSymbolDefKind {
-    /// Tier 1 vectorized row-local predicate.
-    Stateless { predicate: Arc<dyn PhysicalExpr> },
-    /// Tier 2 match-state predicate evaluated lazily on candidate transitions.
+    Stateless {
+        predicate: Arc<dyn PhysicalExpr>,
+    },
     Stateful {
         outer_expr: Arc<dyn PhysicalExpr>,
         slot_schema: SchemaRef,
@@ -63,14 +68,12 @@ pub enum PhysicalSymbolDefKind {
     },
 }
 
-/// Physical `DEFINE` symbol entry.
 #[derive(Debug, Clone)]
 pub struct PhysicalSymbolDef {
     pub name: String,
     pub kind: PhysicalSymbolDefKind,
 }
 
-/// Physical representation of an `ORDER BY` item.
 #[derive(Debug, Clone)]
 pub struct PhysicalOrderBySpec {
     pub expr: Arc<dyn PhysicalExpr>,
@@ -78,8 +81,6 @@ pub struct PhysicalOrderBySpec {
     pub input_col_idx: Option<usize>,
 }
 
-/// Custom [`QueryPlanner`] wiring [`MatchRecognizeExtensionPlanner`] into DataFusion's
-/// [`DefaultPhysicalPlanner`].
 #[derive(Default)]
 pub struct MatchRecognizeQueryPlanner {
     additional_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
@@ -94,12 +95,10 @@ impl fmt::Debug for MatchRecognizeQueryPlanner {
 }
 
 impl MatchRecognizeQueryPlanner {
-    /// Creates a query planner supporting `MatchRecognizeNode`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a query planner combining `MatchRecognizeExtensionPlanner` with extra planners.
     pub fn with_extension_planners(
         additional_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
     ) -> Self {
@@ -127,7 +126,6 @@ impl QueryPlanner for MatchRecognizeQueryPlanner {
     }
 }
 
-/// [`ExtensionPlanner`] converting [`MatchRecognizeNode`] into [`MatchRecognizeExec`].
 #[derive(Debug, Default)]
 pub struct MatchRecognizeExtensionPlanner;
 
@@ -146,9 +144,19 @@ fn compile_physical_slots(
             slot_data_type_and_nullability(input_dfschema, slot, rows_per_match)?;
         let kind = match &slot.kind {
             MeasureSlotKind::MatchNumber => PhysicalMeasureSlotKind::MatchNumber,
-            MeasureSlotKind::Classifier { symbol } => PhysicalMeasureSlotKind::Classifier {
+            MeasureSlotKind::Classifier {
+                symbol,
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+            } => PhysicalMeasureSlotKind::Classifier {
                 symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
                 symbol: symbol.clone(),
+                logical_nav: *logical_nav,
+                logical_offset: *logical_offset,
+                physical_nav: *physical_nav,
+                physical_offset: *physical_offset,
             },
             MeasureSlotKind::Nav {
                 logical_nav,
@@ -173,19 +181,21 @@ fn compile_physical_slots(
             MeasureSlotKind::Agg {
                 agg_kind,
                 symbol,
-                inner_expr,
+                args,
                 distinct,
+                arg_physical_nav,
             } => {
-                let phys_inner = inner_expr
-                    .as_ref()
+                let phys_args = args
+                    .iter()
                     .map(|e| create_physical_expr(e, input_dfschema, exec_props, planning_ctx))
-                    .transpose()?;
+                    .collect::<Result<Vec<_>>>()?;
                 PhysicalMeasureSlotKind::Agg {
-                    agg_kind: *agg_kind,
+                    agg_kind: agg_kind.clone(),
                     symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
                     symbol: symbol.clone(),
-                    inner_expr: phys_inner,
+                    args: phys_args,
                     distinct: *distinct,
+                    arg_physical_nav: *arg_physical_nav,
                 }
             }
             MeasureSlotKind::CurrentRow { inner_expr } => {
@@ -358,7 +368,6 @@ pub struct MatchRecognizeExec {
 }
 
 impl MatchRecognizeExec {
-    /// Creates a new `MatchRecognizeExec` (without `SUBSET` union variables).
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
@@ -387,7 +396,6 @@ impl MatchRecognizeExec {
         )
     }
 
-    /// Creates a new `MatchRecognizeExec` with optional `SUBSET` union variables.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_subsets(
         input: Arc<dyn ExecutionPlan>,
@@ -510,19 +518,14 @@ fn apply_slot_exprs(
                     return Ok(TreeNodeRecursion::Stop);
                 }
             }
-            PhysicalMeasureSlotKind::Agg {
-                inner_expr: Some(e),
-                ..
-            } => {
-                if f(e)? == TreeNodeRecursion::Stop {
-                    return Ok(TreeNodeRecursion::Stop);
+            PhysicalMeasureSlotKind::Agg { args, .. } => {
+                for e in args {
+                    if f(e)? == TreeNodeRecursion::Stop {
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
                 }
             }
-            PhysicalMeasureSlotKind::MatchNumber
-            | PhysicalMeasureSlotKind::Classifier { .. }
-            | PhysicalMeasureSlotKind::Agg {
-                inner_expr: None, ..
-            } => {}
+            PhysicalMeasureSlotKind::MatchNumber | PhysicalMeasureSlotKind::Classifier { .. } => {}
         }
     }
     Ok(TreeNodeRecursion::Continue)
@@ -653,14 +656,27 @@ impl ExecutionPlan for MatchRecognizeExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, Arc::clone(&context))?;
-        let reservation = MemoryConsumer::new(format!("MatchRecognizeExec[{partition}]"))
-            .register(context.memory_pool());
+        let runtime_env = context.runtime_env();
+        let disk_spill_enabled = runtime_env.disk_manager.tmp_files_enabled();
+        let consumer = MemoryConsumer::new(format!("MatchRecognizeExec[{partition}]"))
+            .with_can_spill(disk_spill_enabled);
+        let reservation = consumer.register(context.memory_pool());
         let metrics = BaselineMetrics::new(&self.metrics, partition);
+        let input_schema = self.input.schema();
+        let spill_manager = if disk_spill_enabled {
+            let spill_metrics = SpillMetrics::new(&self.metrics, partition);
+            Some(SpillManager::new(
+                runtime_env,
+                spill_metrics,
+                Arc::clone(&input_schema),
+            ))
+        } else {
+            None
+        };
 
         let order_by_input_indices: Vec<Option<usize>> =
             self.order_by.iter().map(|o| o.input_col_idx).collect();
 
-        let input_schema = self.input.schema();
         let row_converter = if self.partition_by.is_empty() {
             None
         } else {
@@ -688,6 +704,8 @@ impl ExecutionPlan for MatchRecognizeExec {
             row_converter,
             current_partition_key: None,
             buffered_batches: Vec::new(),
+            spilled_files: Vec::new(),
+            spill_manager,
             pending_outputs: std::collections::VecDeque::new(),
             input_done: false,
             reservation,
@@ -716,6 +734,8 @@ struct MatchRecognizeStream {
     row_converter: Option<RowConverter>,
     current_partition_key: Option<Vec<u8>>,
     buffered_batches: Vec<RecordBatch>,
+    spilled_files: Vec<Arc<dyn SpillFile>>,
+    spill_manager: Option<SpillManager>,
     pending_outputs: std::collections::VecDeque<RecordBatch>,
     input_done: bool,
     reservation: MemoryReservation,
@@ -723,16 +743,36 @@ struct MatchRecognizeStream {
 }
 
 impl MatchRecognizeStream {
+    /// Buffers a batch for the active partition, automatically spilling to disk via
+    /// [`SpillManager`] if memory reservation fails and disk spilling is enabled.
+    fn push_partition_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let mem = batch.get_array_memory_size();
+        if let Err(err) = self.reservation.try_grow(mem) {
+            if let Some(spill_mgr) = &self.spill_manager {
+                let mut to_spill = std::mem::take(&mut self.buffered_batches);
+                to_spill.push(batch);
+                if let Some(file) = spill_mgr.spill_record_batch_and_finish(
+                    &to_spill,
+                    "MatchRecognizeExec partition buffer spill",
+                )? {
+                    self.spilled_files.push(file);
+                }
+                self.reservation.free();
+                return Ok(());
+            }
+            return Err(err);
+        }
+        self.buffered_batches.push(batch);
+        Ok(())
+    }
+
     fn ingest_batch(&mut self, batch: RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
         if self.partition_by.is_empty() {
-            let mem = batch.get_array_memory_size();
-            self.reservation.try_grow(mem)?;
-            self.buffered_batches.push(batch);
-            return Ok(());
+            return self.push_partition_batch(batch);
         }
 
         let key_arrays: Vec<_> = self
@@ -763,9 +803,7 @@ impl MatchRecognizeStream {
             if !same_partition {
                 if row_idx > slice_start {
                     let sub = batch.slice(slice_start, row_idx - slice_start);
-                    let mem = sub.get_array_memory_size();
-                    self.reservation.try_grow(mem)?;
-                    self.buffered_batches.push(sub);
+                    self.push_partition_batch(sub)?;
                 }
                 self.flush_current_partition()?;
                 self.current_partition_key = Some(key_bytes.to_vec());
@@ -775,34 +813,56 @@ impl MatchRecognizeStream {
 
         if slice_start < num_rows {
             let sub = batch.slice(slice_start, num_rows - slice_start);
-            let mem = sub.get_array_memory_size();
-            self.reservation.try_grow(mem)?;
-            self.buffered_batches.push(sub);
+            self.push_partition_batch(sub)?;
         }
 
         Ok(())
     }
 
     fn flush_current_partition(&mut self) -> Result<()> {
-        if self.buffered_batches.is_empty() {
+        if self.buffered_batches.is_empty() && self.spilled_files.is_empty() {
             return Ok(());
         }
 
-        let batches = std::mem::take(&mut self.buffered_batches);
-        let partition_batch = if batches.len() == 1 {
-            batches.into_iter().next().expect("len 1")
+        let mut all_batches = Vec::new();
+        let spilled = std::mem::take(&mut self.spilled_files);
+        let had_spills = !spilled.is_empty();
+        for spill_file in spilled {
+            let path = spill_file.path().ok_or_else(|| {
+                exec_datafusion_err!("MatchRecognizeExec spill file does not expose a local path")
+            })?;
+            let file = std::fs::File::open(path).map_err(DataFusionError::IoError)?;
+            let reader = StreamReader::try_new(file, None)?;
+            for batch_res in reader {
+                all_batches.push(batch_res?);
+            }
+        }
+        all_batches.extend(std::mem::take(&mut self.buffered_batches));
+
+        if all_batches.is_empty() {
+            self.reservation.free();
+            return Ok(());
+        }
+
+        let partition_batch = if all_batches.len() == 1 {
+            all_batches.into_iter().next().expect("len 1")
         } else {
-            compute::concat_batches(&self.input_schema, &batches)?
+            compute::concat_batches(&self.input_schema, &all_batches)?
         };
 
-        let work_mem = partition_batch.get_array_memory_size();
-        self.reservation.try_resize(work_mem)?;
+        // When no disk spill occurred, enforce tight memory accounting on the active partition;
+        // when spilled from disk, allow processing the reloaded partition and release immediately.
+        if !had_spills {
+            let work_mem = partition_batch.get_array_memory_size();
+            self.reservation.try_resize(work_mem)?;
+        }
 
         let symbols =
             evaluate_stateless_symbols(&partition_batch, &self.program, &self.definitions)?;
-        self.reservation.try_grow(symbols.memory_bytes())?;
+        if !had_spills {
+            self.reservation.try_grow(symbols.memory_bytes())?;
+        }
 
-        // Collect Tier 2 stateful symbol definitions (if any).
         let stateful_defs: Vec<StatefulDefineInput<'_>> = self
             .definitions
             .iter()
@@ -861,11 +921,6 @@ impl MatchRecognizeStream {
     }
 }
 
-/// Evaluates all Tier 1 stateless `DEFINE` predicates in vectorized Arrow into [`PartitionSymbols`].
-///
-/// Stateful symbols receive placeholder `false` bits (they are evaluated lazily via
-/// [`PartitionStatefulEvaluator`] during NFA transitions); symbols omitted from `DEFINE` default
-/// to `true` per SQL:2016.
 fn evaluate_stateless_symbols(
     partition_batch: &RecordBatch,
     program: &Program,
@@ -961,7 +1016,6 @@ impl RecordBatchStream for MatchRecognizeStream {
     }
 }
 
-/// Helper to check whether a partition expression is a direct column reference.
 pub fn partition_expr_is_column(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(_))
 }

@@ -1,27 +1,28 @@
-# Documented Divergences and Upstream Parser Gaps
+# SQL:2016 Coverage, Divergences, and Upstream Tracking
 
-This file tracks intentional differences from Trino and remaining upstream parser boundaries verified against Trino 484.
+This document records the complete SQL:2016 `MATCH_RECOGNIZE` implementation matrix, intentional supersets over Trino 484, and upstream tracking PRs for every remaining syntax or extension-point boundary.
 
-## Engine Parity Status
+## Implemented Engine Capabilities (Verified Against Trino 484)
 
-All core SQL:2016 row pattern recognition features are implemented and verified against Trino 484:
-
-- Stateless (`u64` bitmask fast path) and stateful (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, cross-symbol references) `DEFINE` predicates.
-- `ONE ROW PER MATCH` and `ALL ROWS PER MATCH` (`SHOW EMPTY MATCHES`, `OMIT EMPTY MATCHES`, `WITH UNMATCHED ROWS`).
-- `AFTER MATCH SKIP` (`PAST LAST ROW`, `TO NEXT ROW`, `TO FIRST <var>`, `TO LAST <var>`, including `SUBSET` union variables).
-- `COUNT(*)`, `COUNT(var.*)`, `COUNT([DISTINCT] expr)`, `SUM([DISTINCT] expr)`, `AVG([DISTINCT] expr)`, `MIN(expr)`, and `MAX(expr)` in both `MEASURES` and stateful `DEFINE`.
-- `SUBSET` union variables and `RUNNING` / `FINAL` evaluation semantics in the IR, matcher, measure evaluator, and protobuf codecs.
-- Reluctant quantifiers (`*?`, `+?`, `??`, `{n,m}?`) in the IR, bytecode compiler, PikeVM matcher, and protobuf codecs.
+- **Pattern engine:** Named primary variables, implicit-true variables omitted from `DEFINE`, `^` and `$` partition anchors, concatenation, ordered alternation (`|`), groups, greedy and reluctant quantifiers (`*`, `+`, `?`, `{n}`, `{n,}`, `{,m}`, `{n,m}`, `*?`, `+?`, `??`, `{n,m}?`), `{- exclude -}`, and `PERMUTE(...)`.
+- **Hybrid two-tier `DEFINE`:** Tier 1 vectorized Arrow `u64` bitmask fast path with O(1) `start_symbols_mask` fast skip, and Tier 2 lazy stateful `DEFINE` (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, cross-symbol references) with precomputed partition inner expressions and configurable `max_active_threads` limits.
+- **Rows per match and skip modes:** `ONE ROW PER MATCH`, `ALL ROWS PER MATCH` (`SHOW EMPTY MATCHES`, `OMIT EMPTY MATCHES`, `WITH UNMATCHED ROWS`), and `AFTER MATCH SKIP` (`PAST LAST ROW`, `TO NEXT ROW`, `TO FIRST <var>`, `TO LAST <var>`, including `SUBSET` union variables).
+- **Measures and aggregates:** `MATCH_NUMBER()`, `CLASSIFIER([var])` (including `FIRST`/`LAST`/`PREV`/`NEXT` over `CLASSIFIER()`), `FIRST`/`LAST`/`PREV`/`NEXT` with offsets and nesting, symbol-qualified and `SUBSET`-qualified columns, omitted `MEASURES`, built-in fast paths (`COUNT(*)`, `COUNT(var.*)`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `DISTINCT` aggregates, and **arbitrary registered DataFusion `AggregateUDF`s** via DataFusion's `Accumulator` trait (`ARRAY_AGG`, `STRING_AGG`, `STDDEV_SAMP`, `STDDEV_POP`, `BOOL_AND`, `BOOL_OR`, and custom UDAFs) with `fields_with_udf` type coercion.
+- **Memory safety and disk spilling:** Partition buffering accounted against `TaskContext::memory_pool()` with automatic Arrow IPC temp-file spilling via DataFusion's `SpillManager` (`SpillMetrics`) when `DiskManager` is enabled, and clean `ResourcesExhausted` errors when disk spilling is disabled.
+- **Optimization, serialization, and unparsing:** `MatchRecognizeFilterPushdown`, `necessary_children_exprs` column pruning, composable `MatchRecognizeLogicalCodec` / `MatchRecognizePhysicalCodec` (`with_delegate`), and `MatchRecognizeUnparser` (`UserDefinedLogicalNodeUnparser::unparse_to_statement` and `match_recognize_to_table_factor`).
 
 ## Intentional Supersets Over Trino 484
 
-- **`DISTINCT` inside `MATCH_RECOGNIZE` aggregates:** Trino 484 rejects `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` in pattern recognition context (`NOT_SUPPORTED`). `datafusion-match-recognize` supports `DISTINCT` on `COUNT`, `SUM`, and `AVG` in both `MEASURES` and stateful `DEFINE` (verified in `tests/slt/stateful_and_distinct.slt` and `tests/invariance.rs`).
+1. **`DISTINCT` inside `MATCH_RECOGNIZE` aggregates:** Trino 484 rejects `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` in pattern recognition context (`NOT_SUPPORTED`). `datafusion-match-recognize` supports `DISTINCT` across `COUNT`, `SUM`, `AVG`, and single-argument UDAFs (verified in `tests/slt/stateful_and_distinct.slt` and `tests/invariance.rs`).
+2. **Physical navigation inside aggregates (`SUM(PREV(b.price))`, `SUM(NEXT(b.price))`):** Trino 484 rejects nesting `PREV`/`NEXT` inside aggregates (`INVALID_NAVIGATION_NESTING`). `datafusion-match-recognize` supports shifting aggregate input rows by `PREV`/`NEXT` (verified in `tests/slt/edge_cases.slt` and `tests/invariance.rs`).
 
-## Remaining Upstream `sqlparser 0.63.0` Parser Gaps
+## Upstream Parser and Extension-Point Blockers
 
-DataFusion `57.0.0-dev` currently pins `sqlparser = 0.63.0`, which has four SQL syntax limitations in `TableFactor::MatchRecognize`:
+Every remaining gap is outside this crate and tracked by an upstream PR or explicit DataFusion API boundary:
 
-1. **Reluctant quantifiers (`*?`, `+?`, `??`, `{n,m}?`):** Supported in our engine and verified in `tests/oracle.rs`. Already added in `sqlparser 0.64.0` (`RepetitionQuantifier::Reluctant`), so bumping DataFusion's `sqlparser` dependency enables them directly in SQL.
-2. **Unparenthesized exclusion after a symbol (`a {- b -}`):** `sqlparser 0.63.0` treats `{` immediately following a pattern term as the start of a `{n,m}` quantifier rather than checking for `{-`. Wrap exclusions in parentheses (`a ({- b -})* c`) until fixed upstream in `apache/datafusion-sqlparser-rs`.
-3. **`MATCH_RECOGNIZE` directly after an aliased derived table:** `FROM (VALUES ...) AS t(id, tag) MATCH_RECOGNIZE (...)` fails to parse in `sqlparser 0.63.0`. Use a CTE (`WITH t(id, tag) AS (VALUES ...) SELECT * FROM t MATCH_RECOGNIZE (...)`) until fixed upstream.
-4. **SQL syntax for `SUBSET` and explicit `RUNNING` / `FINAL` modifiers:** Supported in our IR, execution engine, and protobuf codecs (verified in `tests/invariance.rs` and `tests/oracle.rs`), awaiting AST support in `apache/datafusion-sqlparser-rs`.
+1. **Reluctant quantifiers (`*?`, `+?`, `??`, `{n,m}?`) in SQL:** Implemented in our engine (verified in `tests/oracle.rs`). Merged in [apache/datafusion-sqlparser-rs#2510](https://github.com/apache/datafusion-sqlparser-rs/pull/2510) (`0.64.0`) and tracked for DataFusion adoption in [apache/datafusion#27063](https://github.com/apache/datafusion/pull/27063).
+2. **Derived tables (`FROM (SELECT/VALUES ...) AS t MATCH_RECOGNIZE`), unparenthesized exclusions (`a {- b -}* c`), and lowercase `permute(...)`:** Tracked in draft PR [apache/datafusion-sqlparser-rs#3017](https://github.com/apache/datafusion-sqlparser-rs/pull/3017). Until adopted by DataFusion, wrap exclusions in parentheses (`a ({- b -})* c`) and use a CTE (`WITH t AS (...) SELECT * FROM t MATCH_RECOGNIZE (...)`).
+3. **SQL syntax for `SUBSET u = (a, b)` union variables:** Implemented in our IR, engine, and protobuf codecs (verified in `tests/invariance.rs` and `tests/oracle.rs`). Tracked in draft PR [apache/datafusion-sqlparser-rs#3018](https://github.com/apache/datafusion-sqlparser-rs/pull/3018).
+4. **SQL syntax for explicit `RUNNING` / `FINAL` measure modifiers:** Implemented in our IR (`EvalSemantics`), evaluator, and protobuf codecs (verified in `tests/invariance.rs`). Tracked in draft PR [apache/datafusion-sqlparser-rs#3019](https://github.com/apache/datafusion-sqlparser-rs/pull/3019).
+5. **Inline `RelationBuilder` unparsing inside outer `SELECT` queries:** `MatchRecognizeUnparser::unparse_to_statement` unparses standalone `MatchRecognizeNode` plans back to SQL, but DataFusion's `RelationBuilder` (`datafusion/sql/src/unparser/ast.rs`) currently wraps a private `TableFactorBuilder` enum with no custom `TableFactor` variant. Unparsing a `MatchRecognizeNode` nested inside an outer `SELECT` requires adding a `RelationBuilder::table_factor(ast::TableFactor)` method upstream in `apache/datafusion`.
+6. **Row pattern recognition inside window clauses (`OVER (... MEASURES ... PATTERN ...)`):** Blocked upstream by two missing hooks: `apache/datafusion-sqlparser-rs` does not parse RPR inside `WindowSpec`, and DataFusion's `RelationPlanner` only intercepts `TableFactor` relations (no `WindowPlanner` extension API exists yet).

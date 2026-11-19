@@ -725,10 +725,222 @@ async fn test_live_trino_differential_oracle() {
         }
     }
 
+    // 5. Edge-case & UDAF / CLASSIFIER nav / SUM(PREV) hand cases vs live Trino 484!
+    let edge_cases: Vec<(&str, &str)> = vec![
+        (
+            "classifier_nav_and_sum_prev",
+            r#"
+            WITH seq(id, tag, price) AS (
+                VALUES (1, 'A', 10), (2, 'B', 20), (3, 'B', 30), (4, 'C', 40)
+            )
+            SELECT * FROM seq
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    MATCH_NUMBER() AS mn,
+                    FIRST(CLASSIFIER()) AS first_cls,
+                    LAST(CLASSIFIER()) AS last_cls,
+                    LAST(CLASSIFIER(), 1) AS prev_last_cls,
+                    PREV(CLASSIFIER(), 1) AS prev_cls,
+                    NEXT(CLASSIFIER(), 1) AS next_cls,
+                    PREV(a.price, 0) AS prev0_a,
+                    FIRST(b.price, 100) AS oob_first
+                ONE ROW PER MATCH
+                PATTERN (a b+ c)
+                DEFINE a AS tag = 'A', b AS tag = 'B', c AS tag = 'C'
+            )
+            "#,
+        ),
+        (
+            "udaf_stddev_and_bool_and",
+            r#"
+            WITH seq(id, tag, price) AS (
+                VALUES (1, 'A', 10), (2, 'B', 20), (3, 'B', 30), (4, 'C', 40)
+            )
+            SELECT * FROM seq
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    ROUND(STDDEV_SAMP(price), 4) AS sd_all,
+                    ROUND(STDDEV_POP(b.price), 4) AS sd_b,
+                    BOOL_AND(price > 0) AS all_pos,
+                    BOOL_OR(price > 35) AS any_hi
+                ONE ROW PER MATCH
+                PATTERN (a b+ c)
+                DEFINE a AS tag = 'A', b AS tag = 'B', c AS tag = 'C'
+            )
+            "#,
+        ),
+        (
+            "multi_col_partition_desc_nulls_first_and_null_define",
+            r#"
+            WITH t(p1, p2, id, tag, v) AS (
+                VALUES
+                    ('x', 1, 1, 'A', 10),
+                    ('x', 2, 1, 'A', CAST(NULL AS INTEGER)),
+                    ('x', 2, 2, 'B', 20),
+                    ('y', 1, 3, 'A', 30),
+                    ('y', 1, 2, 'B', 25),
+                    ('y', 1, 1, 'B', 15),
+                    ('y', 1, 0, 'C', 5)
+            )
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY p1, p2
+                ORDER BY id DESC NULLS FIRST
+                MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS first_id, LAST(id) AS last_id
+                ONE ROW PER MATCH
+                PATTERN (a b* c?)
+                DEFINE a AS v > 5, b AS tag = 'B', c AS tag = 'C'
+            )
+            ORDER BY p1, p2, mn
+            "#,
+        ),
+        (
+            "omitted_measures_all_rows",
+            r#"
+            WITH t(p, id, tag) AS (
+                VALUES ('p1', 1, 'A'), ('p1', 2, 'B'), ('p1', 3, 'C')
+            )
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY id
+                ALL ROWS PER MATCH
+                PATTERN (a b+ c)
+                DEFINE a AS tag = 'A', b AS tag = 'B', c AS tag = 'C'
+            )
+            ORDER BY p, id
+            "#,
+        ),
+        (
+            "joined_match_recognize_ctes",
+            r#"
+            WITH t(p, id, tag) AS (
+                VALUES ('p1', 1, 'A'), ('p1', 2, 'B'), ('p1', 3, 'C'), ('p2', 1, 'A'), ('p2', 2, 'C')
+            ),
+            m1 AS (
+                SELECT * FROM t
+                MATCH_RECOGNIZE (
+                    PARTITION BY p ORDER BY id
+                    MEASURES FIRST(id) AS s_id
+                    ONE ROW PER MATCH
+                    PATTERN (a b* c)
+                    DEFINE a AS tag = 'A', b AS tag = 'B', c AS tag = 'C'
+                )
+            ),
+            m2 AS (
+                SELECT * FROM t
+                MATCH_RECOGNIZE (
+                    PARTITION BY p ORDER BY id
+                    MEASURES LAST(id) AS e_id, COUNT(*) AS cnt
+                    ONE ROW PER MATCH
+                    PATTERN (a b* c)
+                    DEFINE a AS tag = 'A', b AS tag = 'B', c AS tag = 'C'
+                )
+            )
+            SELECT m1.p, m1.s_id, m2.e_id, m2.cnt
+            FROM m1 JOIN m2 ON m1.p = m2.p
+            ORDER BY m1.p
+            "#,
+        ),
+    ];
+
+    for (name, sql) in &edge_cases {
+        assert_matches_trino(&client, &base_url, name, sql).await;
+    }
+
+    // 6. Seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (50 queries)
+    let mut rng_state: u64 = 0x5EED_CAFE_1234_ABCD;
+    let mut next_u64 = || -> u64 {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        rng_state
+    };
+
+    let rand_patterns: &[(&str, &str)] = &[
+        (
+            "a b* c?",
+            "a AS v >= 1 AND v <= 4, b AS v >= 3 AND v <= 6, c AS v >= 5",
+        ),
+        ("(a | a b)", "a AS v <= 4, b AS v >= 3"),
+        ("s d+ u+", "d AS d.v < PREV(d.v), u AS u.v > PREV(u.v)"),
+        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)"),
+        (
+            "a b+",
+            "a AS v >= 2, b AS b.v - FIRST(a.v) <= 3 AND COUNT(b.*) <= 3",
+        ),
+        ("PERMUTE(a, b)", "a AS v <= 4, b AS v >= 4"),
+    ];
+    let rand_orders = ["ORDER BY id ASC", "ORDER BY id DESC NULLS FIRST"];
+    let rand_skips = [
+        "AFTER MATCH SKIP PAST LAST ROW",
+        "AFTER MATCH SKIP TO NEXT ROW",
+    ];
+
+    let mut random_checked = 0usize;
+    for q in 0..50usize {
+        let num_parts = (next_u64() % 3 + 1) as usize;
+        let mut value_rows = Vec::new();
+        for p in 1..=num_parts {
+            let nrows = (next_u64() % 7 + 1) as usize;
+            for r in 1..=nrows {
+                let is_null = (next_u64() % 6) == 0;
+                let v_str = if is_null {
+                    "CAST(NULL AS INTEGER)".to_string()
+                } else {
+                    format!("{}", (next_u64() % 9) as i64)
+                };
+                value_rows.push(format!("({p}, {r}, {v_str})"));
+            }
+        }
+        let values_sql = value_rows.join(", ");
+        let (pat, defs) = rand_patterns[(next_u64() as usize) % rand_patterns.len()];
+        let ord = rand_orders[(next_u64() as usize) % rand_orders.len()];
+        let skip = rand_skips[(next_u64() as usize) % rand_skips.len()];
+        let (mode, outer_ord) = if (next_u64() % 2) == 0 {
+            ("ONE ROW PER MATCH", "ORDER BY p, mn")
+        } else {
+            (
+                "ALL ROWS PER MATCH OMIT EMPTY MATCHES",
+                "ORDER BY p, mn, id",
+            )
+        };
+
+        let sql = format!(
+            r#"
+            WITH t(p, id, v) AS (VALUES {values_sql})
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                {ord}
+                MEASURES
+                    MATCH_NUMBER() AS mn,
+                    FIRST(CLASSIFIER()) AS f_cls,
+                    LAST(CLASSIFIER()) AS l_cls,
+                    FIRST(v) AS fv,
+                    LAST(v) AS lv,
+                    COUNT(*) AS cnt,
+                    SUM(v) AS sv
+                {mode}
+                {skip}
+                PATTERN ({pat})
+                DEFINE {defs}
+            )
+            {outer_ord}
+            "#
+        );
+        assert_matches_trino(&client, &base_url, &format!("prng_q{q}"), &sql).await;
+        random_checked += 1;
+    }
+
     eprintln!(
-        "Live Trino differential oracle passed all 13 stateless + {} stateful hand cases + {} stateless fuzz + {} stateful fuzz queries!",
+        "Live Trino differential oracle passed all 13 stateless + {} stateful + {} edge hand cases + {} stateless fuzz + {} stateful fuzz + {} PRNG random SQL queries!",
         stateful_cases.len(),
+        edge_cases.len(),
         checked,
-        stateful_checked
+        stateful_checked,
+        random_checked
     );
 }

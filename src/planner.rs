@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! [`RelationPlanner`] implementation lowering `sqlparser::ast::TableFactor::MatchRecognize`
-//! into a [`MatchRecognizeNode`], supporting both Tier 1 stateless `DEFINE` predicates and
-//! Tier 2 stateful `DEFINE` predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, aggregates,
-//! `CLASSIFIER()`, `MATCH_NUMBER()`, and cross-symbol references).
+//! into a [`MatchRecognizeNode`], supporting Tier 1 stateless `DEFINE`, Tier 2 stateful `DEFINE`,
+//! navigation over `CLASSIFIER()`, `PREV`/`NEXT` inside aggregates, and arbitrary registered
+//! DataFusion [`AggregateUDF`]s.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use datafusion_common::{DFSchema, Result, plan_datafusion_err, plan_err};
+use datafusion_expr::AggregateUDF;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
 };
@@ -34,7 +36,6 @@ pub struct MatchRecognizeRelationPlanner {
 }
 
 impl MatchRecognizeRelationPlanner {
-    /// Creates a relation planner with custom compilation limits.
     pub fn new(config: MatchRecognizeConfig) -> Self {
         Self { config }
     }
@@ -95,14 +96,12 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
         let planned_skip = lower_after_match_skip(after_match_skip, ctx);
         let planned_pattern = lower_pattern(pattern, ctx)?;
 
-        // SQL:2016 forbids exclusions with ALL ROWS PER MATCH WITH UNMATCHED ROWS.
         if planned_rows_per_match.include_unmatched_rows() && planned_pattern.has_exclusion() {
             return plan_err!(
                 "MATCH_RECOGNIZE pattern exclusion {{- ... -}} is not allowed with ALL ROWS PER MATCH WITH UNMATCHED ROWS"
             );
         }
 
-        // Collect all primary pattern variable names from PATTERN.
         let mut known_symbols: HashSet<String> = HashSet::new();
         let mut pattern_symbols = Vec::new();
         planned_pattern.collect_named_symbols(&mut pattern_symbols);
@@ -110,7 +109,6 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             known_symbols.insert(s.clone());
         }
 
-        // Validate and classify DEFINE predicates into Tier 1 (Stateless) or Tier 2 (Stateful).
         let mut planned_definitions = Vec::with_capacity(symbols.len());
         let mut seen_defs: HashSet<String> = HashSet::new();
         for sym_def in symbols {
@@ -125,8 +123,6 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             }
 
             if is_stateful_define(&sym_def.definition, &name, &known_symbols, ctx) {
-                // Tier 2: decompose into MeasureSlots with RUNNING semantics (bare columns and
-                // self-qualified `name.col` evaluate on the candidate row).
                 let mut extractor = SlotExtractor {
                     ctx,
                     input_schema: input_schema.as_ref(),
@@ -146,8 +142,6 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                     kind: SymbolDefKind::Stateful { outer_expr, slots },
                 });
             } else {
-                // Tier 1: strip self qualifier `name.col` -> `col` and evaluate once per batch
-                // in vectorized Arrow.
                 let stripped = strip_self_qualifier(sym_def.definition, &name, ctx);
                 let predicate = ctx.sql_to_expr(stripped, input_schema.as_ref())?;
                 planned_definitions.push(SymbolDef {
@@ -157,19 +151,16 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             }
         }
 
-        // Validate AFTER MATCH SKIP target variable exists.
         if let AfterMatchSkip::ToFirst(target) | AfterMatchSkip::ToLast(target) = &planned_skip
             && !known_symbols.contains(target)
         {
             return plan_err!("AFTER MATCH SKIP references undefined pattern variable '{target}'");
         }
 
-        // Validate pattern compiles cleanly within limits at plan time.
         let declared_names: Vec<String> =
             planned_definitions.iter().map(|d| d.name.clone()).collect();
         Program::compile(&planned_pattern, &declared_names, self.config)?;
 
-        // Plan MEASURES via slot extraction + outer standard DataFusion Expr.
         let default_semantics = if planned_rows_per_match.is_one_row() {
             EvalSemantics::Final
         } else {
@@ -302,8 +293,11 @@ fn lower_quantifier(quant: SqlQuant) -> (u32, Option<u32>, bool) {
     }
 }
 
-/// Returns true if a `DEFINE` expression depends on match state (navigation functions,
-/// pattern aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, or another pattern variable).
+fn is_builtin_or_registered_agg(fname: &str, ctx: &dyn RelationPlannerContext) -> bool {
+    matches!(fname, "count" | "sum" | "avg" | "min" | "max")
+        || ctx.context_provider().get_aggregate_meta(fname).is_some()
+}
+
 fn is_stateful_define(
     expr: &SqlExpr,
     current_symbol: &str,
@@ -324,18 +318,9 @@ fn is_stateful_define(
             let fname = func.name.to_string().to_ascii_lowercase();
             if matches!(
                 fname.as_str(),
-                "prev"
-                    | "next"
-                    | "first"
-                    | "last"
-                    | "classifier"
-                    | "match_number"
-                    | "count"
-                    | "sum"
-                    | "avg"
-                    | "min"
-                    | "max"
-            ) {
+                "prev" | "next" | "first" | "last" | "classifier" | "match_number"
+            ) || is_builtin_or_registered_agg(&fname, ctx)
+            {
                 return true;
             }
             if let FunctionArguments::List(list) = &func.args {
@@ -394,7 +379,6 @@ fn is_stateful_define(
     }
 }
 
-/// Strips `current_symbol.col` -> `col` for Tier 1 stateless `DEFINE` expressions.
 fn strip_self_qualifier(
     expr: SqlExpr,
     current_symbol: &str,
@@ -499,15 +483,12 @@ fn strip_self_qualifier(
     }
 }
 
-/// Shared slot extractor used by both `MEASURES` and Tier 2 stateful `DEFINE` predicates.
 struct SlotExtractor<'a, 'b> {
     ctx: &'a mut dyn RelationPlannerContext,
     input_schema: &'b DFSchema,
     known_symbols: &'b HashSet<String>,
     bare_col_is_current_row: bool,
     default_semantics: EvalSemantics,
-    /// When lowering `DEFINE <sym> AS ...`, holds `Some(sym)` so self-qualified `sym.col`
-    /// resolves directly to `CurrentRow` (candidate row `pos`).
     current_define_symbol: Option<&'b str>,
     slots: Vec<MeasureSlot>,
 }
@@ -527,6 +508,24 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
         SqlExpr::Identifier(Ident::new(slot_name))
     }
 
+    fn parse_classifier_symbol(&self, args: &FunctionArguments) -> Result<Option<String>> {
+        let (arg_exprs, _) = extract_unnamed_args(args)?;
+        match arg_exprs.len() {
+            0 => Ok(None),
+            1 => match &arg_exprs[0] {
+                FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
+                    let sym = self.ctx.normalize_ident(id.clone());
+                    if !self.known_symbols.contains(&sym) {
+                        return plan_err!("CLASSIFIER({sym}) references unknown pattern variable");
+                    }
+                    Ok(Some(sym))
+                }
+                _ => plan_err!("CLASSIFIER() argument must be a pattern variable identifier"),
+            },
+            _ => plan_err!("CLASSIFIER() takes at most 1 argument"),
+        }
+    }
+
     fn rewrite_outer(&mut self, expr: SqlExpr) -> Result<SqlExpr> {
         match expr {
             SqlExpr::Function(func) => {
@@ -540,38 +539,31 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         Ok(self.push_slot(MeasureSlotKind::MatchNumber))
                     }
                     "classifier" => {
-                        let (args, _) = extract_unnamed_args(&func.args)?;
-                        let symbol = match args.len() {
-                            0 => None,
-                            1 => match &args[0] {
-                                FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
-                                    let sym = self.ctx.normalize_ident(id.clone());
-                                    if !self.known_symbols.contains(&sym) {
-                                        return plan_err!(
-                                            "CLASSIFIER({sym}) references unknown pattern variable"
-                                        );
-                                    }
-                                    Some(sym)
-                                }
-                                _ => {
-                                    return plan_err!(
-                                        "CLASSIFIER() argument must be a pattern variable identifier"
-                                    );
-                                }
-                            },
-                            _ => return plan_err!("CLASSIFIER() takes at most 1 argument"),
-                        };
-                        Ok(self.push_slot(MeasureSlotKind::Classifier { symbol }))
+                        let symbol = self.parse_classifier_symbol(&func.args)?;
+                        Ok(self.push_slot(MeasureSlotKind::Classifier {
+                            symbol,
+                            logical_nav: None,
+                            logical_offset: 0,
+                            physical_nav: None,
+                            physical_offset: 0,
+                        }))
                     }
                     "first" | "last" | "prev" | "next" => {
                         let slot_kind = self.lower_nav_function(&fname, &func.args)?;
                         Ok(self.push_slot(slot_kind))
                     }
                     "count" | "sum" | "avg" | "min" | "max" => {
-                        let slot_kind = self.lower_agg_function(&fname, &func.args)?;
+                        let slot_kind = self.lower_agg_function(&fname, None, &func.args)?;
                         Ok(self.push_slot(slot_kind))
                     }
                     _ => {
+                        // Check if this is any registered DataFusion AggregateUDF (e.g.
+                        // ARRAY_AGG, STRING_AGG, STDDEV_SAMP, BOOL_AND, custom UDAFs).
+                        if let Some(udaf) = self.ctx.context_provider().get_aggregate_meta(&fname) {
+                            let slot_kind =
+                                self.lower_agg_function(&fname, Some(udaf), &func.args)?;
+                            return Ok(self.push_slot(slot_kind));
+                        }
                         let args = match func.args {
                             FunctionArguments::List(mut list) => {
                                 for arg in &mut list.args {
@@ -762,6 +754,19 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 } else {
                     LogicalNavKind::Last
                 };
+                // Support FIRST(CLASSIFIER([sym]), n) / LAST(CLASSIFIER([sym]), n)
+                if let SqlExpr::Function(inner_fn) = &target_sql
+                    && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
+                {
+                    let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
+                    return Ok(MeasureSlotKind::Classifier {
+                        symbol,
+                        logical_nav: Some(logical_nav),
+                        logical_offset: offset,
+                        physical_nav: None,
+                        physical_offset: 0,
+                    });
+                }
                 let (symbol, stripped) =
                     extract_single_symbol_qualifier(target_sql, self.known_symbols, self.ctx)?;
                 let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
@@ -780,6 +785,20 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 } else {
                     PhysicalNavKind::Next
                 };
+                // Support PREV(CLASSIFIER([sym]), n) / NEXT(CLASSIFIER([sym]), n)
+                if let SqlExpr::Function(inner_fn) = &target_sql
+                    && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
+                {
+                    let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
+                    return Ok(MeasureSlotKind::Classifier {
+                        symbol,
+                        logical_nav: Some(LogicalNavKind::Last),
+                        logical_offset: 0,
+                        physical_nav: Some(physical_nav),
+                        physical_offset: offset,
+                    });
+                }
+
                 let (logical_nav, logical_offset, inner_target) =
                     if let SqlExpr::Function(inner_func) = &target_sql {
                         let inner_name = inner_func.name.to_string().to_ascii_lowercase();
@@ -813,6 +832,20 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         (Some(LogicalNavKind::Last), 0, target_sql)
                     };
 
+                // Support PREV(FIRST(CLASSIFIER()), n) / NEXT(LAST(CLASSIFIER()), n)
+                if let SqlExpr::Function(inner_fn) = &inner_target
+                    && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
+                {
+                    let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
+                    return Ok(MeasureSlotKind::Classifier {
+                        symbol,
+                        logical_nav,
+                        logical_offset,
+                        physical_nav: Some(physical_nav),
+                        physical_offset: offset,
+                    });
+                }
+
                 let (symbol, stripped) =
                     extract_single_symbol_qualifier(inner_target, self.known_symbols, self.ctx)?;
                 let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
@@ -832,75 +865,153 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
     fn lower_agg_function(
         &mut self,
         fname: &str,
+        udaf: Option<Arc<AggregateUDF>>,
         args: &FunctionArguments,
     ) -> Result<MeasureSlotKind> {
         let (arg_exprs, distinct) = extract_unnamed_args(args)?;
-        if arg_exprs.len() != 1 {
+        if udaf.is_none() && arg_exprs.len() != 1 {
             return plan_err!(
                 "{fname}() in MATCH_RECOGNIZE expects 1 argument, got {}",
                 arg_exprs.len()
             );
         }
+        if arg_exprs.is_empty() {
+            return plan_err!("{fname}() in MATCH_RECOGNIZE expects at least 1 argument");
+        }
 
-        match &arg_exprs[0] {
-            FunctionArgExpr::Wildcard => {
-                if fname != "count" || distinct {
-                    return plan_err!("{fname}(*) is not valid in MATCH_RECOGNIZE");
+        if udaf.is_none() {
+            match &arg_exprs[0] {
+                FunctionArgExpr::Wildcard => {
+                    if fname != "count" || distinct {
+                        return plan_err!("{fname}(*) is not valid in MATCH_RECOGNIZE");
+                    }
+                    return Ok(MeasureSlotKind::Agg {
+                        agg_kind: AggKind::CountStar,
+                        symbol: None,
+                        args: vec![],
+                        distinct: false,
+                        arg_physical_nav: None,
+                    });
                 }
-                Ok(MeasureSlotKind::Agg {
-                    agg_kind: AggKind::CountStar,
-                    symbol: None,
-                    inner_expr: None,
-                    distinct: false,
-                })
-            }
-            FunctionArgExpr::QualifiedWildcard(obj_name) => {
-                if fname != "count" || distinct {
-                    return plan_err!("{fname}({obj_name}.*) is not valid in MATCH_RECOGNIZE");
+                FunctionArgExpr::QualifiedWildcard(obj_name) => {
+                    if fname != "count" || distinct {
+                        return plan_err!("{fname}({obj_name}.*) is not valid in MATCH_RECOGNIZE");
+                    }
+                    let ident = obj_name
+                        .0
+                        .last()
+                        .and_then(|part| part.as_ident())
+                        .ok_or_else(|| {
+                            plan_datafusion_err!("Invalid qualified wildcard in COUNT")
+                        })?;
+                    let sym = self.ctx.normalize_ident(ident.clone());
+                    if !self.known_symbols.contains(&sym) {
+                        return plan_err!(
+                            "COUNT({sym}.*) references unknown pattern variable '{sym}'"
+                        );
+                    }
+                    return Ok(MeasureSlotKind::Agg {
+                        agg_kind: AggKind::CountSymbol,
+                        symbol: Some(sym),
+                        args: vec![],
+                        distinct: false,
+                        arg_physical_nav: None,
+                    });
                 }
-                let ident = obj_name
-                    .0
-                    .last()
-                    .and_then(|part| part.as_ident())
-                    .ok_or_else(|| plan_datafusion_err!("Invalid qualified wildcard in COUNT"))?;
-                let sym = self.ctx.normalize_ident(ident.clone());
-                if !self.known_symbols.contains(&sym) {
-                    return plan_err!("COUNT({sym}.*) references unknown pattern variable '{sym}'");
-                }
-                Ok(MeasureSlotKind::Agg {
-                    agg_kind: AggKind::CountSymbol,
-                    symbol: Some(sym),
-                    inner_expr: None,
-                    distinct: false,
-                })
-            }
-            FunctionArgExpr::Expr(sql_expr) => {
-                let agg_kind = match fname {
-                    "count" => AggKind::Count,
-                    "sum" => AggKind::Sum,
-                    "avg" => AggKind::Avg,
-                    "min" => AggKind::Min,
-                    "max" => AggKind::Max,
-                    _ => unreachable!(),
-                };
-                let (symbol, stripped) = extract_single_symbol_qualifier(
-                    sql_expr.clone(),
-                    self.known_symbols,
-                    self.ctx,
-                )?;
-                let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
-                Ok(MeasureSlotKind::Agg {
-                    agg_kind,
-                    symbol,
-                    inner_expr: Some(inner_expr),
-                    distinct,
-                })
-            }
-            FunctionArgExpr::WildcardWithOptions(_) => {
-                plan_err!("Wildcard options are not supported in MATCH_RECOGNIZE aggregates")
+                _ => {}
             }
         }
+
+        let agg_kind = match udaf {
+            Some(u) => AggKind::Udaf(u),
+            None => match fname {
+                "count" => AggKind::Count,
+                "sum" => AggKind::Sum,
+                "avg" => AggKind::Avg,
+                "min" => AggKind::Min,
+                "max" => AggKind::Max,
+                _ => unreachable!(),
+            },
+        };
+
+        let mut shared_symbol: Option<String> = None;
+        let mut arg_physical_nav: Option<(PhysicalNavKind, u32)> = None;
+        let mut planned_args = Vec::with_capacity(arg_exprs.len());
+
+        for (i, arg) in arg_exprs.into_iter().enumerate() {
+            let sql_expr = match arg {
+                FunctionArgExpr::Expr(e) => e,
+                _ => return plan_err!("Wildcard arguments are not supported in {fname}()"),
+            };
+
+            // Unwrap top-level PREV(expr [, n]) / NEXT(expr [, n]) inside an aggregate argument
+            // (e.g. SUM(PREV(a.price)), AVG(NEXT(b.val, 2))).
+            let (phys_nav, unwrapped_sql) = unwrap_arg_physical_nav(sql_expr)?;
+            if let Some(pn) = phys_nav {
+                if i == 0 {
+                    arg_physical_nav = Some(pn);
+                } else if arg_physical_nav != Some(pn) {
+                    return plan_err!(
+                        "Mismatched PREV/NEXT navigation across multiple arguments of {fname}()"
+                    );
+                }
+            }
+
+            let (sym, stripped) =
+                extract_single_symbol_qualifier(unwrapped_sql, self.known_symbols, self.ctx)?;
+            if let Some(s) = sym {
+                if let Some(existing) = &shared_symbol
+                    && existing != &s
+                {
+                    return plan_err!(
+                        "Aggregate {fname}() cannot reference multiple pattern variables ('{existing}' and '{s}')"
+                    );
+                }
+                shared_symbol = Some(s);
+            }
+            let expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
+            planned_args.push(expr);
+        }
+
+        Ok(MeasureSlotKind::Agg {
+            agg_kind,
+            symbol: shared_symbol,
+            args: planned_args,
+            distinct,
+            arg_physical_nav,
+        })
     }
+}
+
+fn unwrap_arg_physical_nav(expr: SqlExpr) -> Result<(Option<(PhysicalNavKind, u32)>, SqlExpr)> {
+    if let SqlExpr::Function(ref func) = expr {
+        let name = func.name.to_string().to_ascii_lowercase();
+        if matches!(name.as_str(), "prev" | "next") {
+            let (args, _) = extract_unnamed_args(&func.args)?;
+            if args.is_empty() || args.len() > 2 {
+                return plan_err!("{name}() expects 1 or 2 arguments");
+            }
+            let inner = match &args[0] {
+                FunctionArgExpr::Expr(e) => e.clone(),
+                _ => return plan_err!("{name}() expects an expression argument"),
+            };
+            let offset = if args.len() == 2 {
+                match &args[1] {
+                    FunctionArgExpr::Expr(e) => parse_non_negative_u32(e)?,
+                    _ => return plan_err!("{name}() offset must be an integer"),
+                }
+            } else {
+                1
+            };
+            let kind = if name == "prev" {
+                PhysicalNavKind::Prev
+            } else {
+                PhysicalNavKind::Next
+            };
+            return Ok((Some((kind, offset)), inner));
+        }
+    }
+    Ok((None, expr))
 }
 
 fn extract_unnamed_args(args: &FunctionArguments) -> Result<(Vec<FunctionArgExpr>, bool)> {

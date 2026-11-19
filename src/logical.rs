@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Schema};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{DFSchema, DFSchemaRef, Result, plan_datafusion_err, plan_err};
@@ -45,7 +45,6 @@ impl PartialOrd for MatchRecognizeNode {
 }
 
 impl MatchRecognizeNode {
-    /// Constructs a new `MatchRecognizeNode` (without `SUBSET` union variables).
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input: LogicalPlan,
@@ -72,8 +71,6 @@ impl MatchRecognizeNode {
         )
     }
 
-    /// Constructs a new `MatchRecognizeNode` with optional `SUBSET` union variables and computes
-    /// its SQL:2016 output schema.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_subsets(
         input: LogicalPlan,
@@ -87,7 +84,6 @@ impl MatchRecognizeNode {
         definitions: Vec<SymbolDef>,
         config: MatchRecognizeConfig,
     ) -> Result<Self> {
-        // Coerce each measure's outer_expr against its synthetic slot schema.
         let mut coerced_measures = Vec::with_capacity(measures.len());
         for m in measures {
             let slot_schema = build_slot_schema(input.schema(), &m.slots, rows_per_match)?;
@@ -100,7 +96,6 @@ impl MatchRecognizeNode {
             });
         }
 
-        // Coerce each stateful DEFINE predicate's outer_expr against its synthetic slot schema.
         let mut coerced_defs = Vec::with_capacity(definitions.len());
         for def in definitions {
             let kind = match def.kind {
@@ -141,7 +136,6 @@ impl MatchRecognizeNode {
         })
     }
 
-    /// Wraps this node in a [`LogicalPlan::Extension`].
     pub fn into_plan(self) -> LogicalPlan {
         LogicalPlan::Extension(Extension {
             node: Arc::new(self),
@@ -181,16 +175,12 @@ pub fn slot_data_type_and_nullability(
             let dt = inner_expr.get_type(input_schema)?;
             Ok((dt, true))
         }
-        MeasureSlotKind::Agg {
-            agg_kind,
-            inner_expr,
-            ..
-        } => match agg_kind {
+        MeasureSlotKind::Agg { agg_kind, args, .. } => match agg_kind {
             AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
                 Ok((DataType::Int64, unmatched))
             }
             AggKind::Sum => {
-                let expr = inner_expr.as_ref().ok_or_else(|| {
+                let expr = args.first().ok_or_else(|| {
                     plan_datafusion_err!("SUM in MEASURES/DEFINE requires an input expression")
                 })?;
                 let inner_dt = expr.get_type(input_schema)?;
@@ -198,20 +188,31 @@ pub fn slot_data_type_and_nullability(
             }
             AggKind::Avg => Ok((DataType::Float64, true)),
             AggKind::Min | AggKind::Max => {
-                let expr = inner_expr.as_ref().ok_or_else(|| {
+                let expr = args.first().ok_or_else(|| {
                     plan_datafusion_err!("MIN/MAX in MEASURES/DEFINE requires an input expression")
                 })?;
                 let inner_dt = expr.get_type(input_schema)?;
                 Ok((inner_dt, true))
             }
+            AggKind::Udaf(udaf) => {
+                let raw_fields: Vec<FieldRef> = args
+                    .iter()
+                    .map(|a| {
+                        let (_, f) = a.to_field(input_schema)?;
+                        Ok(f)
+                    })
+                    .collect::<Result<_>>()?;
+                let coerced_fields = datafusion_expr::type_coercion::functions::fields_with_udf(
+                    &raw_fields,
+                    udaf.as_ref(),
+                )?;
+                let ret = udaf.return_field(&coerced_fields)?;
+                Ok((ret.data_type().clone(), true))
+            }
         },
     }
 }
 
-/// Computes the SQL:2016 / Trino output schema for `MATCH_RECOGNIZE`.
-///
-/// - `ONE ROW PER MATCH`: `[PARTITION BY cols..., MEASURES cols...]`
-/// - `ALL ROWS PER MATCH`: `[PARTITION BY cols..., ORDER BY cols..., MEASURES cols..., remaining input cols...]`
 pub fn compute_output_schema(
     input_schema: &DFSchema,
     partition_by: &[Expr],
@@ -222,7 +223,6 @@ pub fn compute_output_schema(
     let mut fields: Vec<Field> = Vec::new();
     let mut included_input_indices: HashSet<usize> = HashSet::new();
 
-    // 1. PARTITION BY columns
     for expr in partition_by {
         if let Expr::Column(col) = expr {
             let idx = input_schema.index_of_column(col)?;
@@ -240,7 +240,6 @@ pub fn compute_output_schema(
         }
     }
 
-    // 2. ORDER BY columns (only for ALL ROWS PER MATCH)
     if !rows_per_match.is_one_row() {
         for ob in order_by {
             if let Expr::Column(col) = &ob.expr {
@@ -253,7 +252,6 @@ pub fn compute_output_schema(
         }
     }
 
-    // 3. MEASURES columns
     for m in measures {
         let slot_schema = build_slot_schema(input_schema, &m.slots, rows_per_match)?;
         let (_, field) = m.outer_expr.to_field(&slot_schema)?;
@@ -265,7 +263,6 @@ pub fn compute_output_schema(
         fields.push(Field::new(&m.alias, field.data_type().clone(), nullable));
     }
 
-    // 4. Remaining input columns (only for ALL ROWS PER MATCH)
     if !rows_per_match.is_one_row() {
         for (idx, f) in input_schema.fields().iter().enumerate() {
             if included_input_indices.insert(idx) {
@@ -297,17 +294,10 @@ fn push_slot_exprs(slots: &[MeasureSlot], exprs: &mut Vec<Expr>) {
             | MeasureSlotKind::CurrentRow { inner_expr } => {
                 exprs.push(inner_expr.clone());
             }
-            MeasureSlotKind::Agg {
-                inner_expr: Some(e),
-                ..
-            } => {
-                exprs.push(e.clone());
+            MeasureSlotKind::Agg { args, .. } => {
+                exprs.extend(args.iter().cloned());
             }
-            MeasureSlotKind::MatchNumber
-            | MeasureSlotKind::Classifier { .. }
-            | MeasureSlotKind::Agg {
-                inner_expr: None, ..
-            } => {}
+            MeasureSlotKind::MatchNumber | MeasureSlotKind::Classifier { .. } => {}
         }
     }
 }
@@ -344,16 +334,24 @@ fn rebuild_slots_from_iter(
             MeasureSlotKind::Agg {
                 agg_kind,
                 symbol,
-                inner_expr: Some(_),
+                args,
                 distinct,
-            } => MeasureSlotKind::Agg {
-                agg_kind: *agg_kind,
-                symbol: symbol.clone(),
-                inner_expr: Some(iter.next().ok_or_else(|| {
-                    plan_datafusion_err!("MatchRecognize: missing agg slot expression")
-                })?),
-                distinct: *distinct,
-            },
+                arg_physical_nav,
+            } => {
+                let mut new_args = Vec::with_capacity(args.len());
+                for _ in 0..args.len() {
+                    new_args.push(iter.next().ok_or_else(|| {
+                        plan_datafusion_err!("MatchRecognize: missing agg slot expression")
+                    })?);
+                }
+                MeasureSlotKind::Agg {
+                    agg_kind: agg_kind.clone(),
+                    symbol: symbol.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                    arg_physical_nav: *arg_physical_nav,
+                }
+            }
             other => other.clone(),
         };
         new_slots.push(MeasureSlot {

@@ -331,8 +331,11 @@ async fn test_optimizer_filter_pushdown_and_projection_pruning() {
 }
 
 #[tokio::test]
-async fn test_memory_pool_enforcement() {
-    // Create a 50,000-row single partition and execute under a tiny 64 KB GreedyMemoryPool.
+async fn test_memory_pool_enforcement_when_disk_disabled() {
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+
+    // Create a 50,000-row single partition under a 64 KB GreedyMemoryPool with disk spilling
+    // explicitly disabled -> must return clean ResourcesExhausted error.
     let n = 50_000usize;
     let batch = RecordBatch::try_from_iter(vec![
         ("k", Arc::new(Int64Array::from(vec![1i64; n])) as ArrayRef),
@@ -346,6 +349,9 @@ async fn test_memory_pool_enforcement() {
 
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(Arc::new(GreedyMemoryPool::new(64 * 1024)))
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        )
         .build_arc()
         .unwrap();
     let state = SessionStateBuilder::new()
@@ -375,6 +381,83 @@ async fn test_memory_pool_enforcement() {
         Err(other) if other.to_string().contains("Resources exhausted") => {}
         other => panic!("Expected ResourcesExhausted error under 64KB memory pool, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_disk_spill_large_partition() {
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use datafusion::physical_plan::ExecutionPlan;
+
+    // 20,000 rows split across small batches under a 64 KB FairSpillPool with disk spilling
+    // enabled: MatchRecognizeExec must spill buffered batches to disk and still produce exact
+    // output with spill_count > 0.
+    let n = 20_000usize;
+    let full = RecordBatch::try_from_iter(vec![
+        ("k", Arc::new(Int64Array::from(vec![1i64; n])) as ArrayRef),
+        ("ts", Arc::new(Int64Array::from_iter_values(0..n as i64))),
+        (
+            "v",
+            Arc::new(StringArray::from(vec!["payload_string_value_for_spill"; n])),
+        ),
+    ])
+    .unwrap();
+    let mut chunks = Vec::new();
+    let mut off = 0;
+    while off < n {
+        let len = 1000.min(n - off);
+        chunks.push(full.slice(off, len));
+        off += len;
+    }
+
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(64 * 1024)))
+        .build_arc()
+        .unwrap();
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_config(
+            SessionConfig::new()
+                .with_batch_size(1000)
+                .with_target_partitions(1),
+        )
+        .with_runtime_env(runtime)
+        .with_query_planner(Arc::new(MatchRecognizeQueryPlanner::new()))
+        .build();
+    let ctx = SessionContext::new_with_state(state);
+    register_relation_planner(&ctx, MatchRecognizeConfig::default()).unwrap();
+    let table = MemTable::try_new(full.schema(), vec![chunks]).unwrap();
+    ctx.register_table("big_spill", Arc::new(table)).unwrap();
+
+    // No ORDER BY / PARTITION BY so SortExec doesn't reject the tight pool before MatchRecognizeExec.
+    let sql = r#"
+        SELECT * FROM big_spill
+        MATCH_RECOGNIZE (
+            MEASURES COUNT(*) AS c
+            ONE ROW PER MATCH
+            PATTERN (a+)
+            DEFINE a AS ts >= 0
+        )
+    "#;
+    let df = ctx.sql(sql).await.unwrap();
+    let plan = df.create_physical_plan().await.unwrap();
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+    let formatted = pretty_format_batches(&batches).unwrap().to_string();
+    assert!(
+        formatted.contains("20000"),
+        "expected count=20000, got:\n{formatted}"
+    );
+
+    fn find_mr_metrics(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        if plan.name() == "MatchRecognizeExec" {
+            return plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0);
+        }
+        plan.children().iter().map(|c| find_mr_metrics(c)).sum()
+    }
+    let spills = find_mr_metrics(&plan);
+    assert!(
+        spills > 0,
+        "expected MatchRecognizeExec spill_count > 0, got {spills}"
+    );
 }
 
 #[tokio::test]
@@ -654,8 +737,9 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
                 kind: MeasureSlotKind::Agg {
                     agg_kind: AggKind::CountSymbol,
                     symbol: Some("u".into()),
-                    inner_expr: None,
+                    args: vec![],
                     distinct: false,
+                    arg_physical_nav: None,
                 },
             }],
         },
@@ -667,6 +751,10 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
                 semantics: EvalSemantics::Running,
                 kind: MeasureSlotKind::Classifier {
                     symbol: Some("u".into()),
+                    logical_nav: None,
+                    logical_offset: 0,
+                    physical_nav: None,
+                    physical_offset: 0,
                 },
             }],
         },
@@ -735,4 +823,142 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
         .unwrap()
         .to_string();
     assert_eq!(pout, formatted);
+}
+
+#[tokio::test]
+async fn test_udaf_and_classifier_nav_proto_roundtrip() {
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new()
+            .with_batch_size(2)
+            .with_target_partitions(2),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+
+    let sql = r#"
+        WITH seq(id, tag, price) AS (
+            VALUES (1, 'A', 10), (2, 'B', 20), (3, 'B', 30), (4, 'C', 40)
+        )
+        SELECT * FROM seq
+        MATCH_RECOGNIZE (
+            ORDER BY id
+            MEASURES
+                FIRST(CLASSIFIER()) AS first_cls,
+                LAST(CLASSIFIER(), 1) AS prev_last_cls,
+                SUM(PREV(b.price)) AS sum_prev_b,
+                ARRAY_AGG(b.price) AS b_arr,
+                STRING_AGG(tag, '-') AS path_str,
+                ROUND(STDDEV_SAMP(price), 4) AS sd
+            ONE ROW PER MATCH
+            PATTERN (a b+ c)
+            DEFINE
+                a AS tag = 'A',
+                b AS tag = 'B',
+                c AS tag = 'C'
+        )
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+    let expected = pretty_format_batches(&df.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    let lplan = df.clone().into_optimized_plan().unwrap();
+    let lcodec = MatchRecognizeLogicalCodec::new();
+    let lbytes = logical_plan_to_bytes_with_extension_codec(&lplan, &lcodec).unwrap();
+    let ldecoded =
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+    let lout = pretty_format_batches(
+        &ctx.execute_logical_plan(ldecoded)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    assert_eq!(lout, expected);
+
+    let pplan = df.create_physical_plan().await.unwrap();
+    let pcodec = MatchRecognizePhysicalCodec::new();
+    let pbytes = physical_plan_to_bytes_with_extension_codec(pplan, &pcodec).unwrap();
+    let pdecoded =
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+    let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
+        .unwrap()
+        .to_string();
+    assert_eq!(pout, expected);
+}
+
+#[tokio::test]
+async fn test_sql_unparser_roundtrip() {
+    use datafusion_expr::logical_plan::LogicalPlan;
+    use datafusion_match_recognize::MatchRecognizeUnparser;
+    use datafusion_sql::unparser::Unparser;
+
+    let ctx =
+        session_context_with_match_recognize(SessionConfig::new(), MatchRecognizeConfig::default())
+            .unwrap();
+    ctx.register_batch(
+        "ticks",
+        RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            ("tag", Arc::new(StringArray::from(vec!["A", "B", "B", "C"]))),
+            ("price", Arc::new(Int64Array::from(vec![10, 20, 30, 40]))),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    let sql = r#"
+        SELECT * FROM ticks
+        MATCH_RECOGNIZE (
+            ORDER BY id
+            MEASURES
+                MATCH_NUMBER() AS mn,
+                FIRST(a.price) AS start_p,
+                LAST(c.price) AS end_p,
+                SUM(b.price) AS sum_b
+            ONE ROW PER MATCH
+            AFTER MATCH SKIP PAST LAST ROW
+            PATTERN (a b+ c)
+            DEFINE
+                a AS tag = 'A',
+                b AS tag = 'B',
+                c AS tag = 'C'
+        )
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+    let expected = pretty_format_batches(&df.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    // Locate the MatchRecognize Extension node and unparse it back to SQL via MatchRecognizeUnparser.
+    fn find_extension(plan: &LogicalPlan) -> Option<LogicalPlan> {
+        if matches!(plan, LogicalPlan::Extension(_)) {
+            return Some(plan.clone());
+        }
+        for child in plan.inputs() {
+            if let Some(found) = find_extension(child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let mr_ext = find_extension(&df.into_unoptimized_plan()).expect("MatchRecognize Extension");
+    let unparser =
+        Unparser::default().with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
+    let unparsed_sql = unparser.plan_to_sql(&mr_ext).unwrap().to_string();
+
+    let roundtrip = run_and_format(&ctx, &unparsed_sql).await;
+    assert_eq!(
+        roundtrip, expected,
+        "Unparsed SQL roundtrip mismatch!\nUnparsed SQL:\n{unparsed_sql}"
+    );
 }

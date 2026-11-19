@@ -8,10 +8,10 @@ This crate builds `MATCH_RECOGNIZE` purely on top of DataFusion public extension
 
 - **SQL Planning (`MatchRecognizeRelationPlanner`):** Intercepts `sqlparser::ast::TableFactor::MatchRecognize` via DataFusion `RelationPlanner`, validates SQL:2016 variable rules, and builds a `MatchRecognizeNode`.
 - **Hybrid Two-Tier `DEFINE` Evaluation:** Row-local `DEFINE` predicates evaluate once per partition in vectorized Arrow packed into per-row `u64` bitmasks with O(1) start-symbol fast skipping. Match-state `DEFINE` predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, and cross-symbol references) precompute inner expressions once per partition and evaluate lazily on candidate transitions.
-- **Measure Slot Decomposition:** Extracts pattern-recognition leaves (`MATCH_NUMBER()`, `CLASSIFIER()`, `FIRST`, `LAST`, `PREV`, `NEXT`, symbol-qualified and `SUBSET`-qualified columns, and scoped `[DISTINCT]` aggregates) into synthetic slots while preserving arbitrary outer DataFusion scalar expressions (`CASE WHEN`, arithmetic, `COALESCE`, `CAST`, and UDFs) with automatic type coercion.
+- **Measure Slot Decomposition and UDAFs:** Extracts pattern-recognition leaves (`MATCH_NUMBER()`, `CLASSIFIER()` with `FIRST`/`LAST`/`PREV`/`NEXT` navigation, `FIRST`/`LAST`/`PREV`/`NEXT` with offsets, symbol-qualified and `SUBSET`-qualified columns, built-in `[DISTINCT]` aggregates, and arbitrary registered DataFusion `AggregateUDF`s via `Accumulator`) into synthetic slots while preserving arbitrary outer DataFusion scalar expressions (`CASE WHEN`, arithmetic, `COALESCE`, `CAST`, and UDFs) with automatic type coercion.
 - **Priority-Ordered PikeVM Matcher:** Compiles patterns into NFA bytecode preserving SQL:2016 leftmost-ordered alternation and greedy vs. reluctant quantifier priority. Uses per-position `pc` deduplication in Tier 1 (linear worst-case matching time), per-thread epsilon-cycle detection with configurable thread caps in Tier 2, and a flat arena for O(1)-stack match histories.
-- **Partition-Streaming Execution (`MatchRecognizeExec`):** Declares `Distribution::KeyPartitioned` (or `SinglePartition`) and `[PARTITION BY..., ORDER BY...]` ordering requirements so DataFusion inserts or elides `RepartitionExec` and `SortExec`. Streams one partition at a time with `MemoryReservation` accounting.
-- **Optimizer and Serialization:** Includes `MatchRecognizeFilterPushdown` (pushes partition-only predicates below `MatchRecognizeNode`), `necessary_children_exprs` column pruning, and composable `proto` codecs (`MatchRecognizeLogicalCodec::with_delegate` and `MatchRecognizePhysicalCodec::with_delegate`) for distributed execution.
+- **Partition-Streaming Execution and Disk Spilling (`MatchRecognizeExec`):** Declares `Distribution::KeyPartitioned` (or `SinglePartition`) and `[PARTITION BY..., ORDER BY...]` ordering requirements so DataFusion inserts or elides `RepartitionExec` and `SortExec`. Streams one partition at a time with `MemoryReservation` accounting and automatic Arrow IPC temp-file spilling via DataFusion's `SpillManager` when memory limits are tight.
+- **Optimizer, Serialization, and Unparsing:** Includes `MatchRecognizeFilterPushdown` (pushes partition-only predicates below `MatchRecognizeNode`), `necessary_children_exprs` column pruning, composable `proto` codecs (`MatchRecognizeLogicalCodec::with_delegate` and `MatchRecognizePhysicalCodec::with_delegate`), and `MatchRecognizeUnparser` (`UserDefinedLogicalNodeUnparser`).
 
 ## Quick Start
 
@@ -79,9 +79,14 @@ cargo test --test trino_oracle -- --ignored --nocapture
 docker rm -f mr-trino-oracle
 ```
 
-## Current Scope and Known Gaps
+## Current Scope, Divergences, and Upstream PRs
 
-See [tests/divergences.md](tests/divergences.md) for documented differences from Trino and upstream `sqlparser-rs` parser gaps.
+See [tests/divergences.md](tests/divergences.md) for the full parity matrix, remaining roadmap items, and tracked upstream `sqlparser-rs` / DataFusion PRs:
+
+- Reluctant quantifiers in SQL: [apache/datafusion-sqlparser-rs#2510](https://github.com/apache/datafusion-sqlparser-rs/pull/2510) (merged in `0.64.0`), DataFusion adoption in [apache/datafusion#27063](https://github.com/apache/datafusion/pull/27063).
+- Derived tables, unparenthesized `a {- b -}` exclusions, and case-insensitive `permute`: [apache/datafusion-sqlparser-rs#3017](https://github.com/apache/datafusion-sqlparser-rs/pull/3017) (draft).
+- SQL:2016 `SUBSET` union variables: [apache/datafusion-sqlparser-rs#3018](https://github.com/apache/datafusion-sqlparser-rs/pull/3018) (draft).
+- SQL:2016 `RUNNING` / `FINAL` measure modifiers: [apache/datafusion-sqlparser-rs#3019](https://github.com/apache/datafusion-sqlparser-rs/pull/3019) (draft).
 
 ## Acknowledgments
 

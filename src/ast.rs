@@ -3,8 +3,9 @@
 //! Validated internal IR for SQL:2016 `MATCH_RECOGNIZE`.
 
 use std::fmt;
+use std::sync::Arc;
 
-use datafusion_expr::Expr;
+use datafusion_expr::{AggregateUDF, Expr};
 
 /// Default safety limit on the number of elements inside `PERMUTE(...)`.
 pub const DEFAULT_MAX_PERMUTE_ELEMENTS: u32 = 8;
@@ -39,11 +40,8 @@ impl Default for MatchRecognizeConfig {
 /// A pattern symbol reference (named variable or partition anchor).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SymbolRef {
-    /// Normalized pattern variable name (e.g., `"a"`).
     Named(String),
-    /// Start-of-partition anchor (`^`).
     Start,
-    /// End-of-partition anchor (`$`).
     End,
 }
 
@@ -60,17 +58,11 @@ impl fmt::Display for SymbolRef {
 /// Internal row-pattern AST.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Pattern {
-    /// A single named symbol or partition anchor (`^`, `$`).
     Symbol(SymbolRef),
-    /// Exclusion syntax `{- pattern -}`.
     Exclude(Box<Pattern>),
-    /// `PERMUTE(p1, p2, ...)` expanding to lexicographically ordered permutations.
     Permute(Vec<Pattern>),
-    /// Ordered concatenation `p1 p2 ...`.
     Concat(Vec<Pattern>),
-    /// Ordered alternation `p1 | p2 | ...` (leftmost branch has highest priority).
     Alternation(Vec<Pattern>),
-    /// Quantified repetition `inner{min, max}` (greedy or reluctant).
     Repetition {
         inner: Box<Pattern>,
         min: u32,
@@ -175,29 +167,22 @@ impl fmt::Display for Pattern {
 /// Output row mode for `MATCH_RECOGNIZE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum RowsPerMatch {
-    /// `ONE ROW PER MATCH` (default).
     #[default]
     OneRow,
-    /// `ALL ROWS PER MATCH [SHOW EMPTY MATCHES]`.
     AllRowsShowEmpty,
-    /// `ALL ROWS PER MATCH OMIT EMPTY MATCHES`.
     AllRowsOmitEmpty,
-    /// `ALL ROWS PER MATCH WITH UNMATCHED ROWS`.
     AllRowsWithUnmatched,
 }
 
 impl RowsPerMatch {
-    /// Returns true if this mode emits one row per match.
     pub fn is_one_row(self) -> bool {
         matches!(self, RowsPerMatch::OneRow)
     }
 
-    /// Returns true if empty matches emit an output row.
     pub fn show_empty_matches(self) -> bool {
         !matches!(self, RowsPerMatch::AllRowsOmitEmpty)
     }
 
-    /// Returns true if unmatched input rows are emitted.
     pub fn include_unmatched_rows(self) -> bool {
         matches!(self, RowsPerMatch::AllRowsWithUnmatched)
     }
@@ -219,14 +204,10 @@ impl fmt::Display for RowsPerMatch {
 /// `AFTER MATCH SKIP` resumption policy.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum AfterMatchSkip {
-    /// `AFTER MATCH SKIP PAST LAST ROW` (default).
     #[default]
     PastLastRow,
-    /// `AFTER MATCH SKIP TO NEXT ROW`.
     ToNextRow,
-    /// `AFTER MATCH SKIP TO FIRST <symbol_or_subset>`.
     ToFirst(String),
-    /// `AFTER MATCH SKIP TO LAST <symbol_or_subset>`.
     ToLast(String),
 }
 
@@ -263,30 +244,23 @@ pub enum PhysicalNavKind {
 }
 
 /// Aggregate functions supported inside `MEASURES` and stateful `DEFINE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum AggKind {
-    /// `COUNT(*)` over all rows in the match.
     CountStar,
-    /// `COUNT(A.*)` over rows matching symbol/subset `A`.
     CountSymbol,
-    /// `COUNT([DISTINCT] expr)` counting non-null values.
     Count,
-    /// `SUM([DISTINCT] expr)`.
     Sum,
-    /// `AVG([DISTINCT] expr)`.
     Avg,
-    /// `MIN(expr)`.
     Min,
-    /// `MAX(expr)`.
     Max,
+    /// Any registered DataFusion [`AggregateUDF`] evaluated via its [`datafusion_expr::Accumulator`].
+    Udaf(Arc<AggregateUDF>),
 }
 
 /// Evaluation horizon for a measure or define leaf (`RUNNING` vs `FINAL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvalSemantics {
-    /// Evaluate over rows from match start up to the current row (default for `ALL ROWS` and `DEFINE`).
     Running,
-    /// Evaluate over all rows of the completed match (default for `ONE ROW`).
     Final,
 }
 
@@ -295,8 +269,14 @@ pub enum EvalSemantics {
 pub enum MeasureSlotKind {
     /// `MATCH_NUMBER()` returning 1-based `Int64` match index per partition.
     MatchNumber,
-    /// `CLASSIFIER([symbol_or_subset])` returning `Utf8` variable name (or `NULL`).
-    Classifier { symbol: Option<String> },
+    /// `CLASSIFIER([symbol_or_subset])`, optionally wrapped in `FIRST`/`LAST`/`PREV`/`NEXT`.
+    Classifier {
+        symbol: Option<String>,
+        logical_nav: Option<LogicalNavKind>,
+        logical_offset: u32,
+        physical_nav: Option<PhysicalNavKind>,
+        physical_offset: u32,
+    },
     /// Pattern navigation (`FIRST`/`LAST`, `PREV`/`NEXT`, or bare `A.col`).
     Nav {
         logical_nav: Option<LogicalNavKind>,
@@ -306,12 +286,14 @@ pub enum MeasureSlotKind {
         symbol: Option<String>,
         inner_expr: Expr,
     },
-    /// Aggregate over matched rows (optionally scoped to a single pattern variable or subset).
+    /// Aggregate over matched rows (built-in fast path or any DataFusion `AggregateUDF`),
+    /// optionally scoped to a pattern variable/subset and optionally with `PREV`/`NEXT` shifted args.
     Agg {
         agg_kind: AggKind,
         symbol: Option<String>,
-        inner_expr: Option<Expr>,
+        args: Vec<Expr>,
         distinct: bool,
+        arg_physical_nav: Option<(PhysicalNavKind, u32)>,
     },
     /// Bare input-column reference evaluated on the current row.
     CurrentRow { inner_expr: Expr },
@@ -329,20 +311,16 @@ pub struct MeasureSlot {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct MeasureSpec {
     pub alias: String,
-    /// Standard DataFusion expression referencing `slots` by `slot_name`.
     pub outer_expr: Expr,
-    /// Pattern-recognition leaf expressions evaluated into a synthetic batch for `outer_expr`.
     pub slots: Vec<MeasureSlot>,
 }
 
 /// Classification of a `DEFINE <name> AS <predicate>` expression.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum SymbolDefKind {
-    /// Tier 1 fast path: depends only on the current row; evaluated once per partition in
-    /// vectorized Arrow into a bitmask.
-    Stateless { predicate: Expr },
-    /// Tier 2 match-state predicate: references `PREV`/`NEXT`/`FIRST`/`LAST`, aggregates,
-    /// `CLASSIFIER()`, `MATCH_NUMBER()`, or another symbol/subset.
+    Stateless {
+        predicate: Expr,
+    },
     Stateful {
         outer_expr: Expr,
         slots: Vec<MeasureSlot>,
@@ -357,7 +335,6 @@ pub struct SymbolDef {
 }
 
 impl SymbolDef {
-    /// Creates a stateless row-local symbol definition.
     pub fn stateless(name: impl Into<String>, predicate: Expr) -> Self {
         Self {
             name: name.into(),
@@ -365,7 +342,6 @@ impl SymbolDef {
         }
     }
 
-    /// Creates a stateful match-dependent symbol definition.
     pub fn stateful(name: impl Into<String>, outer_expr: Expr, slots: Vec<MeasureSlot>) -> Self {
         Self {
             name: name.into(),
@@ -373,7 +349,6 @@ impl SymbolDef {
         }
     }
 
-    /// Returns true if this definition requires match-state evaluation during NFA matching.
     pub fn is_stateful(&self) -> bool {
         matches!(self.kind, SymbolDefKind::Stateful { .. })
     }

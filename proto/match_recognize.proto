@@ -68,6 +68,7 @@ enum AggKindProto {
   AGG_AVG = 4;
   AGG_MIN = 5;
   AGG_MAX = 6;
+  AGG_UDAF = 7;
 }
 
 enum EvalSemanticsProto {
@@ -89,6 +90,10 @@ message MeasureSlotProto {
 
 message ClassifierSlotProto {
   optional string symbol = 1;
+  optional LogicalNavKindProto logical_nav = 2;
+  uint32 logical_offset = 3;
+  optional PhysicalNavKindProto physical_nav = 4;
+  uint32 physical_offset = 5;
 }
 
 message NavSlotProto {
@@ -103,8 +108,12 @@ message NavSlotProto {
 message AggSlotProto {
   AggKindProto agg_kind = 1;
   optional string symbol = 2;
-  optional bytes inner_expr = 3;
+  repeated bytes args = 3;
   bool distinct = 4;
+  // Populated when agg_kind == AGG_UDAF.
+  string udaf_name = 5;
+  optional PhysicalNavKindProto arg_physical_nav = 6;
+  uint32 arg_physical_offset = 7;
 }
 
 message CurrentRowSlotProto {
@@ -124,9 +133,7 @@ message StatefulSymbolDefProto {
 
 message SymbolDefProto {
   string name = 1;
-  // Stateless row-local predicate (populated when stateful is absent).
   bytes predicate = 2;
-  // Stateful match-dependent predicate (populated when symbol uses PREV/NEXT/FIRST/LAST/aggs/cross-symbol refs).
   StatefulSymbolDefProto stateful = 3;
 }
 
@@ -141,7 +148,6 @@ message OrderBySpecProto {
   bool nulls_first = 3;
 }
 
-// Serialized payload for LogicalExtensionCodec (MatchRecognizeNode).
 message MatchRecognizeLogicalNodeProto {
   repeated bytes partition_by = 1;
   repeated OrderBySpecProto order_by = 2;
@@ -156,7 +162,6 @@ message MatchRecognizeLogicalNodeProto {
   repeated SubsetDefProto subsets = 11;
 }
 
-// Serialized payload for PhysicalExtensionCodec (MatchRecognizeExec).
 message MatchRecognizePhysicalNodeProto {
   repeated bytes partition_by = 1;
   repeated OrderBySpecProto order_by = 2;
