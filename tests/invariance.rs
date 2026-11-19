@@ -434,7 +434,7 @@ async fn test_logical_and_physical_proto_roundtrip() {
 
     // 1. Logical plan protobuf round-trip
     let logical_plan = df.clone().into_optimized_plan().unwrap();
-    let logical_codec = MatchRecognizeLogicalCodec;
+    let logical_codec = MatchRecognizeLogicalCodec::new();
     let logical_bytes =
         logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec).unwrap();
     let decoded_logical = logical_plan_from_bytes_with_extension_codec(
@@ -460,7 +460,7 @@ async fn test_logical_and_physical_proto_roundtrip() {
 
     // 2. Physical plan protobuf round-trip
     let physical_plan = df.create_physical_plan().await.unwrap();
-    let phys_codec = MatchRecognizePhysicalCodec;
+    let phys_codec = MatchRecognizePhysicalCodec::new();
     let phys_bytes =
         physical_plan_to_bytes_with_extension_codec(Arc::clone(&physical_plan), &phys_codec)
             .unwrap();
@@ -473,4 +473,266 @@ async fn test_logical_and_physical_proto_roundtrip() {
         phys_out, expected,
         "Physical proto round-trip output mismatch"
     );
+}
+
+#[tokio::test]
+async fn test_stateful_define_and_distinct_proto_roundtrip() {
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new()
+            .with_batch_size(2)
+            .with_target_partitions(2),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+
+    let sql = r#"
+        WITH ticker(sym, t, price) AS (
+            VALUES
+                ('ACME', 1, 100),
+                ('ACME', 2,  90),
+                ('ACME', 3,  80),
+                ('ACME', 4,  85),
+                ('ACME', 5,  95),
+                ('ACME', 6,  95),
+                ('ACME', 7,  70),
+                ('ACME', 8, 110)
+        )
+        SELECT * FROM ticker
+        MATCH_RECOGNIZE (
+            PARTITION BY sym
+            ORDER BY t
+            MEASURES
+                MATCH_NUMBER() AS mn,
+                FIRST(strt.price) AS start_p,
+                LAST(down.price) AS bottom_p,
+                LAST(up.price) AS peak_p,
+                COUNT(DISTINCT price) AS distinct_prices,
+                SUM(DISTINCT price) AS sum_distinct_prices
+            ONE ROW PER MATCH
+            AFTER MATCH SKIP TO LAST up
+            PATTERN (strt down+ up+)
+            DEFINE
+                down AS down.price < PREV(down.price),
+                up AS up.price > PREV(up.price)
+        )
+        ORDER BY sym, mn
+    "#;
+
+    let df = ctx.sql(sql).await.unwrap();
+    let expected = pretty_format_batches(&df.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    let logical_plan = df.clone().into_optimized_plan().unwrap();
+    let logical_codec = MatchRecognizeLogicalCodec::with_delegate(Arc::new(
+        datafusion_proto::logical_plan::DefaultLogicalExtensionCodec {},
+    ));
+    let logical_bytes =
+        logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec).unwrap();
+    let decoded_logical = logical_plan_from_bytes_with_extension_codec(
+        &logical_bytes,
+        &ctx.task_ctx(),
+        &logical_codec,
+    )
+    .unwrap();
+    let logical_out = pretty_format_batches(
+        &ctx.execute_logical_plan(decoded_logical)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    assert_eq!(logical_out, expected);
+
+    let physical_plan = df.create_physical_plan().await.unwrap();
+    let phys_codec = MatchRecognizePhysicalCodec::with_delegate(Arc::new(
+        datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec {},
+    ));
+    let phys_bytes =
+        physical_plan_to_bytes_with_extension_codec(Arc::clone(&physical_plan), &phys_codec)
+            .unwrap();
+    let decoded_phys =
+        physical_plan_from_bytes_with_extension_codec(&phys_bytes, &ctx.task_ctx(), &phys_codec)
+            .unwrap();
+    let phys_batches = collect(decoded_phys, ctx.task_ctx()).await.unwrap();
+    let phys_out = pretty_format_batches(&phys_batches).unwrap().to_string();
+    assert_eq!(phys_out, expected);
+}
+
+#[tokio::test]
+async fn test_subset_union_variables_and_final_semantics_roundtrip() {
+    use datafusion_expr::{col, lit};
+    use datafusion_match_recognize::{
+        AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeNode, MeasureSlot,
+        MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, RowsPerMatch, SubsetDef, SymbolDef,
+        SymbolRef,
+    };
+
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new()
+            .with_batch_size(2)
+            .with_target_partitions(2),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+
+    let base_plan = ctx
+        .sql(
+            "SELECT column1 AS id, column2 AS tag, column3 AS val FROM (VALUES \
+             (1, 'A', 10), (2, 'B', 20), (3, 'C', 30), (4, 'B', 40))",
+        )
+        .await
+        .unwrap()
+        .into_unoptimized_plan();
+
+    let pattern = Pattern::Concat(vec![
+        Pattern::Symbol(SymbolRef::Named("a".into())),
+        Pattern::Repetition {
+            inner: Box::new(Pattern::Symbol(SymbolRef::Named("b".into()))),
+            min: 1,
+            max: None,
+            reluctant: false,
+        },
+        Pattern::Repetition {
+            inner: Box::new(Pattern::Symbol(SymbolRef::Named("c".into()))),
+            min: 1,
+            max: None,
+            reluctant: false,
+        },
+    ]);
+    let subsets = vec![SubsetDef {
+        name: "u".into(),
+        members: vec!["b".into(), "c".into()],
+    }];
+    let definitions = vec![
+        SymbolDef::stateless("a", col("tag").eq(lit("A"))),
+        SymbolDef::stateless("b", col("tag").eq(lit("B"))),
+        SymbolDef::stateless("c", col("tag").eq(lit("C"))),
+    ];
+    let measures = vec![
+        MeasureSpec {
+            alias: "u_first".into(),
+            outer_expr: col("__mr_slot_0"),
+            slots: vec![MeasureSlot {
+                slot_name: "__mr_slot_0".into(),
+                semantics: EvalSemantics::Final,
+                kind: MeasureSlotKind::Nav {
+                    logical_nav: Some(LogicalNavKind::First),
+                    logical_offset: 0,
+                    physical_nav: None,
+                    physical_offset: 0,
+                    symbol: Some("u".into()),
+                    inner_expr: col("val"),
+                },
+            }],
+        },
+        MeasureSpec {
+            alias: "u_last_final".into(),
+            outer_expr: col("__mr_slot_0"),
+            slots: vec![MeasureSlot {
+                slot_name: "__mr_slot_0".into(),
+                semantics: EvalSemantics::Final,
+                kind: MeasureSlotKind::Nav {
+                    logical_nav: Some(LogicalNavKind::Last),
+                    logical_offset: 0,
+                    physical_nav: None,
+                    physical_offset: 0,
+                    symbol: Some("u".into()),
+                    inner_expr: col("val"),
+                },
+            }],
+        },
+        MeasureSpec {
+            alias: "u_cnt_final".into(),
+            outer_expr: col("__mr_slot_0"),
+            slots: vec![MeasureSlot {
+                slot_name: "__mr_slot_0".into(),
+                semantics: EvalSemantics::Final,
+                kind: MeasureSlotKind::Agg {
+                    agg_kind: AggKind::CountSymbol,
+                    symbol: Some("u".into()),
+                    inner_expr: None,
+                    distinct: false,
+                },
+            }],
+        },
+        MeasureSpec {
+            alias: "u_cls_running".into(),
+            outer_expr: col("__mr_slot_0"),
+            slots: vec![MeasureSlot {
+                slot_name: "__mr_slot_0".into(),
+                semantics: EvalSemantics::Running,
+                kind: MeasureSlotKind::Classifier {
+                    symbol: Some("u".into()),
+                },
+            }],
+        },
+    ];
+
+    let mr_plan = MatchRecognizeNode::try_new_with_subsets(
+        base_plan,
+        vec![],
+        vec![OrderBySpec {
+            expr: col("id"),
+            asc: true,
+            nulls_first: false,
+        }],
+        measures,
+        RowsPerMatch::AllRowsShowEmpty,
+        AfterMatchSkip::PastLastRow,
+        pattern,
+        subsets,
+        definitions,
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap()
+    .into_plan();
+
+    let df = ctx.execute_logical_plan(mr_plan.clone()).await.unwrap();
+    let batches = df.clone().collect().await.unwrap();
+    let formatted = pretty_format_batches(&batches).unwrap().to_string();
+    assert!(
+        formatted
+            .contains("| 1  | 20      | 30           | 2           |               | A   | 10  |"),
+        "got:\n{formatted}"
+    );
+    assert!(
+        formatted
+            .contains("| 2  | 20      | 30           | 2           | B             | B   | 20  |"),
+        "got:\n{formatted}"
+    );
+    assert!(
+        formatted
+            .contains("| 3  | 20      | 30           | 2           | C             | C   | 30  |"),
+        "got:\n{formatted}"
+    );
+
+    let lcodec = MatchRecognizeLogicalCodec::new();
+    let lbytes = logical_plan_to_bytes_with_extension_codec(&mr_plan, &lcodec).unwrap();
+    let ldecoded =
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+    let lout = pretty_format_batches(
+        &ctx.execute_logical_plan(ldecoded)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    assert_eq!(lout, formatted);
+
+    let phys = df.create_physical_plan().await.unwrap();
+    let pcodec = MatchRecognizePhysicalCodec::new();
+    let pbytes = physical_plan_to_bytes_with_extension_codec(phys, &pcodec).unwrap();
+    let pdecoded =
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+    let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
+        .unwrap()
+        .to_string();
+    assert_eq!(pout, formatted);
 }

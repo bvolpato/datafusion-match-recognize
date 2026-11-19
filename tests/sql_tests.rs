@@ -127,3 +127,10 @@ async fn test_slt_calcite_and_funnels() {
         run_slt_file("tests/slt/calcite_and_funnels.slt", bs, tp).await;
     }
 }
+
+#[tokio::test]
+async fn test_slt_stateful_and_distinct() {
+    for &(bs, tp) in &[(8192, 1), (2, 4)] {
+        run_slt_file("tests/slt/stateful_and_distinct.slt", bs, tp).await;
+    }
+}

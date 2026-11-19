@@ -99,7 +99,7 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             Arc::new(mr_node.input.clone()),
         )?);
 
-        let new_mr = MatchRecognizeNode::try_new(
+        let new_mr = MatchRecognizeNode::try_new_with_subsets(
             new_input,
             mr_node.partition_by.clone(),
             mr_node.order_by.clone(),
@@ -107,6 +107,7 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             mr_node.rows_per_match,
             mr_node.after_match_skip.clone(),
             mr_node.pattern.clone(),
+            mr_node.subsets.clone(),
             mr_node.definitions.clone(),
             mr_node.config,
         )?

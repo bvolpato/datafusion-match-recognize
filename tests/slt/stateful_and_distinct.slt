@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: Apache-2.0
+# Phase 2: Stateful DEFINE predicates (PREV/NEXT/FIRST/LAST/aggs/cross-symbol) & DISTINCT aggregates
+
+statement ok
+CREATE TABLE ticker (sym VARCHAR, t INT, price INT) AS VALUES
+  ('ACME', 1, 100),
+  ('ACME', 2,  90),
+  ('ACME', 3,  80),
+  ('ACME', 4,  85),
+  ('ACME', 5,  95),
+  ('ACME', 6,  95),
+  ('ACME', 7,  70),
+  ('ACME', 8,  60),
+  ('ACME', 9, 110);
+
+# 1. Calcite/SQL:2016 classic stock-price V-shape with stateful PREV() in DEFINE
+query TIIIII
+SELECT * FROM ticker
+MATCH_RECOGNIZE (
+  PARTITION BY sym
+  ORDER BY t
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    FIRST(strt.t) AS start_t,
+    LAST(down.t) AS bottom_t,
+    LAST(up.t) AS end_t,
+    LAST(down.price) AS bottom_price
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (strt down+ up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY sym, mn;
+----
+ACME 1 1 3 5 80
+ACME 2 6 8 9 60
+
+# 2. V-shape with AFTER MATCH SKIP TO LAST up (overlapping V-shapes)
+query TIIII
+SELECT * FROM ticker
+MATCH_RECOGNIZE (
+  PARTITION BY sym
+  ORDER BY t
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    FIRST(strt.t) AS start_t,
+    LAST(down.t) AS bottom_t,
+    LAST(up.t) AS end_t
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt down+ up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY sym, mn;
+----
+ACME 1 1 3 5
+ACME 2 6 8 9
+
+# 3. Time-windowed funnel: stateful DEFINE using b.ts - FIRST(a.ts) <= 500
+statement ok
+CREATE TABLE timed_events (u VARCHAR, ts BIGINT, ev VARCHAR) AS VALUES
+  ('u1', 100, 'view'),
+  ('u1', 300, 'scroll'),
+  ('u1', 450, 'buy'),
+  ('u2', 100, 'view'),
+  ('u2', 700, 'buy'),
+  ('u3', 100, 'view'),
+  ('u3', 200, 'view'),
+  ('u3', 650, 'buy');
+
+query TIII
+SELECT * FROM timed_events
+MATCH_RECOGNIZE (
+  PARTITION BY u
+  ORDER BY ts
+  MEASURES
+    FIRST(a.ts) AS a_ts,
+    LAST(b.ts) AS b_ts,
+    LAST(b.ts) - FIRST(a.ts) AS dt
+  ONE ROW PER MATCH
+  PATTERN (a any_r* b)
+  DEFINE
+    a AS ev = 'view',
+    b AS ev = 'buy' AND b.ts - FIRST(a.ts) <= 500
+)
+ORDER BY u;
+----
+u1 100 450 350
+u3 200 650 450
+
+# 4. Running aggregate AVG + COUNT inside stateful DEFINE
+statement ok
+CREATE TABLE nums (id INT, v INT) AS VALUES
+  (1, 10),
+  (2, 20),
+  (3, 18),
+  (4, 25),
+  (5, 30),
+  (6, 5);
+
+query IIII
+SELECT * FROM nums
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    FIRST(a.id) AS first_a,
+    LAST(b.id) AS last_b,
+    COUNT(b.*) AS cnt_b
+  ONE ROW PER MATCH
+  PATTERN (a+ b+)
+  DEFINE
+    a AS v <= 20,
+    b AS b.v > AVG(a.v) AND COUNT(b.*) <= 2
+)
+ORDER BY mn;
+----
+1 1 5 2
+
+# 5. DISTINCT aggregates in MEASURES (COUNT DISTINCT, SUM DISTINCT, AVG DISTINCT)
+statement ok
+CREATE TABLE dups (id INT, tag VARCHAR, v INT) AS VALUES
+  (1, 'A', 10),
+  (2, 'B', 20),
+  (3, 'B', 20),
+  (4, 'B', 30),
+  (5, 'B', NULL),
+  (6, 'C', 10);
+
+query IIIIIR
+SELECT * FROM dups
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    COUNT(v) AS cnt_all,
+    COUNT(DISTINCT v) AS cnt_dist,
+    COUNT(DISTINCT b.v) AS cnt_b_dist,
+    SUM(b.v) AS sum_b,
+    SUM(DISTINCT b.v) AS sum_b_dist,
+    AVG(DISTINCT b.v) AS avg_b_dist
+  ONE ROW PER MATCH
+  PATTERN (a b+ c)
+  DEFINE
+    a AS tag = 'A',
+    b AS tag = 'B',
+    c AS tag = 'C'
+);
+----
+5 3 2 70 50 25.0

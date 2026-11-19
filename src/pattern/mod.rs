@@ -1,20 +1,59 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compiles a [`Pattern`] AST into priority-ordered NFA bytecode.
-//!
-//! The bytecode preserves SQL:2016 leftmost-ordered alternation and greedy vs. reluctant
-//! quantifier priorities. Placing the loop-back `Split` at the end of unbounded repetitions
-//! ensures standard per-position `visited[pc]` epsilon-closure deduplication handles empty
-//! iterations (such as `(A??)*`) without dropping higher-priority exits.
+//! Compiles a [`Pattern`] AST into priority-ordered NFA bytecode, resolves `SUBSET` union
+//! variables into dense [`SymbolSet`] bitmasks, and precomputes start-symbol masks for
+//! O(1) row fast-skipping.
 
 use std::collections::HashMap;
 
 use datafusion_common::{Result, plan_err};
 
-use crate::ast::{MatchRecognizeConfig, Pattern, SymbolRef};
+use crate::ast::{MatchRecognizeConfig, Pattern, SubsetDef, SymbolRef};
 
-/// Dense 0-based runtime identifier for a pattern variable.
+/// Dense 0-based runtime identifier for a primary pattern variable.
 pub type SymbolId = u16;
+
+/// Set of primary [`SymbolId`]s matched by either a single primary variable or a `SUBSET` union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolSet {
+    /// Single primary variable (fast equality check).
+    Single(SymbolId),
+    /// Bitmask for up to 64 primary variables (`SUBSET` fast path).
+    Mask64(u64),
+    /// General sorted list for > 64 primary variables.
+    List(Vec<SymbolId>),
+}
+
+impl SymbolSet {
+    /// Creates a [`SymbolSet`] from a slice of member [`SymbolId`]s.
+    pub fn from_ids(ids: &[SymbolId]) -> Self {
+        if ids.len() == 1 {
+            return Self::Single(ids[0]);
+        }
+        if ids.iter().all(|&id| (id as usize) < 64) {
+            let mut mask = 0u64;
+            for &id in ids {
+                mask |= 1u64 << id;
+            }
+            Self::Mask64(mask)
+        } else {
+            let mut sorted = ids.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            Self::List(sorted)
+        }
+    }
+
+    /// Returns true if `sym` belongs to this primary variable or subset.
+    #[inline]
+    pub fn contains(&self, sym: SymbolId) -> bool {
+        match self {
+            SymbolSet::Single(id) => *id == sym,
+            SymbolSet::Mask64(mask) => (sym as usize) < 64 && (*mask & (1u64 << sym)) != 0,
+            SymbolSet::List(ids) => ids.binary_search(&sym).is_ok(),
+        }
+    }
+}
 
 /// A single NFA bytecode instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -42,20 +81,38 @@ pub enum Inst {
 pub struct Program {
     /// Bytecode instruction stream.
     pub instructions: Vec<Inst>,
-    /// Index-to-name symbol table (`id_to_symbol[sym as usize]`).
+    /// Index-to-name primary symbol table (`id_to_symbol[sym as usize]`).
     pub id_to_symbol: Vec<String>,
-    /// Name-to-index symbol lookup.
+    /// Name-to-index primary symbol lookup.
     pub symbol_to_id: HashMap<String, SymbolId>,
+    /// Resolved `SUBSET` union variables (`subset_name -> SymbolSet`).
+    pub subsets: HashMap<String, SymbolSet>,
+    /// Optional bitmask of all symbols that can match the very first row of a match.
+    ///
+    /// Populated only when the pattern cannot match empty, contains no `^`/`$` anchors on the
+    /// start frontier, and has at most 64 primary symbols. Enables O(1) row fast-skipping when
+    /// all symbols are stateless.
+    pub start_symbols_mask: Option<u64>,
 }
 
 impl Program {
-    /// Compiles a [`Pattern`] and explicit symbol list into a [`Program`].
-    ///
-    /// Any pattern variable referenced in `pattern` that is not in `declared_symbols`
-    /// is automatically registered (implicit `TRUE` definition per SQL:2016).
+    /// Compiles a [`Pattern`] with declared symbols and no `SUBSET` union variables.
     pub fn compile(
         pattern: &Pattern,
         declared_symbols: &[String],
+        config: MatchRecognizeConfig,
+    ) -> Result<Self> {
+        Self::compile_with_subsets(pattern, declared_symbols, &[], config)
+    }
+
+    /// Compiles a [`Pattern`] with declared symbols and optional `SUBSET` union variables.
+    ///
+    /// Any pattern variable referenced in `pattern` that is not in `declared_symbols`
+    /// is automatically registered (implicit `TRUE` definition per SQL:2016).
+    pub fn compile_with_subsets(
+        pattern: &Pattern,
+        declared_symbols: &[String],
+        subset_defs: &[SubsetDef],
         config: MatchRecognizeConfig,
     ) -> Result<Self> {
         let mut id_to_symbol = Vec::new();
@@ -70,6 +127,37 @@ impl Program {
             register_symbol(name, &mut id_to_symbol, &mut symbol_to_id)?;
         }
 
+        // Validate and resolve SUBSET union variables.
+        let mut subsets: HashMap<String, SymbolSet> = HashMap::with_capacity(subset_defs.len());
+        for sdef in subset_defs {
+            if symbol_to_id.contains_key(&sdef.name) {
+                return plan_err!(
+                    "SUBSET variable '{}' conflicts with primary pattern variable",
+                    sdef.name
+                );
+            }
+            if subsets.contains_key(&sdef.name) {
+                return plan_err!("Duplicate SUBSET variable '{}'", sdef.name);
+            }
+            if sdef.members.is_empty() {
+                return plan_err!(
+                    "SUBSET variable '{}' must reference at least one primary variable",
+                    sdef.name
+                );
+            }
+            let mut member_ids = Vec::with_capacity(sdef.members.len());
+            for member in &sdef.members {
+                let id = *symbol_to_id.get(member).ok_or_else(|| {
+                    datafusion_common::plan_datafusion_err!(
+                        "SUBSET '{}' references unknown primary pattern variable '{member}'",
+                        sdef.name
+                    )
+                })?;
+                member_ids.push(id);
+            }
+            subsets.insert(sdef.name.clone(), SymbolSet::from_ids(&member_ids));
+        }
+
         let mut compiler = Compiler {
             instructions: Vec::new(),
             symbol_to_id: &symbol_to_id,
@@ -79,22 +167,70 @@ impl Program {
         compiler.compile_pattern(pattern)?;
         compiler.push(Inst::Accept)?;
 
+        let start_symbols_mask =
+            compute_start_symbols_mask(&compiler.instructions, id_to_symbol.len());
+
         Ok(Program {
             instructions: compiler.instructions,
             id_to_symbol,
             symbol_to_id,
+            subsets,
+            start_symbols_mask,
         })
     }
 
-    /// Returns the number of registered pattern symbols.
+    /// Returns the number of registered primary pattern symbols.
     pub fn num_symbols(&self) -> usize {
         self.id_to_symbol.len()
     }
 
-    /// Looks up a symbol's dense runtime id by normalized name.
+    /// Looks up a primary symbol's dense runtime id by normalized name.
     pub fn symbol_id(&self, name: &str) -> Option<SymbolId> {
         self.symbol_to_id.get(name).copied()
     }
+
+    /// Resolves either a primary symbol name or a `SUBSET` union variable name to a [`SymbolSet`].
+    pub fn resolve_symbol_set(&self, name: &str) -> Option<SymbolSet> {
+        if let Some(id) = self.symbol_to_id.get(name).copied() {
+            return Some(SymbolSet::Single(id));
+        }
+        self.subsets.get(name).cloned()
+    }
+}
+
+/// Computes the bitmask of primary symbols reachable on the first consuming step from `pc = 0`.
+///
+/// Returns `None` if `Accept` is reachable without consuming a row (nullable pattern), if an
+/// anchor (`^`/`$`) lies on the initial frontier, or if there are more than 64 symbols.
+fn compute_start_symbols_mask(instructions: &[Inst], num_symbols: usize) -> Option<u64> {
+    if num_symbols == 0 || num_symbols > 64 || instructions.is_empty() {
+        return None;
+    }
+    let mut visited = vec![false; instructions.len()];
+    let mut stack = vec![0usize];
+    let mut mask = 0u64;
+
+    while let Some(pc) = stack.pop() {
+        if visited[pc] {
+            continue;
+        }
+        visited[pc] = true;
+        match instructions[pc] {
+            Inst::MatchLabel { sym } => {
+                mask |= 1u64 << sym;
+            }
+            Inst::Jump(target) => stack.push(target),
+            Inst::Split { first, second } => {
+                stack.push(second);
+                stack.push(first);
+            }
+            Inst::ExcludeEnter | Inst::ExcludeExit => stack.push(pc + 1),
+            // Anchors or immediate Accept can succeed/fail without matching a symbol mask.
+            Inst::AnchorStart | Inst::AnchorEnd | Inst::Accept => return None,
+        }
+    }
+
+    Some(mask)
 }
 
 fn register_symbol(
@@ -271,7 +407,6 @@ impl<'a> Compiler<'a> {
             return Ok(());
         }
 
-        // Unbounded repetition: {min,}
         if min == 0 {
             let entry_split = self.push(Inst::Jump(0))?;
             let body_start = self.instructions.len();
@@ -326,7 +461,6 @@ impl<'a> Compiler<'a> {
     }
 }
 
-/// Generates all permutations of `0..n` in strict lexicographical order.
 fn lexicographic_permutations(n: usize) -> Vec<Vec<usize>> {
     let mut current: Vec<usize> = (0..n).collect();
     let mut result = vec![current.clone()];

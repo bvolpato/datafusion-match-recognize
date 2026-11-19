@@ -565,5 +565,170 @@ async fn test_live_trino_differential_oracle() {
             }
         }
     }
-    eprintln!("Live Trino differential oracle passed all 13 hand cases + {checked} fuzz queries!");
+    // 3. Phase 2 stateful DEFINE & DISTINCT aggregate differential tests vs live Trino 484!
+    let stateful_cases: Vec<(&str, &str)> = vec![
+        (
+            "stateful_v_shape_one_row",
+            r#"
+            WITH ticker(sym, t, price) AS (
+                VALUES
+                    ('ACME', 1, 100), ('ACME', 2, 90), ('ACME', 3, 80),
+                    ('ACME', 4,  85), ('ACME', 5, 95), ('ACME', 6, 95),
+                    ('ACME', 7,  70), ('ACME', 8, 60), ('ACME', 9, 110),
+                    ('BETA', 1,  50), ('BETA', 2, 40), ('BETA', 3, 60), ('BETA', 4, 30), ('BETA', 5, 80)
+            )
+            SELECT * FROM ticker
+            MATCH_RECOGNIZE (
+                PARTITION BY sym
+                ORDER BY t
+                MEASURES
+                    MATCH_NUMBER() AS mn,
+                    FIRST(strt.t) AS start_t,
+                    LAST(down.t) AS bottom_t,
+                    LAST(up.t) AS end_t,
+                    LAST(down.price) AS bottom_price
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (strt down+ up+)
+                DEFINE
+                    down AS down.price < PREV(down.price),
+                    up AS up.price > PREV(up.price)
+            )
+            ORDER BY sym, mn
+            "#,
+        ),
+        (
+            "stateful_v_shape_skip_to_last_up_all_rows",
+            r#"
+            WITH ticker(sym, t, price) AS (
+                VALUES
+                    ('ACME', 1, 100), ('ACME', 2, 80), ('ACME', 3, 95),
+                    ('ACME', 4,  70), ('ACME', 5, 90)
+            )
+            SELECT * FROM ticker
+            MATCH_RECOGNIZE (
+                PARTITION BY sym
+                ORDER BY t
+                MEASURES
+                    MATCH_NUMBER() AS mn,
+                    CLASSIFIER() AS cls,
+                    FIRST(strt.price) AS sp,
+                    LAST(down.price) AS bp
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP TO LAST up
+                PATTERN (strt down+ up+)
+                DEFINE
+                    down AS down.price < PREV(down.price),
+                    up AS up.price > PREV(up.price)
+            )
+            ORDER BY sym, mn, t
+            "#,
+        ),
+        (
+            "stateful_time_window_funnel",
+            r#"
+            WITH timed(u, ts, ev) AS (
+                VALUES
+                    ('u1', 100, 'view'), ('u1', 300, 'scroll'), ('u1', 450, 'buy'),
+                    ('u2', 100, 'view'), ('u2', 700, 'buy'),
+                    ('u3', 100, 'view'), ('u3', 200, 'view'), ('u3', 650, 'buy')
+            )
+            SELECT * FROM timed
+            MATCH_RECOGNIZE (
+                PARTITION BY u
+                ORDER BY ts
+                MEASURES
+                    FIRST(a.ts) AS a_ts,
+                    LAST(b.ts) AS b_ts,
+                    LAST(b.ts) - FIRST(a.ts) AS dt
+                ONE ROW PER MATCH
+                PATTERN (a any_r* b)
+                DEFINE
+                    a AS ev = 'view',
+                    b AS ev = 'buy' AND b.ts - FIRST(a.ts) <= 500
+            )
+            ORDER BY u
+            "#,
+        ),
+        (
+            "stateful_running_avg_and_count_in_define",
+            r#"
+            WITH nums(id, v) AS (
+                VALUES (1, 10), (2, 20), (3, 18), (4, 25), (5, 30), (6, 5)
+            )
+            SELECT * FROM nums
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    MATCH_NUMBER() AS mn,
+                    FIRST(a.id) AS first_a,
+                    LAST(b.id) AS last_b,
+                    COUNT(b.*) AS cnt_b
+                ONE ROW PER MATCH
+                PATTERN (a+ b+)
+                DEFINE
+                    a AS v <= 20,
+                    b AS b.v > AVG(a.v) AND COUNT(b.*) <= 2
+            )
+            ORDER BY mn
+            "#,
+        ),
+    ];
+
+    for (name, sql) in &stateful_cases {
+        assert_matches_trino(&client, &base_url, name, sql).await;
+    }
+
+    // 4. Stateful DEFINE randomized fuzz matrix vs live Trino 484 (16 queries)
+    let stateful_patterns: &[(&str, &str)] = &[
+        ("s d+ u+", "d AS d.v < PREV(d.v), u AS u.v > PREV(u.v)"),
+        (
+            "a b+",
+            "a AS v <= 5, b AS b.v > FIRST(a.v) AND COUNT(b.*) <= 2",
+        ),
+        (
+            "a b* c",
+            "a AS v >= 2, b AS b.v >= PREV(b.v), c AS c.v < PREV(c.v)",
+        ),
+        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)"),
+    ];
+    let mut stateful_checked = 0usize;
+    for (pi, (pat, defines)) in stateful_patterns.iter().enumerate() {
+        for (si, skip) in skips.iter().enumerate() {
+            for (mi, (mode, order_clause)) in modes[..2].iter().enumerate() {
+                let sql = format!(
+                    r#"
+                    {base_cte}
+                    SELECT * FROM t
+                    MATCH_RECOGNIZE (
+                        PARTITION BY p
+                        ORDER BY id
+                        MEASURES
+                            MATCH_NUMBER() AS mn,
+                            CLASSIFIER() AS cls,
+                            FIRST(v) AS fv,
+                            LAST(v) AS lv,
+                            COUNT(*) AS cnt,
+                            SUM(v) AS sv
+                        {mode}
+                        {skip}
+                        PATTERN ({pat})
+                        DEFINE {defines}
+                    )
+                    {order_clause}
+                    "#
+                );
+                let name = format!("stateful_fuzz_p{pi}_s{si}_m{mi}");
+                assert_matches_trino(&client, &base_url, &name, &sql).await;
+                stateful_checked += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "Live Trino differential oracle passed all 13 stateless + {} stateful hand cases + {} stateless fuzz + {} stateful fuzz queries!",
+        stateful_cases.len(),
+        checked,
+        stateful_checked
+    );
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Physical execution plan (`MatchRecognizeExec`), [`ExtensionPlanner`], and [`QueryPlanner`]
-//! for `MATCH_RECOGNIZE`.
+//! for `MATCH_RECOGNIZE`, supporting Tier 1 stateless bitmask matching, Tier 2 hybrid stateful
+//! `DEFINE` evaluation, `SUBSET` union variables, and `DISTINCT` measure aggregates.
 
 use std::collections::HashMap;
 use std::fmt::{self, Formatter};
@@ -37,20 +38,36 @@ use datafusion_physical_expr::{
 };
 use futures::stream::Stream;
 
-use crate::ast::{AfterMatchSkip, MatchRecognizeConfig, MeasureSlotKind, Pattern, RowsPerMatch};
+use crate::ast::{
+    AfterMatchSkip, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, Pattern, RowsPerMatch,
+    SubsetDef, SymbolDefKind,
+};
 use crate::logical::{MatchRecognizeNode, slot_data_type_and_nullability};
 use crate::matcher::{Matcher, PartitionSymbols};
 use crate::measures::{
-    PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind, build_partition_output_batch,
-    build_physical_slot_schema,
+    PartitionStatefulEvaluator, PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind,
+    StatefulDefineInput, build_partition_output_batch, build_physical_slot_schema,
 };
 use crate::pattern::Program;
 
 /// Physical representation of a `DEFINE <name> AS <predicate>` entry.
 #[derive(Debug, Clone)]
+pub enum PhysicalSymbolDefKind {
+    /// Tier 1 vectorized row-local predicate.
+    Stateless { predicate: Arc<dyn PhysicalExpr> },
+    /// Tier 2 match-state predicate evaluated lazily on candidate transitions.
+    Stateful {
+        outer_expr: Arc<dyn PhysicalExpr>,
+        slot_schema: SchemaRef,
+        slots: Vec<PhysicalMeasureSlot>,
+    },
+}
+
+/// Physical `DEFINE` symbol entry.
+#[derive(Debug, Clone)]
 pub struct PhysicalSymbolDef {
     pub name: String,
-    pub predicate: Arc<dyn PhysicalExpr>,
+    pub kind: PhysicalSymbolDefKind,
 }
 
 /// Physical representation of an `ORDER BY` item.
@@ -114,6 +131,82 @@ impl QueryPlanner for MatchRecognizeQueryPlanner {
 #[derive(Debug, Default)]
 pub struct MatchRecognizeExtensionPlanner;
 
+fn compile_physical_slots(
+    slots: &[MeasureSlot],
+    input_dfschema: &DFSchema,
+    program: &Program,
+    rows_per_match: RowsPerMatch,
+    session_state: &dyn Session,
+    planning_ctx: &PhysicalPlanningContext,
+) -> Result<Vec<PhysicalMeasureSlot>> {
+    let exec_props = session_state.execution_props();
+    let mut phys_slots = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let (data_type, nullable) =
+            slot_data_type_and_nullability(input_dfschema, slot, rows_per_match)?;
+        let kind = match &slot.kind {
+            MeasureSlotKind::MatchNumber => PhysicalMeasureSlotKind::MatchNumber,
+            MeasureSlotKind::Classifier { symbol } => PhysicalMeasureSlotKind::Classifier {
+                symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
+                symbol: symbol.clone(),
+            },
+            MeasureSlotKind::Nav {
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+                symbol,
+                inner_expr,
+            } => {
+                let phys_inner =
+                    create_physical_expr(inner_expr, input_dfschema, exec_props, planning_ctx)?;
+                PhysicalMeasureSlotKind::Nav {
+                    logical_nav: *logical_nav,
+                    logical_offset: *logical_offset,
+                    physical_nav: *physical_nav,
+                    physical_offset: *physical_offset,
+                    symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
+                    symbol: symbol.clone(),
+                    inner_expr: phys_inner,
+                }
+            }
+            MeasureSlotKind::Agg {
+                agg_kind,
+                symbol,
+                inner_expr,
+                distinct,
+            } => {
+                let phys_inner = inner_expr
+                    .as_ref()
+                    .map(|e| create_physical_expr(e, input_dfschema, exec_props, planning_ctx))
+                    .transpose()?;
+                PhysicalMeasureSlotKind::Agg {
+                    agg_kind: *agg_kind,
+                    symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
+                    symbol: symbol.clone(),
+                    inner_expr: phys_inner,
+                    distinct: *distinct,
+                }
+            }
+            MeasureSlotKind::CurrentRow { inner_expr } => {
+                let phys_inner =
+                    create_physical_expr(inner_expr, input_dfschema, exec_props, planning_ctx)?;
+                PhysicalMeasureSlotKind::CurrentRow {
+                    inner_expr: phys_inner,
+                }
+            }
+        };
+        phys_slots.push(PhysicalMeasureSlot {
+            slot_name: slot.slot_name.clone(),
+            semantics: slot.semantics,
+            data_type,
+            nullable,
+            kind,
+        });
+    }
+    Ok(phys_slots)
+}
+
 #[async_trait]
 impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
     async fn plan_extension(
@@ -157,97 +250,61 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
             })
             .collect::<Result<_>>()?;
 
-        let definitions: Vec<PhysicalSymbolDef> = mr_node
-            .definitions
-            .iter()
-            .map(|d| {
-                let predicate =
-                    create_physical_expr(&d.predicate, input_dfschema, exec_props, planning_ctx)?;
-                Ok(PhysicalSymbolDef {
-                    name: d.name.clone(),
-                    predicate,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let declared_names: Vec<String> =
+            mr_node.definitions.iter().map(|d| d.name.clone()).collect();
+        let program = Program::compile_with_subsets(
+            &mr_node.pattern,
+            &declared_names,
+            &mr_node.subsets,
+            mr_node.config,
+        )?;
 
-        let declared_names: Vec<String> = definitions.iter().map(|d| d.name.clone()).collect();
-        let program = Program::compile(&mr_node.pattern, &declared_names, mr_node.config)?;
+        let mut definitions = Vec::with_capacity(mr_node.definitions.len());
+        for d in &mr_node.definitions {
+            let kind = match &d.kind {
+                SymbolDefKind::Stateless { predicate } => {
+                    let phys_pred =
+                        create_physical_expr(predicate, input_dfschema, exec_props, planning_ctx)?;
+                    PhysicalSymbolDefKind::Stateless {
+                        predicate: phys_pred,
+                    }
+                }
+                SymbolDefKind::Stateful { outer_expr, slots } => {
+                    let phys_slots = compile_physical_slots(
+                        slots,
+                        input_dfschema,
+                        &program,
+                        RowsPerMatch::OneRow,
+                        session_state,
+                        planning_ctx,
+                    )?;
+                    let slot_schema = build_physical_slot_schema(&phys_slots);
+                    let slot_dfschema = DFSchema::try_from(slot_schema.as_ref().clone())?;
+                    let phys_outer =
+                        create_physical_expr(outer_expr, &slot_dfschema, exec_props, planning_ctx)?;
+                    PhysicalSymbolDefKind::Stateful {
+                        outer_expr: phys_outer,
+                        slot_schema,
+                        slots: phys_slots,
+                    }
+                }
+            };
+            definitions.push(PhysicalSymbolDef {
+                name: d.name.clone(),
+                kind,
+            });
+        }
 
         let mut physical_measures = Vec::with_capacity(mr_node.measures.len());
         for m in &mr_node.measures {
-            let mut phys_slots = Vec::with_capacity(m.slots.len());
-            for slot in &m.slots {
-                let (data_type, nullable) =
-                    slot_data_type_and_nullability(input_dfschema, slot, mr_node.rows_per_match)?;
-                let kind = match &slot.kind {
-                    MeasureSlotKind::MatchNumber => PhysicalMeasureSlotKind::MatchNumber,
-                    MeasureSlotKind::Classifier { symbol } => PhysicalMeasureSlotKind::Classifier {
-                        symbol_id: symbol.as_ref().and_then(|s| program.symbol_id(s)),
-                        symbol: symbol.clone(),
-                    },
-                    MeasureSlotKind::Nav {
-                        logical_nav,
-                        logical_offset,
-                        physical_nav,
-                        physical_offset,
-                        symbol,
-                        inner_expr,
-                    } => {
-                        let phys_inner = create_physical_expr(
-                            inner_expr,
-                            input_dfschema,
-                            exec_props,
-                            planning_ctx,
-                        )?;
-                        PhysicalMeasureSlotKind::Nav {
-                            logical_nav: *logical_nav,
-                            logical_offset: *logical_offset,
-                            physical_nav: *physical_nav,
-                            physical_offset: *physical_offset,
-                            symbol_id: symbol.as_ref().and_then(|s| program.symbol_id(s)),
-                            symbol: symbol.clone(),
-                            inner_expr: phys_inner,
-                        }
-                    }
-                    MeasureSlotKind::Agg {
-                        agg_kind,
-                        symbol,
-                        inner_expr,
-                    } => {
-                        let phys_inner = inner_expr
-                            .as_ref()
-                            .map(|e| {
-                                create_physical_expr(e, input_dfschema, exec_props, planning_ctx)
-                            })
-                            .transpose()?;
-                        PhysicalMeasureSlotKind::Agg {
-                            agg_kind: *agg_kind,
-                            symbol_id: symbol.as_ref().and_then(|s| program.symbol_id(s)),
-                            symbol: symbol.clone(),
-                            inner_expr: phys_inner,
-                        }
-                    }
-                    MeasureSlotKind::CurrentRow { inner_expr } => {
-                        let phys_inner = create_physical_expr(
-                            inner_expr,
-                            input_dfschema,
-                            exec_props,
-                            planning_ctx,
-                        )?;
-                        PhysicalMeasureSlotKind::CurrentRow {
-                            inner_expr: phys_inner,
-                        }
-                    }
-                };
-                phys_slots.push(PhysicalMeasureSlot {
-                    slot_name: slot.slot_name.clone(),
-                    semantics: slot.semantics,
-                    data_type,
-                    nullable,
-                    kind,
-                });
-            }
-
+            let phys_slots = compile_physical_slots(
+                &m.slots,
+                input_dfschema,
+                &program,
+                mr_node.rows_per_match,
+                session_state,
+                planning_ctx,
+            )?;
             let slot_schema = build_physical_slot_schema(&phys_slots);
             let slot_dfschema = DFSchema::try_from(slot_schema.as_ref().clone())?;
             let outer_expr =
@@ -263,7 +320,7 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
 
         let output_schema = Arc::clone(mr_node.schema.inner());
 
-        let exec = MatchRecognizeExec::try_new(
+        let exec = MatchRecognizeExec::try_new_with_subsets(
             input_exec,
             partition_by,
             order_by,
@@ -271,6 +328,7 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
             mr_node.rows_per_match,
             mr_node.after_match_skip.clone(),
             mr_node.pattern.clone(),
+            mr_node.subsets.clone(),
             definitions,
             mr_node.config,
             output_schema,
@@ -280,10 +338,6 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
 }
 
 /// Physical [`ExecutionPlan`] executing SQL:2016 `MATCH_RECOGNIZE`.
-///
-/// Relies on DataFusion's `EnforceDistribution` and `EnforceSorting` to co-partition and sort
-/// the input by `[PARTITION BY..., ORDER BY...]`, then streams one partition at a time with
-/// `MemoryReservation`-tracked buffering.
 #[derive(Debug, Clone)]
 pub struct MatchRecognizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -294,6 +348,7 @@ pub struct MatchRecognizeExec {
     rows_per_match: RowsPerMatch,
     after_match_skip: AfterMatchSkip,
     pattern: Pattern,
+    subsets: Vec<SubsetDef>,
     definitions: Vec<PhysicalSymbolDef>,
     config: MatchRecognizeConfig,
     program: Arc<Program>,
@@ -303,7 +358,7 @@ pub struct MatchRecognizeExec {
 }
 
 impl MatchRecognizeExec {
-    /// Creates a new `MatchRecognizeExec`.
+    /// Creates a new `MatchRecognizeExec` (without `SUBSET` union variables).
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
@@ -317,8 +372,43 @@ impl MatchRecognizeExec {
         config: MatchRecognizeConfig,
         output_schema: SchemaRef,
     ) -> Result<Self> {
+        Self::try_new_with_subsets(
+            input,
+            partition_by,
+            order_by,
+            measures,
+            rows_per_match,
+            after_match_skip,
+            pattern,
+            vec![],
+            definitions,
+            config,
+            output_schema,
+        )
+    }
+
+    /// Creates a new `MatchRecognizeExec` with optional `SUBSET` union variables.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_subsets(
+        input: Arc<dyn ExecutionPlan>,
+        partition_by: Vec<Arc<dyn PhysicalExpr>>,
+        order_by: Vec<PhysicalOrderBySpec>,
+        measures: Vec<PhysicalMeasure>,
+        rows_per_match: RowsPerMatch,
+        after_match_skip: AfterMatchSkip,
+        pattern: Pattern,
+        subsets: Vec<SubsetDef>,
+        definitions: Vec<PhysicalSymbolDef>,
+        config: MatchRecognizeConfig,
+        output_schema: SchemaRef,
+    ) -> Result<Self> {
         let declared_names: Vec<String> = definitions.iter().map(|d| d.name.clone()).collect();
-        let program = Arc::new(Program::compile(&pattern, &declared_names, config)?);
+        let program = Arc::new(Program::compile_with_subsets(
+            &pattern,
+            &declared_names,
+            &subsets,
+            config,
+        )?);
 
         let partition_by_input_indices: Vec<Option<usize>> = partition_by
             .iter()
@@ -343,6 +433,7 @@ impl MatchRecognizeExec {
             rows_per_match,
             after_match_skip,
             pattern,
+            subsets,
             definitions,
             config,
             program,
@@ -380,6 +471,10 @@ impl MatchRecognizeExec {
         &self.pattern
     }
 
+    pub fn subsets(&self) -> &[SubsetDef] {
+        &self.subsets
+    }
+
     pub fn definitions(&self) -> &[PhysicalSymbolDef] {
         &self.definitions
     }
@@ -401,6 +496,36 @@ impl DisplayAs for MatchRecognizeExec {
             self.pattern, self.rows_per_match, self.after_match_skip
         )
     }
+}
+
+fn apply_slot_exprs(
+    slots: &[PhysicalMeasureSlot],
+    f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+) -> Result<TreeNodeRecursion> {
+    for slot in slots {
+        match &slot.kind {
+            PhysicalMeasureSlotKind::Nav { inner_expr, .. }
+            | PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+                if f(inner_expr)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            PhysicalMeasureSlotKind::Agg {
+                inner_expr: Some(e),
+                ..
+            } => {
+                if f(e)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            PhysicalMeasureSlotKind::MatchNumber
+            | PhysicalMeasureSlotKind::Classifier { .. }
+            | PhysicalMeasureSlotKind::Agg {
+                inner_expr: None, ..
+            } => {}
+        }
+    }
+    Ok(TreeNodeRecursion::Continue)
 }
 
 impl ExecutionPlan for MatchRecognizeExec {
@@ -431,33 +556,22 @@ impl ExecutionPlan for MatchRecognizeExec {
             }
         }
         for def in &self.definitions {
-            if f(&def.predicate)? == TreeNodeRecursion::Stop {
-                return Ok(TreeNodeRecursion::Stop);
+            match &def.kind {
+                PhysicalSymbolDefKind::Stateless { predicate } => {
+                    if f(predicate)? == TreeNodeRecursion::Stop {
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                PhysicalSymbolDefKind::Stateful { slots, .. } => {
+                    if apply_slot_exprs(slots, f)? == TreeNodeRecursion::Stop {
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
             }
         }
         for m in &self.measures {
-            for slot in &m.slots {
-                match &slot.kind {
-                    PhysicalMeasureSlotKind::Nav { inner_expr, .. }
-                    | PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
-                        if f(inner_expr)? == TreeNodeRecursion::Stop {
-                            return Ok(TreeNodeRecursion::Stop);
-                        }
-                    }
-                    PhysicalMeasureSlotKind::Agg {
-                        inner_expr: Some(e),
-                        ..
-                    } => {
-                        if f(e)? == TreeNodeRecursion::Stop {
-                            return Ok(TreeNodeRecursion::Stop);
-                        }
-                    }
-                    PhysicalMeasureSlotKind::MatchNumber
-                    | PhysicalMeasureSlotKind::Classifier { .. }
-                    | PhysicalMeasureSlotKind::Agg {
-                        inner_expr: None, ..
-                    } => {}
-                }
+            if apply_slot_exprs(&m.slots, f)? == TreeNodeRecursion::Stop {
+                return Ok(TreeNodeRecursion::Stop);
             }
         }
         Ok(TreeNodeRecursion::Continue)
@@ -508,7 +622,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             return internal_err!("MatchRecognizeExec expects 1 child, got {}", children.len());
         }
         let child = children.swap_remove(0);
-        Ok(Arc::new(Self::try_new(
+        Ok(Arc::new(Self::try_new_with_subsets(
             child,
             self.partition_by.clone(),
             self.order_by.clone(),
@@ -516,6 +630,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             self.rows_per_match,
             self.after_match_skip.clone(),
             self.pattern.clone(),
+            self.subsets.clone(),
             self.definitions.clone(),
             self.config,
             Arc::clone(&self.output_schema),
@@ -545,7 +660,6 @@ impl ExecutionPlan for MatchRecognizeExec {
         let order_by_input_indices: Vec<Option<usize>> =
             self.order_by.iter().map(|o| o.input_col_idx).collect();
 
-        // Precompute RowConverter for partition boundary detection when PARTITION BY is non-empty.
         let input_schema = self.input.schema();
         let row_converter = if self.partition_by.is_empty() {
             None
@@ -570,6 +684,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             after_match_skip: self.after_match_skip.clone(),
             definitions: self.definitions.clone(),
             program: Arc::clone(&self.program),
+            max_active_threads: self.config.max_active_threads as usize,
             row_converter,
             current_partition_key: None,
             buffered_batches: Vec::new(),
@@ -597,6 +712,7 @@ struct MatchRecognizeStream {
     after_match_skip: AfterMatchSkip,
     definitions: Vec<PhysicalSymbolDef>,
     program: Arc<Program>,
+    max_active_threads: usize,
     row_converter: Option<RowConverter>,
     current_partition_key: Option<Vec<u8>>,
     buffered_batches: Vec<RecordBatch>,
@@ -679,16 +795,51 @@ impl MatchRecognizeStream {
             compute::concat_batches(&self.input_schema, &batches)?
         };
 
-        // Account for concatenated partition batch memory while processing, then release on drop.
         let work_mem = partition_batch.get_array_memory_size();
         self.reservation.try_resize(work_mem)?;
 
-        let symbols = evaluate_define_symbols(&partition_batch, &self.program, &self.definitions)?;
+        let symbols =
+            evaluate_stateless_symbols(&partition_batch, &self.program, &self.definitions)?;
         self.reservation.try_grow(symbols.memory_bytes())?;
 
-        let mut matcher = Matcher::new(&self.program);
-        let (events, _stats) =
-            matcher.match_partition(&symbols, &self.after_match_skip, self.rows_per_match)?;
+        // Collect Tier 2 stateful symbol definitions (if any).
+        let stateful_defs: Vec<StatefulDefineInput<'_>> = self
+            .definitions
+            .iter()
+            .filter_map(|d| match &d.kind {
+                PhysicalSymbolDefKind::Stateless { .. } => None,
+                PhysicalSymbolDefKind::Stateful {
+                    outer_expr,
+                    slot_schema,
+                    slots,
+                } => self
+                    .program
+                    .symbol_id(&d.name)
+                    .map(|sym_id| StatefulDefineInput {
+                        sym_id,
+                        outer_expr,
+                        slot_schema,
+                        slots: slots.as_slice(),
+                    }),
+            })
+            .collect();
+
+        let mut matcher = Matcher::with_max_active_threads(&self.program, self.max_active_threads);
+        let (events, _stats) = if stateful_defs.is_empty() {
+            matcher.match_partition(&symbols, &self.after_match_skip, self.rows_per_match)?
+        } else {
+            let mut stateful_eval = PartitionStatefulEvaluator::try_new(
+                &partition_batch,
+                &self.program,
+                &stateful_defs,
+            )?;
+            matcher.match_partition_with_evaluator(
+                &symbols,
+                &self.after_match_skip,
+                self.rows_per_match,
+                &mut stateful_eval,
+            )?
+        };
 
         if let Some(out_batch) = build_partition_output_batch(
             &partition_batch,
@@ -710,40 +861,49 @@ impl MatchRecognizeStream {
     }
 }
 
-/// Evaluates all `DEFINE` predicates in vectorized Arrow into a compact [`PartitionSymbols`].
-fn evaluate_define_symbols(
+/// Evaluates all Tier 1 stateless `DEFINE` predicates in vectorized Arrow into [`PartitionSymbols`].
+///
+/// Stateful symbols receive placeholder `false` bits (they are evaluated lazily via
+/// [`PartitionStatefulEvaluator`] during NFA transitions); symbols omitted from `DEFINE` default
+/// to `true` per SQL:2016.
+fn evaluate_stateless_symbols(
     partition_batch: &RecordBatch,
     program: &Program,
     definitions: &[PhysicalSymbolDef],
 ) -> Result<PartitionSymbols> {
     let num_rows = partition_batch.num_rows();
     let num_symbols = program.num_symbols();
-    let def_map: HashMap<&str, &Arc<dyn PhysicalExpr>> = definitions
+    let def_map: HashMap<&str, &PhysicalSymbolDefKind> = definitions
         .iter()
-        .map(|d| (d.name.as_str(), &d.predicate))
+        .map(|d| (d.name.as_str(), &d.kind))
         .collect();
 
     let mut columns: Vec<Vec<bool>> = Vec::with_capacity(num_symbols);
     for sym_name in &program.id_to_symbol {
-        if let Some(pred) = def_map.get(sym_name.as_str()) {
-            let evaluated = pred.evaluate(partition_batch)?.into_array(num_rows)?;
-            let bool_arr = evaluated
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "DEFINE predicate for '{sym_name}' must evaluate to Boolean, got {}",
-                        evaluated.data_type()
-                    ))
-                })?;
-            let mut flags = Vec::with_capacity(num_rows);
-            for i in 0..num_rows {
-                flags.push(bool_arr.is_valid(i) && bool_arr.value(i));
+        match def_map.get(sym_name.as_str()) {
+            Some(PhysicalSymbolDefKind::Stateless { predicate }) => {
+                let evaluated = predicate.evaluate(partition_batch)?.into_array(num_rows)?;
+                let bool_arr = evaluated
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "DEFINE predicate for '{sym_name}' must evaluate to Boolean, got {}",
+                            evaluated.data_type()
+                        ))
+                    })?;
+                let mut flags = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    flags.push(bool_arr.is_valid(i) && bool_arr.value(i));
+                }
+                columns.push(flags);
             }
-            columns.push(flags);
-        } else {
-            // SQL:2016: pattern variable omitted from DEFINE defaults to TRUE.
-            columns.push(vec![true; num_rows]);
+            Some(PhysicalSymbolDefKind::Stateful { .. }) => {
+                columns.push(vec![false; num_rows]);
+            }
+            None => {
+                columns.push(vec![true; num_rows]);
+            }
         }
     }
 
@@ -801,7 +961,7 @@ impl RecordBatchStream for MatchRecognizeStream {
     }
 }
 
-/// Helper to build a DataFusion `Expr` column list check (used by tests and proto).
+/// Helper to check whether a partition expression is a direct column reference.
 pub fn partition_expr_is_column(expr: &Expr) -> bool {
     matches!(expr, Expr::Column(_))
 }

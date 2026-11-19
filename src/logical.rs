@@ -17,7 +17,7 @@ use datafusion_expr::{Expr, ExprSchemable, UserDefinedLogicalNodeCore};
 
 use crate::ast::{
     AfterMatchSkip, AggKind, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, MeasureSpec,
-    OrderBySpec, Pattern, RowsPerMatch, SymbolDef,
+    OrderBySpec, Pattern, RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind,
 };
 
 /// Logical plan node representing a SQL `MATCH_RECOGNIZE` relation.
@@ -30,6 +30,7 @@ pub struct MatchRecognizeNode {
     pub rows_per_match: RowsPerMatch,
     pub after_match_skip: AfterMatchSkip,
     pub pattern: Pattern,
+    pub subsets: Vec<SubsetDef>,
     pub definitions: Vec<SymbolDef>,
     pub config: MatchRecognizeConfig,
     pub schema: DFSchemaRef,
@@ -44,7 +45,7 @@ impl PartialOrd for MatchRecognizeNode {
 }
 
 impl MatchRecognizeNode {
-    /// Constructs a new `MatchRecognizeNode` and computes its SQL:2016 output schema.
+    /// Constructs a new `MatchRecognizeNode` (without `SUBSET` union variables).
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         input: LogicalPlan,
@@ -57,8 +58,36 @@ impl MatchRecognizeNode {
         definitions: Vec<SymbolDef>,
         config: MatchRecognizeConfig,
     ) -> Result<Self> {
-        // Coerce each measure's outer_expr against its synthetic slot schema so mixed types
-        // (e.g., SUM(int32)->Int64 + FIRST(int32)->Int32) coerce cleanly just like standard SQL.
+        Self::try_new_with_subsets(
+            input,
+            partition_by,
+            order_by,
+            measures,
+            rows_per_match,
+            after_match_skip,
+            pattern,
+            vec![],
+            definitions,
+            config,
+        )
+    }
+
+    /// Constructs a new `MatchRecognizeNode` with optional `SUBSET` union variables and computes
+    /// its SQL:2016 output schema.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_subsets(
+        input: LogicalPlan,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderBySpec>,
+        measures: Vec<MeasureSpec>,
+        rows_per_match: RowsPerMatch,
+        after_match_skip: AfterMatchSkip,
+        pattern: Pattern,
+        subsets: Vec<SubsetDef>,
+        definitions: Vec<SymbolDef>,
+        config: MatchRecognizeConfig,
+    ) -> Result<Self> {
+        // Coerce each measure's outer_expr against its synthetic slot schema.
         let mut coerced_measures = Vec::with_capacity(measures.len());
         for m in measures {
             let slot_schema = build_slot_schema(input.schema(), &m.slots, rows_per_match)?;
@@ -70,6 +99,26 @@ impl MatchRecognizeNode {
                 slots: m.slots,
             });
         }
+
+        // Coerce each stateful DEFINE predicate's outer_expr against its synthetic slot schema.
+        let mut coerced_defs = Vec::with_capacity(definitions.len());
+        for def in definitions {
+            let kind = match def.kind {
+                SymbolDefKind::Stateless { predicate } => SymbolDefKind::Stateless { predicate },
+                SymbolDefKind::Stateful { outer_expr, slots } => {
+                    let slot_schema =
+                        build_slot_schema(input.schema(), &slots, RowsPerMatch::OneRow)?;
+                    let mut rewriter = TypeCoercionRewriter::new(&slot_schema);
+                    let outer_expr = outer_expr.rewrite(&mut rewriter)?.data;
+                    SymbolDefKind::Stateful { outer_expr, slots }
+                }
+            };
+            coerced_defs.push(SymbolDef {
+                name: def.name,
+                kind,
+            });
+        }
+
         let schema = compute_output_schema(
             input.schema(),
             &partition_by,
@@ -85,7 +134,8 @@ impl MatchRecognizeNode {
             rows_per_match,
             after_match_skip,
             pattern,
-            definitions,
+            subsets,
+            definitions: coerced_defs,
             config,
             schema,
         })
@@ -99,7 +149,7 @@ impl MatchRecognizeNode {
     }
 }
 
-/// Computes the synthetic `DFSchema` for a measure's extracted leaf slots.
+/// Computes the synthetic `DFSchema` for a measure or stateful define's extracted leaf slots.
 pub fn build_slot_schema(
     input_schema: &DFSchema,
     slots: &[MeasureSlot],
@@ -141,7 +191,7 @@ pub fn slot_data_type_and_nullability(
             }
             AggKind::Sum => {
                 let expr = inner_expr.as_ref().ok_or_else(|| {
-                    plan_datafusion_err!("SUM in MEASURES requires an input expression")
+                    plan_datafusion_err!("SUM in MEASURES/DEFINE requires an input expression")
                 })?;
                 let inner_dt = expr.get_type(input_schema)?;
                 Ok((sum_result_type(&inner_dt)?, true))
@@ -149,7 +199,7 @@ pub fn slot_data_type_and_nullability(
             AggKind::Avg => Ok((DataType::Float64, true)),
             AggKind::Min | AggKind::Max => {
                 let expr = inner_expr.as_ref().ok_or_else(|| {
-                    plan_datafusion_err!("MIN/MAX in MEASURES requires an input expression")
+                    plan_datafusion_err!("MIN/MAX in MEASURES/DEFINE requires an input expression")
                 })?;
                 let inner_dt = expr.get_type(input_schema)?;
                 Ok((inner_dt, true))
@@ -236,8 +286,83 @@ fn sum_result_type(dt: &DataType) -> Result<DataType> {
         }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(DataType::Float64),
         DataType::Decimal128(p, s) => Ok(DataType::Decimal128((*p + 10).min(38), *s)),
-        other => plan_err!("SUM in MATCH_RECOGNIZE MEASURES does not support type {other}"),
+        other => plan_err!("SUM in MATCH_RECOGNIZE does not support type {other}"),
     }
+}
+
+fn push_slot_exprs(slots: &[MeasureSlot], exprs: &mut Vec<Expr>) {
+    for slot in slots {
+        match &slot.kind {
+            MeasureSlotKind::Nav { inner_expr, .. }
+            | MeasureSlotKind::CurrentRow { inner_expr } => {
+                exprs.push(inner_expr.clone());
+            }
+            MeasureSlotKind::Agg {
+                inner_expr: Some(e),
+                ..
+            } => {
+                exprs.push(e.clone());
+            }
+            MeasureSlotKind::MatchNumber
+            | MeasureSlotKind::Classifier { .. }
+            | MeasureSlotKind::Agg {
+                inner_expr: None, ..
+            } => {}
+        }
+    }
+}
+
+fn rebuild_slots_from_iter(
+    orig_slots: &[MeasureSlot],
+    iter: &mut impl Iterator<Item = Expr>,
+) -> Result<Vec<MeasureSlot>> {
+    let mut new_slots = Vec::with_capacity(orig_slots.len());
+    for slot in orig_slots {
+        let kind = match &slot.kind {
+            MeasureSlotKind::Nav {
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+                symbol,
+                ..
+            } => MeasureSlotKind::Nav {
+                logical_nav: *logical_nav,
+                logical_offset: *logical_offset,
+                physical_nav: *physical_nav,
+                physical_offset: *physical_offset,
+                symbol: symbol.clone(),
+                inner_expr: iter.next().ok_or_else(|| {
+                    plan_datafusion_err!("MatchRecognize: missing nav slot expression")
+                })?,
+            },
+            MeasureSlotKind::CurrentRow { .. } => MeasureSlotKind::CurrentRow {
+                inner_expr: iter.next().ok_or_else(|| {
+                    plan_datafusion_err!("MatchRecognize: missing current_row slot expression")
+                })?,
+            },
+            MeasureSlotKind::Agg {
+                agg_kind,
+                symbol,
+                inner_expr: Some(_),
+                distinct,
+            } => MeasureSlotKind::Agg {
+                agg_kind: *agg_kind,
+                symbol: symbol.clone(),
+                inner_expr: Some(iter.next().ok_or_else(|| {
+                    plan_datafusion_err!("MatchRecognize: missing agg slot expression")
+                })?),
+                distinct: *distinct,
+            },
+            other => other.clone(),
+        };
+        new_slots.push(MeasureSlot {
+            slot_name: slot.slot_name.clone(),
+            semantics: slot.semantics,
+            kind,
+        });
+    }
+    Ok(new_slots)
 }
 
 impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
@@ -257,27 +382,14 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         let mut exprs = Vec::new();
         exprs.extend(self.partition_by.iter().cloned());
         exprs.extend(self.order_by.iter().map(|o| o.expr.clone()));
-        exprs.extend(self.definitions.iter().map(|d| d.predicate.clone()));
-        for m in &self.measures {
-            for slot in &m.slots {
-                match &slot.kind {
-                    MeasureSlotKind::Nav { inner_expr, .. }
-                    | MeasureSlotKind::CurrentRow { inner_expr } => {
-                        exprs.push(inner_expr.clone());
-                    }
-                    MeasureSlotKind::Agg {
-                        inner_expr: Some(e),
-                        ..
-                    } => {
-                        exprs.push(e.clone());
-                    }
-                    MeasureSlotKind::MatchNumber
-                    | MeasureSlotKind::Classifier { .. }
-                    | MeasureSlotKind::Agg {
-                        inner_expr: None, ..
-                    } => {}
-                }
+        for def in &self.definitions {
+            match &def.kind {
+                SymbolDefKind::Stateless { predicate } => exprs.push(predicate.clone()),
+                SymbolDefKind::Stateful { slots, .. } => push_slot_exprs(slots, &mut exprs),
             }
+        }
+        for m in &self.measures {
+            push_slot_exprs(&m.slots, &mut exprs);
         }
         exprs
     }
@@ -305,6 +417,16 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
                     write!(f, ", ")?;
                 }
                 write!(f, "{} {}", o.expr, if o.asc { "ASC" } else { "DESC" })?;
+            }
+            write!(f, "]")?;
+        }
+        if !self.subsets.is_empty() {
+            write!(f, ", subsets=[")?;
+            for (i, s) in self.subsets.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}=({})", s.name, s.members.join(", "))?;
             }
             write!(f, "]")?;
         }
@@ -356,63 +478,30 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
 
         let mut definitions = Vec::with_capacity(self.definitions.len());
         for orig in &self.definitions {
-            let predicate = iter
-                .next()
-                .ok_or_else(|| plan_datafusion_err!("MatchRecognize: missing define expression"))?;
+            let kind = match &orig.kind {
+                SymbolDefKind::Stateless { .. } => {
+                    let predicate = iter.next().ok_or_else(|| {
+                        plan_datafusion_err!("MatchRecognize: missing stateless define expression")
+                    })?;
+                    SymbolDefKind::Stateless { predicate }
+                }
+                SymbolDefKind::Stateful { outer_expr, slots } => {
+                    let new_slots = rebuild_slots_from_iter(slots, &mut iter)?;
+                    SymbolDefKind::Stateful {
+                        outer_expr: outer_expr.clone(),
+                        slots: new_slots,
+                    }
+                }
+            };
             definitions.push(SymbolDef {
                 name: orig.name.clone(),
-                predicate,
+                kind,
             });
         }
 
         let mut measures = Vec::with_capacity(self.measures.len());
         for orig in &self.measures {
-            let mut new_slots = Vec::with_capacity(orig.slots.len());
-            for slot in &orig.slots {
-                let kind = match &slot.kind {
-                    MeasureSlotKind::Nav {
-                        logical_nav,
-                        logical_offset,
-                        physical_nav,
-                        physical_offset,
-                        symbol,
-                        ..
-                    } => MeasureSlotKind::Nav {
-                        logical_nav: *logical_nav,
-                        logical_offset: *logical_offset,
-                        physical_nav: *physical_nav,
-                        physical_offset: *physical_offset,
-                        symbol: symbol.clone(),
-                        inner_expr: iter.next().ok_or_else(|| {
-                            plan_datafusion_err!("MatchRecognize: missing measure nav expression")
-                        })?,
-                    },
-                    MeasureSlotKind::CurrentRow { .. } => MeasureSlotKind::CurrentRow {
-                        inner_expr: iter.next().ok_or_else(|| {
-                            plan_datafusion_err!(
-                                "MatchRecognize: missing measure current_row expression"
-                            )
-                        })?,
-                    },
-                    MeasureSlotKind::Agg {
-                        agg_kind,
-                        symbol,
-                        inner_expr: Some(_),
-                    } => MeasureSlotKind::Agg {
-                        agg_kind: *agg_kind,
-                        symbol: symbol.clone(),
-                        inner_expr: Some(iter.next().ok_or_else(|| {
-                            plan_datafusion_err!("MatchRecognize: missing measure agg expression")
-                        })?),
-                    },
-                    other => other.clone(),
-                };
-                new_slots.push(MeasureSlot {
-                    slot_name: slot.slot_name.clone(),
-                    semantics: slot.semantics,
-                    kind,
-                });
-            }
+            let new_slots = rebuild_slots_from_iter(&orig.slots, &mut iter)?;
             measures.push(MeasureSpec {
                 alias: orig.alias.clone(),
                 outer_expr: orig.outer_expr.clone(),
@@ -424,7 +513,7 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             return plan_err!("MatchRecognize: unexpected extra expressions");
         }
 
-        Self::try_new(
+        Self::try_new_with_subsets(
             input,
             partition_by,
             order_by,
@@ -432,21 +521,19 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             self.rows_per_match,
             self.after_match_skip.clone(),
             self.pattern.clone(),
+            self.subsets.clone(),
             definitions,
             self.config,
         )
     }
 
     fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
-        // Only prune input columns in ONE ROW PER MATCH; in ALL ROWS PER MATCH all remaining
-        // input columns are part of the output schema (and DataFusion will prune above if needed).
         if !self.rows_per_match.is_one_row() {
             return None;
         }
         let input_schema = self.input.schema();
         let mut needed: HashSet<usize> = HashSet::new();
 
-        // Always keep all columns referenced by partition_by, order_by, define, and measure slots.
         for expr in self.expressions() {
             let mut cols = HashSet::new();
             if expr_to_columns(&strip_outer_reference(expr), &mut cols).is_err() {
@@ -461,7 +548,6 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             }
         }
 
-        // Also keep any partition column requested by output_columns.
         for &out_idx in output_columns {
             if out_idx < self.partition_by.len()
                 && let Expr::Column(col) = &self.partition_by[out_idx]
@@ -472,7 +558,6 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         }
 
         if needed.is_empty() && !input_schema.fields().is_empty() {
-            // Preserve at least one column so row counts remain intact.
             needed.insert(0);
         }
 

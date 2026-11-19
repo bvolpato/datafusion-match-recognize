@@ -2,6 +2,10 @@
 
 //! Protobuf serialization codecs ([`LogicalExtensionCodec`] and [`PhysicalExtensionCodec`])
 //! for distributed execution (e.g., `datafusion-distributed`) and plan persistence.
+//!
+//! Both codecs support optional delegation (`with_delegate(...)`) so downstream engines can
+//! chain `MATCH_RECOGNIZE` serialization with custom `TableProvider`, `FileFormat`, or other
+//! extension plan codecs.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,16 +33,18 @@ use datafusion_proto::protobuf::{LogicalExprNode, PhysicalExprNode};
 use prost::Message;
 
 use crate::ast::{
-    AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig, MeasureSlot,
-    MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SymbolDef,
-    SymbolRef,
+    AfterMatchSkip, AggKind, DEFAULT_MAX_ACTIVE_THREADS, EvalSemantics, LogicalNavKind,
+    MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern,
+    PhysicalNavKind, RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind, SymbolRef,
 };
 use crate::logical::MatchRecognizeNode;
 use crate::measures::{
     PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind, build_physical_slot_schema,
 };
 use crate::pattern::Program;
-use crate::physical::{MatchRecognizeExec, PhysicalOrderBySpec, PhysicalSymbolDef};
+use crate::physical::{
+    MatchRecognizeExec, PhysicalOrderBySpec, PhysicalSymbolDef, PhysicalSymbolDefKind,
+};
 
 pub mod pb {
     include!(concat!(
@@ -49,7 +55,120 @@ pub mod pb {
 
 /// [`LogicalExtensionCodec`] for serializing and deserializing [`MatchRecognizeNode`].
 #[derive(Debug, Default)]
-pub struct MatchRecognizeLogicalCodec;
+pub struct MatchRecognizeLogicalCodec {
+    delegate: Option<Arc<dyn LogicalExtensionCodec>>,
+}
+
+impl MatchRecognizeLogicalCodec {
+    /// Creates a codec handling [`MatchRecognizeNode`] without a fallback delegate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a codec that delegates non-`MatchRecognize` extensions, table providers, and
+    /// file formats to `delegate`.
+    pub fn with_delegate(delegate: Arc<dyn LogicalExtensionCodec>) -> Self {
+        Self {
+            delegate: Some(delegate),
+        }
+    }
+}
+
+fn decode_logical_slots(
+    proto_slots: &[pb::MeasureSlotProto],
+    decode_expr: &dyn Fn(&[u8]) -> Result<datafusion_expr::Expr>,
+) -> Result<Vec<MeasureSlot>> {
+    let mut slots = Vec::with_capacity(proto_slots.len());
+    for s in proto_slots {
+        let semantics = decode_eval_semantics(s.semantics);
+        let kind =
+            match s.kind.as_ref().ok_or_else(|| {
+                DataFusionError::Internal("Missing MeasureSlotProto.kind".to_string())
+            })? {
+                pb::measure_slot_proto::Kind::MatchNumber(_) => MeasureSlotKind::MatchNumber,
+                pb::measure_slot_proto::Kind::Classifier(c) => MeasureSlotKind::Classifier {
+                    symbol: c.symbol.clone(),
+                },
+                pb::measure_slot_proto::Kind::Nav(n) => MeasureSlotKind::Nav {
+                    logical_nav: n.logical_nav.map(decode_logical_nav),
+                    logical_offset: n.logical_offset,
+                    physical_nav: n.physical_nav.map(decode_physical_nav),
+                    physical_offset: n.physical_offset,
+                    symbol: n.symbol.clone(),
+                    inner_expr: decode_expr(&n.inner_expr)?,
+                },
+                pb::measure_slot_proto::Kind::Agg(a) => MeasureSlotKind::Agg {
+                    agg_kind: decode_agg_kind(a.agg_kind)?,
+                    symbol: a.symbol.clone(),
+                    inner_expr: a.inner_expr.as_deref().map(decode_expr).transpose()?,
+                    distinct: a.distinct,
+                },
+                pb::measure_slot_proto::Kind::CurrentRow(cr) => MeasureSlotKind::CurrentRow {
+                    inner_expr: decode_expr(&cr.inner_expr)?,
+                },
+            };
+        slots.push(MeasureSlot {
+            slot_name: s.slot_name.clone(),
+            semantics,
+            kind,
+        });
+    }
+    Ok(slots)
+}
+
+fn encode_logical_slots(
+    slots: &[MeasureSlot],
+    encode_expr: &dyn Fn(&datafusion_expr::Expr) -> Result<Vec<u8>>,
+) -> Result<Vec<pb::MeasureSlotProto>> {
+    let mut out = Vec::with_capacity(slots.len());
+    for s in slots {
+        let kind = match &s.kind {
+            MeasureSlotKind::MatchNumber => pb::measure_slot_proto::Kind::MatchNumber(true),
+            MeasureSlotKind::Classifier { symbol } => {
+                pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
+                    symbol: symbol.clone(),
+                })
+            }
+            MeasureSlotKind::Nav {
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+                symbol,
+                inner_expr,
+            } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
+                logical_nav: logical_nav.map(encode_logical_nav),
+                logical_offset: *logical_offset,
+                physical_nav: physical_nav.map(encode_physical_nav),
+                physical_offset: *physical_offset,
+                symbol: symbol.clone(),
+                inner_expr: encode_expr(inner_expr)?,
+            }),
+            MeasureSlotKind::Agg {
+                agg_kind,
+                symbol,
+                inner_expr,
+                distinct,
+            } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
+                agg_kind: encode_agg_kind(*agg_kind),
+                symbol: symbol.clone(),
+                inner_expr: inner_expr.as_ref().map(encode_expr).transpose()?,
+                distinct: *distinct,
+            }),
+            MeasureSlotKind::CurrentRow { inner_expr } => {
+                pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
+                    inner_expr: encode_expr(inner_expr)?,
+                })
+            }
+        };
+        out.push(pb::MeasureSlotProto {
+            slot_name: s.slot_name.clone(),
+            semantics: encode_eval_semantics(s.semantics),
+            kind: Some(kind),
+        });
+    }
+    Ok(out)
+}
 
 impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
     fn try_decode(
@@ -58,19 +177,22 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
         inputs: &[LogicalPlan],
         ctx: &TaskContext,
     ) -> Result<Extension> {
+        let msg = match pb::MatchRecognizeLogicalNodeProto::decode(buf) {
+            Ok(m) if m.pattern.is_some() => m,
+            _ => {
+                if let Some(delegate) = &self.delegate {
+                    return delegate.try_decode(buf, inputs, ctx);
+                }
+                return internal_err!("Failed to decode MatchRecognizeLogicalNodeProto");
+            }
+        };
         if inputs.len() != 1 {
             return internal_err!(
                 "MatchRecognizeLogicalCodec expects 1 input, got {}",
                 inputs.len()
             );
         }
-        let msg = pb::MatchRecognizeLogicalNodeProto::decode(buf).map_err(|e| {
-            DataFusionError::Internal(format!(
-                "Failed to decode MatchRecognizeLogicalNodeProto: {e}"
-            ))
-        })?;
         let default_codec = DefaultLogicalExtensionCodec {};
-
         let decode_expr = |bytes: &[u8]| -> Result<datafusion_expr::Expr> {
             let node = LogicalExprNode::decode(bytes).map_err(|e| {
                 DataFusionError::Internal(format!("Failed to decode LogicalExprNode: {e}"))
@@ -98,70 +220,56 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let definitions = msg
-            .definitions
+        let subsets: Vec<SubsetDef> = msg
+            .subsets
             .iter()
-            .map(|d| {
-                Ok(SymbolDef {
-                    name: d.name.clone(),
-                    predicate: decode_expr(&d.predicate)?,
-                })
+            .map(|s| SubsetDef {
+                name: s.name.clone(),
+                members: s.members.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        let mut measures = Vec::with_capacity(msg.measures.len());
-        for m in &msg.measures {
-            let mut slots = Vec::with_capacity(m.slots.len());
-            for s in &m.slots {
-                let semantics = decode_eval_semantics(s.semantics);
-                let kind = match s.kind.as_ref().ok_or_else(|| {
-                    DataFusionError::Internal("Missing MeasureSlotProto.kind".to_string())
-                })? {
-                    pb::measure_slot_proto::Kind::MatchNumber(_) => MeasureSlotKind::MatchNumber,
-                    pb::measure_slot_proto::Kind::Classifier(c) => MeasureSlotKind::Classifier {
-                        symbol: c.symbol.clone(),
-                    },
-                    pb::measure_slot_proto::Kind::Nav(n) => MeasureSlotKind::Nav {
-                        logical_nav: n.logical_nav.map(decode_logical_nav),
-                        logical_offset: n.logical_offset,
-                        physical_nav: n.physical_nav.map(decode_physical_nav),
-                        physical_offset: n.physical_offset,
-                        symbol: n.symbol.clone(),
-                        inner_expr: decode_expr(&n.inner_expr)?,
-                    },
-                    pb::measure_slot_proto::Kind::Agg(a) => MeasureSlotKind::Agg {
-                        agg_kind: decode_agg_kind(a.agg_kind)?,
-                        symbol: a.symbol.clone(),
-                        inner_expr: a.inner_expr.as_deref().map(decode_expr).transpose()?,
-                    },
-                    pb::measure_slot_proto::Kind::CurrentRow(cr) => MeasureSlotKind::CurrentRow {
-                        inner_expr: decode_expr(&cr.inner_expr)?,
-                    },
-                };
-                slots.push(MeasureSlot {
-                    slot_name: s.slot_name.clone(),
-                    semantics,
-                    kind,
-                });
-            }
-            measures.push(MeasureSpec {
-                alias: m.alias.clone(),
-                outer_expr: decode_expr(&m.outer_expr)?,
-                slots,
+        let mut definitions = Vec::with_capacity(msg.definitions.len());
+        for d in &msg.definitions {
+            let kind = if let Some(st) = &d.stateful {
+                SymbolDefKind::Stateful {
+                    outer_expr: decode_expr(&st.outer_expr)?,
+                    slots: decode_logical_slots(&st.slots, &decode_expr)?,
+                }
+            } else {
+                SymbolDefKind::Stateless {
+                    predicate: decode_expr(&d.predicate)?,
+                }
+            };
+            definitions.push(SymbolDef {
+                name: d.name.clone(),
+                kind,
             });
         }
 
-        let pattern = decode_pattern(msg.pattern.as_ref().ok_or_else(|| {
-            DataFusionError::Internal("Missing pattern in MatchRecognizeLogicalNodeProto".into())
-        })?)?;
+        let mut measures = Vec::with_capacity(msg.measures.len());
+        for m in &msg.measures {
+            measures.push(MeasureSpec {
+                alias: m.alias.clone(),
+                outer_expr: decode_expr(&m.outer_expr)?,
+                slots: decode_logical_slots(&m.slots, &decode_expr)?,
+            });
+        }
+
+        let pattern = decode_pattern(msg.pattern.as_ref().expect("checked is_some"))?;
         let rows_per_match = decode_rows_per_match(msg.rows_per_match)?;
         let after_match_skip = decode_skip(msg.after_match_skip.as_ref())?;
         let config = MatchRecognizeConfig {
             max_permute_elements: msg.max_permute_elements,
             max_nfa_states: msg.max_nfa_states,
+            max_active_threads: if msg.max_active_threads == 0 {
+                DEFAULT_MAX_ACTIVE_THREADS
+            } else {
+                msg.max_active_threads
+            },
         };
 
-        let node = MatchRecognizeNode::try_new(
+        let node = MatchRecognizeNode::try_new_with_subsets(
             inputs[0].clone(),
             partition_by,
             order_by,
@@ -169,6 +277,7 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             rows_per_match,
             after_match_skip,
             pattern,
+            subsets,
             definitions,
             config,
         )?;
@@ -179,6 +288,9 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
 
     fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> Result<()> {
         let Some(mr) = node.node.as_any().downcast_ref::<MatchRecognizeNode>() else {
+            if let Some(delegate) = &self.delegate {
+                return delegate.try_encode(node, buf);
+            }
             return not_impl_err!("Unsupported logical extension node: {}", node.node.name());
         };
         let default_codec = DefaultLogicalExtensionCodec {};
@@ -206,68 +318,45 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let definitions = mr
-            .definitions
+
+        let subsets: Vec<pb::SubsetDefProto> = mr
+            .subsets
             .iter()
-            .map(|d| {
-                Ok(pb::SymbolDefProto {
-                    name: d.name.clone(),
-                    predicate: encode_expr(&d.predicate)?,
-                })
+            .map(|s| pb::SubsetDefProto {
+                name: s.name.clone(),
+                members: s.members.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+
+        let mut definitions = Vec::with_capacity(mr.definitions.len());
+        for d in &mr.definitions {
+            match &d.kind {
+                SymbolDefKind::Stateless { predicate } => {
+                    definitions.push(pb::SymbolDefProto {
+                        name: d.name.clone(),
+                        predicate: encode_expr(predicate)?,
+                        stateful: None,
+                    });
+                }
+                SymbolDefKind::Stateful { outer_expr, slots } => {
+                    definitions.push(pb::SymbolDefProto {
+                        name: d.name.clone(),
+                        predicate: Vec::new(),
+                        stateful: Some(pb::StatefulSymbolDefProto {
+                            outer_expr: encode_expr(outer_expr)?,
+                            slots: encode_logical_slots(slots, &encode_expr)?,
+                        }),
+                    });
+                }
+            }
+        }
 
         let mut measures = Vec::with_capacity(mr.measures.len());
         for m in &mr.measures {
-            let mut slots = Vec::with_capacity(m.slots.len());
-            for s in &m.slots {
-                let kind = match &s.kind {
-                    MeasureSlotKind::MatchNumber => pb::measure_slot_proto::Kind::MatchNumber(true),
-                    MeasureSlotKind::Classifier { symbol } => {
-                        pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
-                            symbol: symbol.clone(),
-                        })
-                    }
-                    MeasureSlotKind::Nav {
-                        logical_nav,
-                        logical_offset,
-                        physical_nav,
-                        physical_offset,
-                        symbol,
-                        inner_expr,
-                    } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
-                        logical_nav: logical_nav.map(encode_logical_nav),
-                        logical_offset: *logical_offset,
-                        physical_nav: physical_nav.map(encode_physical_nav),
-                        physical_offset: *physical_offset,
-                        symbol: symbol.clone(),
-                        inner_expr: encode_expr(inner_expr)?,
-                    }),
-                    MeasureSlotKind::Agg {
-                        agg_kind,
-                        symbol,
-                        inner_expr,
-                    } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
-                        agg_kind: encode_agg_kind(*agg_kind),
-                        symbol: symbol.clone(),
-                        inner_expr: inner_expr.as_ref().map(encode_expr).transpose()?,
-                    }),
-                    MeasureSlotKind::CurrentRow { inner_expr } => {
-                        pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
-                            inner_expr: encode_expr(inner_expr)?,
-                        })
-                    }
-                };
-                slots.push(pb::MeasureSlotProto {
-                    slot_name: s.slot_name.clone(),
-                    semantics: encode_eval_semantics(s.semantics),
-                    kind: Some(kind),
-                });
-            }
             measures.push(pb::MeasureSpecProto {
                 alias: m.alias.clone(),
                 outer_expr: encode_expr(&m.outer_expr)?,
-                slots,
+                slots: encode_logical_slots(&m.slots, &encode_expr)?,
             });
         }
 
@@ -281,6 +370,8 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             definitions,
             max_permute_elements: mr.config.max_permute_elements,
             max_nfa_states: mr.config.max_nfa_states,
+            max_active_threads: mr.config.max_active_threads,
+            subsets,
         };
         msg.encode(buf).map_err(|e| {
             DataFusionError::Internal(format!(
@@ -291,35 +382,246 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
 
     fn try_decode_table_provider(
         &self,
-        _buf: &[u8],
-        _table_ref: &TableReference,
-        _schema: Arc<Schema>,
-        _ctx: &TaskContext,
+        buf: &[u8],
+        table_ref: &TableReference,
+        schema: Arc<Schema>,
+        ctx: &TaskContext,
     ) -> Result<Arc<dyn TableProvider>> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.try_decode_table_provider(buf, table_ref, schema, ctx);
+        }
         not_impl_err!("MatchRecognizeLogicalCodec does not handle custom TableProvider")
     }
 
     fn try_encode_table_provider(
         &self,
-        _table_ref: &TableReference,
-        _node: Arc<dyn TableProvider>,
-        _buf: &mut Vec<u8>,
+        table_ref: &TableReference,
+        node: Arc<dyn TableProvider>,
+        buf: &mut Vec<u8>,
     ) -> Result<()> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.try_encode_table_provider(table_ref, node, buf);
+        }
         not_impl_err!("MatchRecognizeLogicalCodec does not handle custom TableProvider")
     }
 
     fn try_decode_file_format(
         &self,
-        _buf: &[u8],
-        _ctx: &TaskContext,
+        buf: &[u8],
+        ctx: &TaskContext,
     ) -> Result<Arc<dyn FileFormatFactory>> {
+        if let Some(delegate) = &self.delegate {
+            return delegate.try_decode_file_format(buf, ctx);
+        }
         not_impl_err!("MatchRecognizeLogicalCodec does not handle custom FileFormatFactory")
     }
 }
 
 /// [`PhysicalExtensionCodec`] for serializing and deserializing [`MatchRecognizeExec`].
 #[derive(Debug, Default)]
-pub struct MatchRecognizePhysicalCodec;
+pub struct MatchRecognizePhysicalCodec {
+    delegate: Option<Arc<dyn PhysicalExtensionCodec>>,
+}
+
+impl MatchRecognizePhysicalCodec {
+    /// Creates a codec handling [`MatchRecognizeExec`] without a fallback delegate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a codec that delegates non-`MatchRecognizeExec` physical nodes to `delegate`.
+    pub fn with_delegate(delegate: Arc<dyn PhysicalExtensionCodec>) -> Self {
+        Self {
+            delegate: Some(delegate),
+        }
+    }
+}
+
+type PhysExprDecoder<'a> =
+    &'a dyn Fn(&[u8], &Schema) -> Result<Arc<dyn datafusion_physical_expr::PhysicalExpr>>;
+type PhysExprEncoder<'a> =
+    &'a dyn Fn(&Arc<dyn datafusion_physical_expr::PhysicalExpr>) -> Result<Vec<u8>>;
+
+fn decode_physical_slots(
+    proto_slots: &[pb::MeasureSlotProto],
+    input_schema: &Schema,
+    program: &Program,
+    unmatched: bool,
+    decode_phys: PhysExprDecoder<'_>,
+) -> Result<Vec<PhysicalMeasureSlot>> {
+    let mut phys_slots = Vec::with_capacity(proto_slots.len());
+    for s in proto_slots {
+        let semantics = decode_eval_semantics(s.semantics);
+        let (kind, data_type, nullable) = match s
+            .kind
+            .as_ref()
+            .ok_or_else(|| DataFusionError::Internal("Missing MeasureSlotProto.kind".to_string()))?
+        {
+            pb::measure_slot_proto::Kind::MatchNumber(_) => (
+                PhysicalMeasureSlotKind::MatchNumber,
+                DataType::Int64,
+                unmatched,
+            ),
+            pb::measure_slot_proto::Kind::Classifier(c) => (
+                PhysicalMeasureSlotKind::Classifier {
+                    symbol_set: c
+                        .symbol
+                        .as_ref()
+                        .and_then(|sym| program.resolve_symbol_set(sym)),
+                    symbol: c.symbol.clone(),
+                },
+                DataType::Utf8,
+                true,
+            ),
+            pb::measure_slot_proto::Kind::Nav(n) => {
+                let inner_expr = decode_phys(&n.inner_expr, input_schema)?;
+                let dt = inner_expr.data_type(input_schema)?;
+                (
+                    PhysicalMeasureSlotKind::Nav {
+                        logical_nav: n.logical_nav.map(decode_logical_nav),
+                        logical_offset: n.logical_offset,
+                        physical_nav: n.physical_nav.map(decode_physical_nav),
+                        physical_offset: n.physical_offset,
+                        symbol_set: n
+                            .symbol
+                            .as_ref()
+                            .and_then(|sym| program.resolve_symbol_set(sym)),
+                        symbol: n.symbol.clone(),
+                        inner_expr,
+                    },
+                    dt,
+                    true,
+                )
+            }
+            pb::measure_slot_proto::Kind::Agg(a) => {
+                let agg_kind = decode_agg_kind(a.agg_kind)?;
+                let inner_expr = a
+                    .inner_expr
+                    .as_deref()
+                    .map(|b| decode_phys(b, input_schema))
+                    .transpose()?;
+                let (dt, null) = match agg_kind {
+                    AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
+                        (DataType::Int64, unmatched)
+                    }
+                    AggKind::Avg => (DataType::Float64, true),
+                    AggKind::Sum => {
+                        let inner_dt = inner_expr
+                            .as_ref()
+                            .expect("SUM has inner_expr")
+                            .data_type(input_schema)?;
+                        let sum_dt = match inner_dt {
+                            DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64 => DataType::Int64,
+                            DataType::UInt8
+                            | DataType::UInt16
+                            | DataType::UInt32
+                            | DataType::UInt64 => DataType::UInt64,
+                            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                                DataType::Float64
+                            }
+                            DataType::Decimal128(p, s) => DataType::Decimal128((p + 10).min(38), s),
+                            other => other,
+                        };
+                        (sum_dt, true)
+                    }
+                    AggKind::Min | AggKind::Max => {
+                        let inner_dt = inner_expr
+                            .as_ref()
+                            .expect("MIN/MAX has inner_expr")
+                            .data_type(input_schema)?;
+                        (inner_dt, true)
+                    }
+                };
+                (
+                    PhysicalMeasureSlotKind::Agg {
+                        agg_kind,
+                        symbol_set: a
+                            .symbol
+                            .as_ref()
+                            .and_then(|sym| program.resolve_symbol_set(sym)),
+                        symbol: a.symbol.clone(),
+                        inner_expr,
+                        distinct: a.distinct,
+                    },
+                    dt,
+                    null,
+                )
+            }
+            pb::measure_slot_proto::Kind::CurrentRow(cr) => {
+                let inner_expr = decode_phys(&cr.inner_expr, input_schema)?;
+                let dt = inner_expr.data_type(input_schema)?;
+                (PhysicalMeasureSlotKind::CurrentRow { inner_expr }, dt, true)
+            }
+        };
+        phys_slots.push(PhysicalMeasureSlot {
+            slot_name: s.slot_name.clone(),
+            semantics,
+            data_type,
+            nullable,
+            kind,
+        });
+    }
+    Ok(phys_slots)
+}
+
+fn encode_physical_slots(
+    slots: &[PhysicalMeasureSlot],
+    encode_phys: PhysExprEncoder<'_>,
+) -> Result<Vec<pb::MeasureSlotProto>> {
+    let mut out = Vec::with_capacity(slots.len());
+    for s in slots {
+        let kind = match &s.kind {
+            PhysicalMeasureSlotKind::MatchNumber => pb::measure_slot_proto::Kind::MatchNumber(true),
+            PhysicalMeasureSlotKind::Classifier { symbol, .. } => {
+                pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
+                    symbol: symbol.clone(),
+                })
+            }
+            PhysicalMeasureSlotKind::Nav {
+                logical_nav,
+                logical_offset,
+                physical_nav,
+                physical_offset,
+                symbol,
+                inner_expr,
+                ..
+            } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
+                logical_nav: logical_nav.map(encode_logical_nav),
+                logical_offset: *logical_offset,
+                physical_nav: physical_nav.map(encode_physical_nav),
+                physical_offset: *physical_offset,
+                symbol: symbol.clone(),
+                inner_expr: encode_phys(inner_expr)?,
+            }),
+            PhysicalMeasureSlotKind::Agg {
+                agg_kind,
+                symbol,
+                inner_expr,
+                distinct,
+                ..
+            } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
+                agg_kind: encode_agg_kind(*agg_kind),
+                symbol: symbol.clone(),
+                inner_expr: inner_expr.as_ref().map(encode_phys).transpose()?,
+                distinct: *distinct,
+            }),
+            PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+                pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
+                    inner_expr: encode_phys(inner_expr)?,
+                })
+            }
+        };
+        out.push(pb::MeasureSlotProto {
+            slot_name: s.slot_name.clone(),
+            semantics: encode_eval_semantics(s.semantics),
+            kind: Some(kind),
+        });
+    }
+    Ok(out)
+}
 
 impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
     fn try_decode(
@@ -329,6 +631,15 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
         ctx: &TaskContext,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let msg = match pb::MatchRecognizePhysicalNodeProto::decode(buf) {
+            Ok(m) if m.pattern.is_some() => m,
+            _ => {
+                if let Some(delegate) = &self.delegate {
+                    return delegate.try_decode(buf, inputs, ctx, proto_converter);
+                }
+                return internal_err!("Failed to decode MatchRecognizePhysicalNodeProto");
+            }
+        };
         if inputs.len() != 1 {
             return internal_err!(
                 "MatchRecognizePhysicalCodec expects 1 input, got {}",
@@ -337,11 +648,6 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
         }
         let input = Arc::clone(&inputs[0]);
         let input_schema = input.schema();
-        let msg = pb::MatchRecognizePhysicalNodeProto::decode(buf).map_err(|e| {
-            DataFusionError::Internal(format!(
-                "Failed to decode MatchRecognizePhysicalNodeProto: {e}"
-            ))
-        })?;
         let default_codec = DefaultPhysicalExtensionCodec {};
         let decode_ctx = PhysicalPlanDecodeContext::new(ctx, &default_codec);
 
@@ -382,139 +688,68 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let definitions = msg
-            .definitions
-            .iter()
-            .map(|d| {
-                Ok(PhysicalSymbolDef {
-                    name: d.name.clone(),
-                    predicate: decode_phys(&d.predicate, input_schema.as_ref())?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let pattern = decode_pattern(msg.pattern.as_ref().ok_or_else(|| {
-            DataFusionError::Internal("Missing pattern in MatchRecognizePhysicalNodeProto".into())
-        })?)?;
+        let pattern = decode_pattern(msg.pattern.as_ref().expect("checked is_some"))?;
         let rows_per_match = decode_rows_per_match(msg.rows_per_match)?;
         let after_match_skip = decode_skip(msg.after_match_skip.as_ref())?;
+        let subsets: Vec<SubsetDef> = msg
+            .subsets
+            .iter()
+            .map(|s| SubsetDef {
+                name: s.name.clone(),
+                members: s.members.clone(),
+            })
+            .collect();
         let config = MatchRecognizeConfig {
             max_permute_elements: msg.max_permute_elements,
             max_nfa_states: msg.max_nfa_states,
+            max_active_threads: if msg.max_active_threads == 0 {
+                DEFAULT_MAX_ACTIVE_THREADS
+            } else {
+                msg.max_active_threads
+            },
         };
 
-        let declared_names: Vec<String> = definitions.iter().map(|d| d.name.clone()).collect();
-        let program = Program::compile(&pattern, &declared_names, config)?;
+        let declared_names: Vec<String> = msg.definitions.iter().map(|d| d.name.clone()).collect();
+        let program = Program::compile_with_subsets(&pattern, &declared_names, &subsets, config)?;
+
+        let mut definitions = Vec::with_capacity(msg.definitions.len());
+        for d in &msg.definitions {
+            let kind = if let Some(st) = &d.stateful {
+                let slots = decode_physical_slots(
+                    &st.slots,
+                    input_schema.as_ref(),
+                    &program,
+                    false,
+                    &decode_phys,
+                )?;
+                let slot_schema = build_physical_slot_schema(&slots);
+                let outer_expr = decode_phys(&st.outer_expr, slot_schema.as_ref())?;
+                PhysicalSymbolDefKind::Stateful {
+                    outer_expr,
+                    slot_schema,
+                    slots,
+                }
+            } else {
+                PhysicalSymbolDefKind::Stateless {
+                    predicate: decode_phys(&d.predicate, input_schema.as_ref())?,
+                }
+            };
+            definitions.push(PhysicalSymbolDef {
+                name: d.name.clone(),
+                kind,
+            });
+        }
 
         let unmatched = rows_per_match.include_unmatched_rows();
         let mut measures = Vec::with_capacity(msg.measures.len());
         for m in &msg.measures {
-            let mut phys_slots = Vec::with_capacity(m.slots.len());
-            for s in &m.slots {
-                let semantics = decode_eval_semantics(s.semantics);
-                let (kind, data_type, nullable) = match s.kind.as_ref().ok_or_else(|| {
-                    DataFusionError::Internal("Missing MeasureSlotProto.kind".to_string())
-                })? {
-                    pb::measure_slot_proto::Kind::MatchNumber(_) => (
-                        PhysicalMeasureSlotKind::MatchNumber,
-                        DataType::Int64,
-                        unmatched,
-                    ),
-                    pb::measure_slot_proto::Kind::Classifier(c) => (
-                        PhysicalMeasureSlotKind::Classifier {
-                            symbol_id: c.symbol.as_ref().and_then(|sym| program.symbol_id(sym)),
-                            symbol: c.symbol.clone(),
-                        },
-                        DataType::Utf8,
-                        true,
-                    ),
-                    pb::measure_slot_proto::Kind::Nav(n) => {
-                        let inner_expr = decode_phys(&n.inner_expr, input_schema.as_ref())?;
-                        let dt = inner_expr.data_type(input_schema.as_ref())?;
-                        (
-                            PhysicalMeasureSlotKind::Nav {
-                                logical_nav: n.logical_nav.map(decode_logical_nav),
-                                logical_offset: n.logical_offset,
-                                physical_nav: n.physical_nav.map(decode_physical_nav),
-                                physical_offset: n.physical_offset,
-                                symbol_id: n.symbol.as_ref().and_then(|sym| program.symbol_id(sym)),
-                                symbol: n.symbol.clone(),
-                                inner_expr,
-                            },
-                            dt,
-                            true,
-                        )
-                    }
-                    pb::measure_slot_proto::Kind::Agg(a) => {
-                        let agg_kind = decode_agg_kind(a.agg_kind)?;
-                        let inner_expr = a
-                            .inner_expr
-                            .as_deref()
-                            .map(|b| decode_phys(b, input_schema.as_ref()))
-                            .transpose()?;
-                        let (dt, null) = match agg_kind {
-                            AggKind::CountStar | AggKind::CountSymbol | AggKind::Count => {
-                                (DataType::Int64, unmatched)
-                            }
-                            AggKind::Avg => (DataType::Float64, true),
-                            AggKind::Sum => {
-                                let inner_dt = inner_expr
-                                    .as_ref()
-                                    .expect("SUM has inner_expr")
-                                    .data_type(input_schema.as_ref())?;
-                                let sum_dt = match inner_dt {
-                                    DataType::Int8
-                                    | DataType::Int16
-                                    | DataType::Int32
-                                    | DataType::Int64 => DataType::Int64,
-                                    DataType::UInt8
-                                    | DataType::UInt16
-                                    | DataType::UInt32
-                                    | DataType::UInt64 => DataType::UInt64,
-                                    DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                                        DataType::Float64
-                                    }
-                                    DataType::Decimal128(p, s) => {
-                                        DataType::Decimal128((p + 10).min(38), s)
-                                    }
-                                    other => other,
-                                };
-                                (sum_dt, true)
-                            }
-                            AggKind::Min | AggKind::Max => {
-                                let inner_dt = inner_expr
-                                    .as_ref()
-                                    .expect("MIN/MAX has inner_expr")
-                                    .data_type(input_schema.as_ref())?;
-                                (inner_dt, true)
-                            }
-                        };
-                        (
-                            PhysicalMeasureSlotKind::Agg {
-                                agg_kind,
-                                symbol_id: a.symbol.as_ref().and_then(|sym| program.symbol_id(sym)),
-                                symbol: a.symbol.clone(),
-                                inner_expr,
-                            },
-                            dt,
-                            null,
-                        )
-                    }
-                    pb::measure_slot_proto::Kind::CurrentRow(cr) => {
-                        let inner_expr = decode_phys(&cr.inner_expr, input_schema.as_ref())?;
-                        let dt = inner_expr.data_type(input_schema.as_ref())?;
-                        (PhysicalMeasureSlotKind::CurrentRow { inner_expr }, dt, true)
-                    }
-                };
-                phys_slots.push(PhysicalMeasureSlot {
-                    slot_name: s.slot_name.clone(),
-                    semantics,
-                    data_type,
-                    nullable,
-                    kind,
-                });
-            }
-
+            let phys_slots = decode_physical_slots(
+                &m.slots,
+                input_schema.as_ref(),
+                &program,
+                unmatched,
+                &decode_phys,
+            )?;
             let slot_schema = build_physical_slot_schema(&phys_slots);
             let outer_expr = decode_phys(&m.outer_expr, slot_schema.as_ref())?;
             measures.push(PhysicalMeasure {
@@ -525,7 +760,6 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             });
         }
 
-        // Recompute output Arrow schema from physical inputs.
         let output_schema = compute_physical_output_schema(
             input_schema.as_ref(),
             &partition_by,
@@ -534,7 +768,7 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             rows_per_match,
         )?;
 
-        Ok(Arc::new(MatchRecognizeExec::try_new(
+        Ok(Arc::new(MatchRecognizeExec::try_new_with_subsets(
             input,
             partition_by,
             order_by,
@@ -542,6 +776,7 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             rows_per_match,
             after_match_skip,
             pattern,
+            subsets,
             definitions,
             config,
             output_schema,
@@ -555,6 +790,9 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         let Some(exec) = node.downcast_ref::<MatchRecognizeExec>() else {
+            if let Some(delegate) = &self.delegate {
+                return delegate.try_encode(node, buf, proto_converter);
+            }
             return not_impl_err!("Unsupported physical extension node: {}", node.name());
         };
         let default_codec = DefaultPhysicalExtensionCodec {};
@@ -586,72 +824,46 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let definitions = exec
-            .definitions()
+        let subsets: Vec<pb::SubsetDefProto> = exec
+            .subsets()
             .iter()
-            .map(|d| {
-                Ok(pb::SymbolDefProto {
-                    name: d.name.clone(),
-                    predicate: encode_phys(&d.predicate)?,
-                })
+            .map(|s| pb::SubsetDefProto {
+                name: s.name.clone(),
+                members: s.members.clone(),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+
+        let mut definitions = Vec::with_capacity(exec.definitions().len());
+        for d in exec.definitions() {
+            match &d.kind {
+                PhysicalSymbolDefKind::Stateless { predicate } => {
+                    definitions.push(pb::SymbolDefProto {
+                        name: d.name.clone(),
+                        predicate: encode_phys(predicate)?,
+                        stateful: None,
+                    });
+                }
+                PhysicalSymbolDefKind::Stateful {
+                    outer_expr, slots, ..
+                } => {
+                    definitions.push(pb::SymbolDefProto {
+                        name: d.name.clone(),
+                        predicate: Vec::new(),
+                        stateful: Some(pb::StatefulSymbolDefProto {
+                            outer_expr: encode_phys(outer_expr)?,
+                            slots: encode_physical_slots(slots, &encode_phys)?,
+                        }),
+                    });
+                }
+            }
+        }
 
         let mut measures = Vec::with_capacity(exec.measures().len());
         for m in exec.measures() {
-            let mut slots = Vec::with_capacity(m.slots.len());
-            for s in &m.slots {
-                let kind = match &s.kind {
-                    PhysicalMeasureSlotKind::MatchNumber => {
-                        pb::measure_slot_proto::Kind::MatchNumber(true)
-                    }
-                    PhysicalMeasureSlotKind::Classifier { symbol, .. } => {
-                        pb::measure_slot_proto::Kind::Classifier(pb::ClassifierSlotProto {
-                            symbol: symbol.clone(),
-                        })
-                    }
-                    PhysicalMeasureSlotKind::Nav {
-                        logical_nav,
-                        logical_offset,
-                        physical_nav,
-                        physical_offset,
-                        symbol,
-                        inner_expr,
-                        ..
-                    } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
-                        logical_nav: logical_nav.map(encode_logical_nav),
-                        logical_offset: *logical_offset,
-                        physical_nav: physical_nav.map(encode_physical_nav),
-                        physical_offset: *physical_offset,
-                        symbol: symbol.clone(),
-                        inner_expr: encode_phys(inner_expr)?,
-                    }),
-                    PhysicalMeasureSlotKind::Agg {
-                        agg_kind,
-                        symbol,
-                        inner_expr,
-                        ..
-                    } => pb::measure_slot_proto::Kind::Agg(pb::AggSlotProto {
-                        agg_kind: encode_agg_kind(*agg_kind),
-                        symbol: symbol.clone(),
-                        inner_expr: inner_expr.as_ref().map(encode_phys).transpose()?,
-                    }),
-                    PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
-                        pb::measure_slot_proto::Kind::CurrentRow(pb::CurrentRowSlotProto {
-                            inner_expr: encode_phys(inner_expr)?,
-                        })
-                    }
-                };
-                slots.push(pb::MeasureSlotProto {
-                    slot_name: s.slot_name.clone(),
-                    semantics: encode_eval_semantics(s.semantics),
-                    kind: Some(kind),
-                });
-            }
             measures.push(pb::MeasureSpecProto {
                 alias: m.alias.clone(),
                 outer_expr: encode_phys(&m.outer_expr)?,
-                slots,
+                slots: encode_physical_slots(&m.slots, &encode_phys)?,
             });
         }
 
@@ -665,6 +877,8 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             definitions,
             max_permute_elements: exec.config().max_permute_elements,
             max_nfa_states: exec.config().max_nfa_states,
+            max_active_threads: exec.config().max_active_threads,
+            subsets,
         };
         msg.encode(buf).map_err(|e| {
             DataFusionError::Internal(format!(
@@ -725,7 +939,6 @@ fn compute_physical_output_schema(
         }
     }
 
-    // Ensure schema is valid DFSchema too.
     let schema = Arc::new(Schema::new(fields));
     let _ = DFSchema::try_from(schema.as_ref().clone())?;
     Ok(schema)

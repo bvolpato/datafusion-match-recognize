@@ -12,6 +12,9 @@ pub const DEFAULT_MAX_PERMUTE_ELEMENTS: u32 = 8;
 /// Default safety limit on the number of compiled NFA bytecode instructions.
 pub const DEFAULT_MAX_NFA_STATES: u32 = 16_384;
 
+/// Default safety limit on concurrent active NFA threads during stateful `DEFINE` matching.
+pub const DEFAULT_MAX_ACTIVE_THREADS: u32 = 4_096;
+
 /// Configuration knobs for `MATCH_RECOGNIZE` compilation and execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MatchRecognizeConfig {
@@ -19,6 +22,8 @@ pub struct MatchRecognizeConfig {
     pub max_permute_elements: u32,
     /// Maximum number of bytecode instructions allowed in a compiled NFA program.
     pub max_nfa_states: u32,
+    /// Maximum concurrent NFA threads allowed in stateful `DEFINE` mode before erroring.
+    pub max_active_threads: u32,
 }
 
 impl Default for MatchRecognizeConfig {
@@ -26,6 +31,7 @@ impl Default for MatchRecognizeConfig {
         Self {
             max_permute_elements: DEFAULT_MAX_PERMUTE_ELEMENTS,
             max_nfa_states: DEFAULT_MAX_NFA_STATES,
+            max_active_threads: DEFAULT_MAX_ACTIVE_THREADS,
         }
     }
 }
@@ -218,9 +224,9 @@ pub enum AfterMatchSkip {
     PastLastRow,
     /// `AFTER MATCH SKIP TO NEXT ROW`.
     ToNextRow,
-    /// `AFTER MATCH SKIP TO FIRST <symbol>`.
+    /// `AFTER MATCH SKIP TO FIRST <symbol_or_subset>`.
     ToFirst(String),
-    /// `AFTER MATCH SKIP TO LAST <symbol>`.
+    /// `AFTER MATCH SKIP TO LAST <symbol_or_subset>`.
     ToLast(String),
 }
 
@@ -233,6 +239,13 @@ impl fmt::Display for AfterMatchSkip {
             AfterMatchSkip::ToLast(s) => write!(f, "AFTER MATCH SKIP TO LAST {s}"),
         }
     }
+}
+
+/// SQL:2016 `SUBSET <name> = (<member1>, <member2>, ...)` union variable definition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubsetDef {
+    pub name: String,
+    pub members: Vec<String>,
 }
 
 /// Logical navigation function within a match (`FIRST` or `LAST`).
@@ -249,18 +262,18 @@ pub enum PhysicalNavKind {
     Next,
 }
 
-/// Aggregate functions supported inside `MEASURES`.
+/// Aggregate functions supported inside `MEASURES` and stateful `DEFINE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AggKind {
     /// `COUNT(*)` over all rows in the match.
     CountStar,
-    /// `COUNT(A.*)` over rows matching symbol `A`.
+    /// `COUNT(A.*)` over rows matching symbol/subset `A`.
     CountSymbol,
-    /// `COUNT(expr)` counting non-null values.
+    /// `COUNT([DISTINCT] expr)` counting non-null values.
     Count,
-    /// `SUM(expr)`.
+    /// `SUM([DISTINCT] expr)`.
     Sum,
-    /// `AVG(expr)`.
+    /// `AVG([DISTINCT] expr)`.
     Avg,
     /// `MIN(expr)`.
     Min,
@@ -268,21 +281,21 @@ pub enum AggKind {
     Max,
 }
 
-/// Evaluation horizon for a measure leaf (`RUNNING` vs `FINAL`).
+/// Evaluation horizon for a measure or define leaf (`RUNNING` vs `FINAL`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvalSemantics {
-    /// Evaluate over rows from match start up to the current row (default for `ALL ROWS`).
+    /// Evaluate over rows from match start up to the current row (default for `ALL ROWS` and `DEFINE`).
     Running,
     /// Evaluate over all rows of the completed match (default for `ONE ROW`).
     Final,
 }
 
-/// A leaf pattern-recognition sub-expression extracted from a `MEASURES` expression.
+/// A leaf pattern-recognition sub-expression extracted from a `MEASURES` or stateful `DEFINE` expression.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum MeasureSlotKind {
     /// `MATCH_NUMBER()` returning 1-based `Int64` match index per partition.
     MatchNumber,
-    /// `CLASSIFIER([symbol])` returning `Utf8` variable name (or `NULL`).
+    /// `CLASSIFIER([symbol_or_subset])` returning `Utf8` variable name (or `NULL`).
     Classifier { symbol: Option<String> },
     /// Pattern navigation (`FIRST`/`LAST`, `PREV`/`NEXT`, or bare `A.col`).
     Nav {
@@ -293,17 +306,18 @@ pub enum MeasureSlotKind {
         symbol: Option<String>,
         inner_expr: Expr,
     },
-    /// Aggregate over matched rows (optionally scoped to a single pattern variable).
+    /// Aggregate over matched rows (optionally scoped to a single pattern variable or subset).
     Agg {
         agg_kind: AggKind,
         symbol: Option<String>,
         inner_expr: Option<Expr>,
+        distinct: bool,
     },
-    /// Bare input-column reference in `ALL ROWS` mode evaluated on the current row.
+    /// Bare input-column reference evaluated on the current row.
     CurrentRow { inner_expr: Expr },
 }
 
-/// Named synthetic slot for a measure leaf expression.
+/// Named synthetic slot for a pattern-recognition leaf expression.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct MeasureSlot {
     pub slot_name: String,
@@ -321,11 +335,48 @@ pub struct MeasureSpec {
     pub slots: Vec<MeasureSlot>,
 }
 
+/// Classification of a `DEFINE <name> AS <predicate>` expression.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+pub enum SymbolDefKind {
+    /// Tier 1 fast path: depends only on the current row; evaluated once per partition in
+    /// vectorized Arrow into a bitmask.
+    Stateless { predicate: Expr },
+    /// Tier 2 match-state predicate: references `PREV`/`NEXT`/`FIRST`/`LAST`, aggregates,
+    /// `CLASSIFIER()`, `MATCH_NUMBER()`, or another symbol/subset.
+    Stateful {
+        outer_expr: Expr,
+        slots: Vec<MeasureSlot>,
+    },
+}
+
 /// A single `DEFINE <name> AS <predicate>` entry.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub struct SymbolDef {
     pub name: String,
-    pub predicate: Expr,
+    pub kind: SymbolDefKind,
+}
+
+impl SymbolDef {
+    /// Creates a stateless row-local symbol definition.
+    pub fn stateless(name: impl Into<String>, predicate: Expr) -> Self {
+        Self {
+            name: name.into(),
+            kind: SymbolDefKind::Stateless { predicate },
+        }
+    }
+
+    /// Creates a stateful match-dependent symbol definition.
+    pub fn stateful(name: impl Into<String>, outer_expr: Expr, slots: Vec<MeasureSlot>) -> Self {
+        Self {
+            name: name.into(),
+            kind: SymbolDefKind::Stateful { outer_expr, slots },
+        }
+    }
+
+    /// Returns true if this definition requires match-state evaluation during NFA matching.
+    pub fn is_stateful(&self) -> bool {
+        matches!(self.kind, SymbolDefKind::Stateful { .. })
+    }
 }
 
 /// A single `ORDER BY` specification.

@@ -24,8 +24,8 @@ pub mod proto;
 
 pub use ast::{
     AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig, MeasureSlot,
-    MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SymbolDef,
-    SymbolRef,
+    MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SubsetDef,
+    SymbolDef, SymbolDefKind, SymbolRef,
 };
 pub use logical::MatchRecognizeNode;
 pub use optimizer::MatchRecognizeFilterPushdown;

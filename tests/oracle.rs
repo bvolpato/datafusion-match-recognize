@@ -599,3 +599,374 @@ proptest! {
         }
     }
 }
+
+type StatefulMatchCont<'a> =
+    &'a dyn Fn(usize, &mut Vec<MatchStep>, &mut TestStatefulEval) -> Option<Vec<MatchStep>>;
+
+struct TestStatefulEval {
+    vals: Vec<i32>,
+}
+
+impl datafusion_match_recognize::matcher::StatefulPredicateEvaluator for TestStatefulEval {
+    fn is_stateful(&self, sym: SymbolId) -> bool {
+        sym == 1 || sym == 2
+    }
+
+    fn has_any_stateful(&self) -> bool {
+        true
+    }
+
+    fn eval_stateful(
+        &mut self,
+        sym: SymbolId,
+        tentative_steps: &[MatchStep],
+        _candidate_match_number: i64,
+    ) -> datafusion_common::Result<bool> {
+        let pos = tentative_steps.last().unwrap().row_idx;
+        match sym {
+            1 => Ok(pos > 0 && self.vals[pos] < self.vals[pos - 1]),
+            2 => {
+                if let Some(first_a) = tentative_steps.iter().find(|s| s.sym == 0) {
+                    Ok(self.vals[pos] > self.vals[first_a.row_idx])
+                } else {
+                    Ok(pos > 0 && self.vals[pos] > self.vals[pos - 1])
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_eval_stateful(
+    pattern: &Pattern,
+    pos: usize,
+    exclude_depth: u32,
+    symbols: &PartitionSymbols,
+    program: &Program,
+    eval: &mut TestStatefulEval,
+    steps: &mut Vec<MatchStep>,
+    cont: StatefulMatchCont<'_>,
+) -> Option<Vec<MatchStep>> {
+    use datafusion_match_recognize::matcher::StatefulPredicateEvaluator;
+    match pattern {
+        Pattern::Symbol(SymbolRef::Start) => {
+            if pos == 0 {
+                cont(pos, steps, eval)
+            } else {
+                None
+            }
+        }
+        Pattern::Symbol(SymbolRef::End) => {
+            if pos == symbols.num_rows() {
+                cont(pos, steps, eval)
+            } else {
+                None
+            }
+        }
+        Pattern::Symbol(SymbolRef::Named(name)) => {
+            if pos >= symbols.num_rows() {
+                return None;
+            }
+            let sym = program.symbol_id(name).unwrap();
+            steps.push(MatchStep {
+                row_idx: pos,
+                sym,
+                excluded: exclude_depth > 0,
+            });
+            let ok = if eval.is_stateful(sym) {
+                eval.eval_stateful(sym, steps, 1).unwrap()
+            } else {
+                symbols.matches(pos, sym)
+            };
+            let res = if ok { cont(pos + 1, steps, eval) } else { None };
+            steps.pop();
+            res
+        }
+        Pattern::Exclude(inner) => ref_eval_stateful(
+            inner,
+            pos,
+            exclude_depth + 1,
+            symbols,
+            program,
+            eval,
+            steps,
+            cont,
+        ),
+        Pattern::Concat(items) => ref_eval_stateful_slice(
+            items,
+            pos,
+            exclude_depth,
+            symbols,
+            program,
+            eval,
+            steps,
+            cont,
+        ),
+        Pattern::Alternation(branches) => {
+            for b in branches {
+                if let Some(m) =
+                    ref_eval_stateful(b, pos, exclude_depth, symbols, program, eval, steps, cont)
+                {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Pattern::Permute(items) => {
+            for order in lexicographic_perms(items.len()) {
+                let seq: Vec<Pattern> = order.into_iter().map(|i| items[i].clone()).collect();
+                if let Some(m) = ref_eval_stateful_slice(
+                    &seq,
+                    pos,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    eval,
+                    steps,
+                    cont,
+                ) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+        Pattern::Repetition {
+            inner,
+            min,
+            max,
+            reluctant,
+        } => ref_eval_stateful_rep(
+            inner,
+            *min,
+            *max,
+            *reluctant,
+            0,
+            None,
+            pos,
+            exclude_depth,
+            symbols,
+            program,
+            eval,
+            steps,
+            cont,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_eval_stateful_slice(
+    items: &[Pattern],
+    pos: usize,
+    exclude_depth: u32,
+    symbols: &PartitionSymbols,
+    program: &Program,
+    eval: &mut TestStatefulEval,
+    steps: &mut Vec<MatchStep>,
+    cont: StatefulMatchCont<'_>,
+) -> Option<Vec<MatchStep>> {
+    match items.split_first() {
+        None => cont(pos, steps, eval),
+        Some((head, tail)) => ref_eval_stateful(
+            head,
+            pos,
+            exclude_depth,
+            symbols,
+            program,
+            eval,
+            steps,
+            &|p, st, ev| {
+                ref_eval_stateful_slice(tail, p, exclude_depth, symbols, program, ev, st, cont)
+            },
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_eval_stateful_rep(
+    inner: &Pattern,
+    min: u32,
+    max: Option<u32>,
+    reluctant: bool,
+    count: u32,
+    last_iter_start_pos: Option<usize>,
+    pos: usize,
+    exclude_depth: u32,
+    symbols: &PartitionSymbols,
+    program: &Program,
+    eval: &mut TestStatefulEval,
+    steps: &mut Vec<MatchStep>,
+    cont: StatefulMatchCont<'_>,
+) -> Option<Vec<MatchStep>> {
+    if count < min {
+        return ref_eval_stateful(
+            inner,
+            pos,
+            exclude_depth,
+            symbols,
+            program,
+            eval,
+            steps,
+            &|next_pos, st, ev| {
+                ref_eval_stateful_rep(
+                    inner,
+                    min,
+                    max,
+                    reluctant,
+                    count + 1,
+                    Some(pos),
+                    next_pos,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    ev,
+                    st,
+                    cont,
+                )
+            },
+        );
+    }
+    if let Some(m) = max
+        && count >= m
+    {
+        return cont(pos, steps, eval);
+    }
+    if max.is_none() && last_iter_start_pos == Some(pos) {
+        return cont(pos, steps, eval);
+    }
+    let try_more = |st: &mut Vec<MatchStep>, ev: &mut TestStatefulEval| {
+        ref_eval_stateful(
+            inner,
+            pos,
+            exclude_depth,
+            symbols,
+            program,
+            ev,
+            st,
+            &|next_pos, st2, ev2| {
+                ref_eval_stateful_rep(
+                    inner,
+                    min,
+                    max,
+                    reluctant,
+                    count + 1,
+                    Some(pos),
+                    next_pos,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    ev2,
+                    st2,
+                    cont,
+                )
+            },
+        )
+    };
+    if reluctant {
+        if let Some(m) = cont(pos, steps, eval) {
+            return Some(m);
+        }
+        try_more(steps, eval)
+    } else {
+        if let Some(m) = try_more(steps, eval) {
+            return Some(m);
+        }
+        cont(pos, steps, eval)
+    }
+}
+
+#[test]
+fn test_start_symbol_fast_skip_and_subset_skip() {
+    use datafusion_match_recognize::ast::SubsetDef;
+    let declared = vec!["a".into(), "b".into(), "c".into()];
+    let pattern = Pattern::Concat(vec![
+        Pattern::Symbol(SymbolRef::Named("a".into())),
+        Pattern::Symbol(SymbolRef::Named("b".into())),
+        Pattern::Symbol(SymbolRef::Named("c".into())),
+    ]);
+    let subsets = vec![SubsetDef {
+        name: "u".into(),
+        members: vec!["b".into(), "c".into()],
+    }];
+    let program = Program::compile_with_subsets(
+        &pattern,
+        &declared,
+        &subsets,
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(program.start_symbols_mask, Some(0b001));
+
+    let mut bitmasks = vec![0u64; 100];
+    bitmasks[50] = 0b001;
+    bitmasks[51] = 0b010;
+    bitmasks[52] = 0b100;
+    let symbols = PartitionSymbols::from_bitmasks(bitmasks, 3);
+    let mut matcher = Matcher::new(&program);
+    let (events, stats) = matcher
+        .match_partition(
+            &symbols,
+            &AfterMatchSkip::ToLast("u".into()),
+            RowsPerMatch::OneRow,
+        )
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        stats.fast_skipped_rows >= 95,
+        "expected >= 95 fast-skipped rows, got {}",
+        stats.fast_skipped_rows
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 600,
+        max_shrink_iters: 1000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn fuzz_stateful_pikevm_matches_reference_oracle(
+        pattern in arb_pattern(),
+        vals in prop::collection::vec(0i32..10i32, 0..=8),
+        a_flags in prop::collection::vec(any::<bool>(), 0..=8),
+    ) {
+        let len = vals.len().min(a_flags.len());
+        let vals = vals[..len].to_vec();
+        let bitmasks: Vec<u64> = a_flags[..len].iter().map(|&b| if b { 1 } else { 0 }).collect();
+        let declared = vec!["a".into(), "b".into(), "c".into()];
+        let program = Program::compile(&pattern, &declared, MatchRecognizeConfig::default()).unwrap();
+        let symbols = PartitionSymbols::from_bitmasks(bitmasks, 3);
+
+        for start_row in 0..len {
+            let mut eval_ref = TestStatefulEval { vals: vals.clone() };
+            let mut steps_buf = Vec::new();
+            let expected = ref_eval_stateful(
+                &pattern,
+                start_row,
+                0,
+                &symbols,
+                &program,
+                &mut eval_ref,
+                &mut steps_buf,
+                &|_, st, _| Some(st.clone()),
+            );
+
+            let mut eval_vm = TestStatefulEval { vals: vals.clone() };
+            let mut matcher = Matcher::new(&program);
+            let mut stats = Default::default();
+            let actual = matcher
+                .find_match_at_stateful(&symbols, start_row, 1, &mut eval_vm, &mut stats)
+                .unwrap();
+
+            prop_assert_eq!(
+                actual,
+                expected,
+                "Stateful mismatch for pattern={}, vals={:?}, start_row={}",
+                pattern,
+                vals,
+                start_row
+            );
+        }
+    }
+}

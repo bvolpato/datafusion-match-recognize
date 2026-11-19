@@ -104,6 +104,7 @@ message AggSlotProto {
   AggKindProto agg_kind = 1;
   optional string symbol = 2;
   optional bytes inner_expr = 3;
+  bool distinct = 4;
 }
 
 message CurrentRowSlotProto {
@@ -116,9 +117,22 @@ message MeasureSpecProto {
   repeated MeasureSlotProto slots = 3;
 }
 
+message StatefulSymbolDefProto {
+  bytes outer_expr = 1;
+  repeated MeasureSlotProto slots = 2;
+}
+
 message SymbolDefProto {
   string name = 1;
+  // Stateless row-local predicate (populated when stateful is absent).
   bytes predicate = 2;
+  // Stateful match-dependent predicate (populated when symbol uses PREV/NEXT/FIRST/LAST/aggs/cross-symbol refs).
+  StatefulSymbolDefProto stateful = 3;
+}
+
+message SubsetDefProto {
+  string name = 1;
+  repeated string members = 2;
 }
 
 message OrderBySpecProto {
@@ -138,6 +152,8 @@ message MatchRecognizeLogicalNodeProto {
   repeated SymbolDefProto definitions = 7;
   uint32 max_permute_elements = 8;
   uint32 max_nfa_states = 9;
+  uint32 max_active_threads = 10;
+  repeated SubsetDefProto subsets = 11;
 }
 
 // Serialized payload for PhysicalExtensionCodec (MatchRecognizeExec).
@@ -151,4 +167,6 @@ message MatchRecognizePhysicalNodeProto {
   repeated SymbolDefProto definitions = 7;
   uint32 max_permute_elements = 8;
   uint32 max_nfa_states = 9;
+  uint32 max_active_threads = 10;
+  repeated SubsetDefProto subsets = 11;
 }
