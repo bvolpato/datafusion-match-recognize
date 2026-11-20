@@ -257,3 +257,67 @@ MATCH_RECOGNIZE (ORDER BY id MEASURES count(A.price < 5 OR CLASSIFIER(B) > 'Y') 
 statement error must match
 SELECT * FROM neg_t
 MATCH_RECOGNIZE (ORDER BY id MEASURES count(A.price < 5 OR CLASSIFIER() > 'Y') AS x PATTERN (A B+) DEFINE B AS true);
+
+# 11. RisingWave validation cases: PERMUTE cap, nested NFA state cap, DISTINCT/FILTER/OVER/IGNORE NULLS on nav in DEFINE
+statement error PERMUTE supports at most
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (PERMUTE(a, b, c, d, e, f, g, h, i))
+  DEFINE a AS true
+);
+
+statement error maximum NFA instruction limit
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (PERMUTE(a, b, c, d, e, f, g))
+  DEFINE a AS true
+);
+
+statement error maximum NFA instruction limit
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN ((a{900}){900} b)
+  DEFINE a AS true, b AS true
+);
+
+statement error DISTINCT is not valid
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES a.price AS p
+  PATTERN (a b)
+  DEFINE a AS a.price > 0, b AS b.price < last(DISTINCT a.price)
+);
+
+statement error FILTER clause
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES a.price AS p
+  PATTERN (a b)
+  DEFINE a AS a.price > 0, b AS b.price < last(a.price) FILTER (WHERE a.price > 0)
+);
+
+statement error Cannot nest window function
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES a.price AS p
+  PATTERN (a b)
+  DEFINE a AS a.price > 0, b AS b.price < last(a.price) OVER ()
+);
+
+statement error IGNORE/RESPECT NULLS
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES a.price AS p
+  PATTERN (a b)
+  DEFINE a AS a.price > 0, b AS b.price < prev(b.price, 1) IGNORE NULLS
+);

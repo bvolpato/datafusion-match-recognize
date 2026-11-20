@@ -9,6 +9,11 @@ udafs = "udafs"
 pn = "pn"
 # sqllogictest column-type descriptor (Integer, Integer, Text)
 IIT = "IIT"
+IIIT = "IIIT"
+IIIIT = "IIIIT"
+IIIIIT = "IIIIIT"
+IITT = "IITT"
+TITTIII = "TITTIII"
 
 [files]
 extend-exclude = [

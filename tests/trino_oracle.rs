@@ -1548,13 +1548,103 @@ async fn test_live_trino_differential_oracle() {
             )
             "#,
         ),
+        (
+            "risingwave_self_ref_define_tautology_and_equal_runs",
+            r#"
+            WITH t(id, ts, v) AS (
+                VALUES (1, 1, 7), (1, 2, 7), (1, 3, 9), (1, 4, 11), (1, 5, 11), (1, 6, 11)
+            )
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY id
+                ORDER BY ts
+                MEASURES first(a.v) AS v_first, last(a.v) AS v_last, count(*) AS n
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (a+)
+                DEFINE a AS first(a.v) = a.v AND last(a.v) = a.v
+            )
+            ORDER BY v_first
+            "#,
+        ),
+        (
+            "risingwave_nested_nav_case_in_distinct_array_subscript",
+            r#"
+            WITH t(id, ts, v) AS (
+                VALUES (1, 1, 5), (1, 2, 10), (1, 3, 2), (1, 4, 20)
+            )
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY id
+                ORDER BY ts
+                MEASURES a.v AS av, b.v AS bv
+                ONE ROW PER MATCH
+                PATTERN (a b)
+                DEFINE
+                    a AS a.v > 0,
+                    b AS b.v > CASE WHEN prev(b.v) > 0 THEN prev(b.v) ELSE 0 END
+                        AND b.v NOT IN (prev(b.v), last(a.v))
+                        AND (prev(b.v) IS DISTINCT FROM b.v)
+                        AND ((ARRAY[prev(b.v), last(a.v)])[1] < b.v)
+            )
+            ORDER BY av
+            "#,
+        ),
+        (
+            "snowflake_stock_vshape_date_columns_and_skip_to_last",
+            r#"
+            WITH sf_stocks(company, price_date, price) AS (
+                VALUES
+                    ('ABCD', DATE '2020-10-01', 50), ('XYZ', DATE '2020-10-01', 89),
+                    ('ABCD', DATE '2020-10-02', 36), ('XYZ', DATE '2020-10-02', 24),
+                    ('ABCD', DATE '2020-10-03', 39), ('XYZ', DATE '2020-10-03', 37),
+                    ('ABCD', DATE '2020-10-04', 42), ('XYZ', DATE '2020-10-04', 63),
+                    ('ABCD', DATE '2020-10-05', 30), ('XYZ', DATE '2020-10-05', 65),
+                    ('ABCD', DATE '2020-10-06', 47), ('XYZ', DATE '2020-10-06', 56),
+                    ('ABCD', DATE '2020-10-07', 71), ('XYZ', DATE '2020-10-07', 50),
+                    ('ABCD', DATE '2020-10-08', 80), ('XYZ', DATE '2020-10-08', 54),
+                    ('ABCD', DATE '2020-10-09', 75), ('XYZ', DATE '2020-10-09', 30),
+                    ('ABCD', DATE '2020-10-10', 63), ('XYZ', DATE '2020-10-10', 32)
+            )
+            SELECT * FROM sf_stocks
+            MATCH_RECOGNIZE (
+                PARTITION BY company
+                ORDER BY price_date
+                MEASURES
+                    MATCH_NUMBER() AS match_number,
+                    FIRST(price_date) AS start_date,
+                    LAST(price_date) AS end_date,
+                    COUNT(*) AS rows_in_sequence,
+                    COUNT(row_with_price_decrease.*) AS num_decreases,
+                    COUNT(row_with_price_increase.*) AS num_increases
+                ONE ROW PER MATCH
+                AFTER MATCH SKIP TO LAST row_with_price_increase
+                PATTERN (row_before_decrease row_with_price_decrease+ row_with_price_increase+)
+                DEFINE
+                    row_with_price_decrease AS price < PREV(price),
+                    row_with_price_increase AS price > PREV(price)
+            )
+            WHERE company = 'ABCD'
+            ORDER BY company, match_number
+            "#,
+        ),
+        (
+            "err_parity_last_distinct_in_define",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES a.v AS p PATTERN (a b)
+                DEFINE a AS a.v > 0, b AS b.v < last(DISTINCT a.v)
+            )
+            "#,
+        ),
     ];
 
     for (name, sql) in &edge_cases {
         assert_matches_trino(&client, &base_url, name, sql).await;
     }
 
-    // 6. Augmented seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (150 queries)
+    // 6. Augmented seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (200 queries)
     let mut rng_state: u64 = 0x5EED_CAFE_1234_ABCD;
     let mut next_u64 = || -> u64 {
         rng_state ^= rng_state << 13;
@@ -1563,52 +1653,68 @@ async fn test_live_trino_differential_oracle() {
         rng_state
     };
 
-    let rand_patterns: &[(&str, &str, bool)] = &[
+    // (pattern, defines, has_exclusion, can_skip_to_last_b)
+    let rand_patterns: &[(&str, &str, bool, bool)] = &[
         (
             "a b* c?",
             "a AS v >= 1 AND v <= 4, b AS v >= 3 AND v <= 6, c AS v >= 5",
             false,
+            false,
         ),
-        ("(a | a b)", "a AS v <= 4, b AS v >= 3", false),
+        ("(a | a b)", "a AS v <= 4, b AS v >= 3", false, false),
         (
             "s d+ u+",
             "d AS d.v < PREV(d.v), u AS u.v > PREV(u.v)",
             false,
+            false,
         ),
-        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)", false),
+        ("a+ b+", "a AS a.v <= 5, b AS b.v > AVG(a.v)", false, true),
         (
             "a b+",
             "a AS v >= 2, b AS b.v - FIRST(a.v) <= 3 AND COUNT(b.*) <= 3",
             false,
+            true,
         ),
-        ("PERMUTE(a, b)", "a AS v <= 4, b AS v >= 4", false),
-        ("a*", "a AS v >= 2 AND v <= 6", false),
-        ("({- a -}) b+", "a AS v <= 4, b AS v >= 3", true),
-        ("({- a -}) | b", "a AS v <= 3, b AS v >= 5", true),
+        ("PERMUTE(a, b)", "a AS v <= 4, b AS v >= 4", false, false),
+        ("a*", "a AS v >= 2 AND v <= 6", false, false),
+        ("({- a -}) b+", "a AS v <= 4, b AS v >= 3", true, true),
+        ("({- a -}) | b", "a AS v <= 3, b AS v >= 5", true, false),
         (
             "a{0,2} b+",
             "a AS v <= 5 AND MATCH_NUMBER() <= 3, b AS v >= 4",
             false,
+            false,
         ),
-        ("^ a+ b*", "a AS v >= 2, b AS b.v >= PREV(b.v)", false),
+        (
+            "^ a+ b*",
+            "a AS v >= 2, b AS b.v >= PREV(b.v)",
+            false,
+            false,
+        ),
         (
             "a+ b $",
             "a AS v <= 6, b AS PREV(CLASSIFIER()) = 'A' AND b.v >= 2",
             false,
+            true,
         ),
+        ("a+", "a AS FIRST(a.v) = a.v", false, false),
+        ("(c | c? | a)*", "c AS v >= 5, a AS v <= 3", false, false),
+        ("a b b", "a AS v >= 2, b AS v >= 2", false, true),
     ];
     let rand_orders = [
         "ORDER BY id ASC NULLS LAST",
         "ORDER BY id DESC NULLS FIRST",
         "ORDER BY id ASC NULLS FIRST",
+        "ORDER BY id DESC NULLS LAST",
     ];
     let rand_skips = [
         "AFTER MATCH SKIP PAST LAST ROW",
         "AFTER MATCH SKIP TO NEXT ROW",
+        "AFTER MATCH SKIP TO LAST b",
     ];
 
     let mut random_checked = 0usize;
-    for q in 0..150usize {
+    for q in 0..200usize {
         let num_parts = (next_u64() % 3 + 1) as usize;
         let mut value_rows = Vec::new();
         for p in 1..=num_parts {
@@ -1624,10 +1730,11 @@ async fn test_live_trino_differential_oracle() {
             }
         }
         let values_sql = value_rows.join(", ");
-        let (pat, defs, has_excl) =
+        let (pat, defs, has_excl, can_skip_b) =
             rand_patterns[(next_u64() as usize) % rand_patterns.len()];
         let ord = rand_orders[(next_u64() as usize) % rand_orders.len()];
-        let skip = rand_skips[(next_u64() as usize) % rand_skips.len()];
+        let skip_idx = (next_u64() as usize) % if can_skip_b { 3 } else { 2 };
+        let skip = rand_skips[skip_idx];
         let mode_choice = (next_u64() % 4) as usize;
         let (mode, outer_ord) = match mode_choice {
             0 => ("ONE ROW PER MATCH", "ORDER BY m.p, m.mn"),
@@ -1671,7 +1778,11 @@ async fn test_live_trino_differential_oracle() {
                     FIRST(v) AS fv,
                     LAST(v) AS lv,
                     COUNT(*) AS cnt,
-                    SUM(v) AS sv
+                    COUNT() AS cnt0,
+                    SUM(v) AS sv,
+                    MIN(v) AS min_v,
+                    MAX(v) AS max_v,
+                    BOOL_OR(v > 4) AS any_gt4
                 {mode}
                 {skip}
                 PATTERN ({pat})

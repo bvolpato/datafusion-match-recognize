@@ -421,6 +421,30 @@ fn is_stateful_define(
         SqlExpr::Tuple(elems) => elems
             .iter()
             .any(|e| is_stateful_define(e, current_symbol, known_symbols, ctx)),
+        SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            is_stateful_define(root, current_symbol, known_symbols, ctx)
+                || access_chain.iter().any(|a| match a {
+                    ast::AccessExpr::Dot(e) => {
+                        is_stateful_define(e, current_symbol, known_symbols, ctx)
+                    }
+                    ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                        is_stateful_define(index, current_symbol, known_symbols, ctx)
+                    }
+                    ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => {
+                        lower_bound.as_ref().is_some_and(|e| {
+                            is_stateful_define(e, current_symbol, known_symbols, ctx)
+                        }) || upper_bound.as_ref().is_some_and(|e| {
+                            is_stateful_define(e, current_symbol, known_symbols, ctx)
+                        }) || stride.as_ref().is_some_and(|e| {
+                            is_stateful_define(e, current_symbol, known_symbols, ctx)
+                        })
+                    }
+                })
+        }
         SqlExpr::Between {
             expr, low, high, ..
         } => {
@@ -628,6 +652,36 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
                 .map(|e| strip_self_qualifier(e, current_symbol))
                 .collect(),
         ),
+        SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            SqlExpr::CompoundFieldAccess {
+                root: Box::new(strip_self_qualifier(*root, current_symbol)),
+                access_chain: access_chain
+                    .into_iter()
+                    .map(|a| match a {
+                        ast::AccessExpr::Dot(e) => {
+                            ast::AccessExpr::Dot(strip_self_qualifier(e, current_symbol))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            ast::AccessExpr::Subscript(ast::Subscript::Index {
+                                index: strip_self_qualifier(index, current_symbol),
+                            })
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound: lower_bound
+                                .map(|e| strip_self_qualifier(e, current_symbol)),
+                            upper_bound: upper_bound
+                                .map(|e| strip_self_qualifier(e, current_symbol)),
+                            stride: stride
+                                .map(|e| strip_self_qualifier(e, current_symbol)),
+                        }),
+                    })
+                    .collect(),
+            }
+        }
         SqlExpr::Between {
             expr,
             negated,
@@ -1001,6 +1055,36 @@ impl SlotExtractor<'_, '_> {
                     .map(|e| self.rewrite_outer(e))
                     .collect::<Result<Vec<_>>>()?,
             )),
+            SqlExpr::CompoundFieldAccess { root, access_chain } => {
+                let root = Box::new(self.rewrite_outer(*root)?);
+                let access_chain = access_chain
+                    .into_iter()
+                    .map(|a| match a {
+                        ast::AccessExpr::Dot(e) => {
+                            Ok(ast::AccessExpr::Dot(self.rewrite_outer(e)?))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            Ok(ast::AccessExpr::Subscript(ast::Subscript::Index {
+                                index: self.rewrite_outer(index)?,
+                            }))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => Ok(ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound: lower_bound
+                                .map(|e| self.rewrite_outer(e))
+                                .transpose()?,
+                            upper_bound: upper_bound
+                                .map(|e| self.rewrite_outer(e))
+                                .transpose()?,
+                            stride: stride.map(|e| self.rewrite_outer(e)).transpose()?,
+                        })),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(SqlExpr::CompoundFieldAccess { root, access_chain })
+            }
             SqlExpr::Cast {
                 kind,
                 expr,
@@ -1448,6 +1532,11 @@ fn check_function_clauses(func: &ast::Function) -> Result<()> {
     if !func.within_group.is_empty() {
         return plan_err!(
             "Cannot use WITHIN GROUP with '{fname}()' inside MATCH_RECOGNIZE"
+        );
+    }
+    if func.null_treatment.is_some() {
+        return plan_err!(
+            "Cannot use IGNORE/RESPECT NULLS with '{fname}()' inside MATCH_RECOGNIZE"
         );
     }
     if let FunctionArguments::List(list) = &func.args
@@ -2024,6 +2113,36 @@ impl<'a> PatternArgAnalyzer<'a> {
                     .map(|e| self.rewrite(e))
                     .collect::<Result<Vec<_>>>()?,
             )),
+            SqlExpr::CompoundFieldAccess { root, access_chain } => {
+                let root = Box::new(self.rewrite(*root)?);
+                let access_chain = access_chain
+                    .into_iter()
+                    .map(|a| match a {
+                        ast::AccessExpr::Dot(e) => {
+                            Ok(ast::AccessExpr::Dot(self.rewrite(e)?))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            Ok(ast::AccessExpr::Subscript(ast::Subscript::Index {
+                                index: self.rewrite(index)?,
+                            }))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => Ok(ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound: lower_bound
+                                .map(|e| self.rewrite(e))
+                                .transpose()?,
+                            upper_bound: upper_bound
+                                .map(|e| self.rewrite(e))
+                                .transpose()?,
+                            stride: stride.map(|e| self.rewrite(e)).transpose()?,
+                        })),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(SqlExpr::CompoundFieldAccess { root, access_chain })
+            }
             other => Ok(other),
         }
     }

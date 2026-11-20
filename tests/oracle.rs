@@ -1424,7 +1424,7 @@ fn ref_eval_measures_oracle(
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 500,
+        cases: 800,
         max_shrink_iters: 1000,
         .. ProptestConfig::default()
     })]

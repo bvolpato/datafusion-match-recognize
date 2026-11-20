@@ -1,0 +1,303 @@
+# SPDX-License-Identifier: Apache-2.0
+# Ported from RisingWave's e2e_test/streaming/match_recognize*.slt suites and
+# Snowflake's official MATCH_RECOGNIZE stock V-shape documentation example.
+
+# 1. RisingWave match_recognize.slt: out-of-order input + SKIP PAST LAST ROW vs SKIP TO NEXT ROW
+statement ok
+CREATE TABLE rw_t (id INT, ts INT, v INT) AS VALUES
+  (1, 1, 10), (1, 3, 8), (1, 2, -5), (1, 4, -3), (1, 5, 2),
+  (2, 1, 5),  (2, 2, 6), (2, 3, 7),  (2, 4, -1);
+
+query II
+SELECT * FROM rw_t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES b.v AS dip
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a b)
+  DEFINE a AS a.v > 0, b AS b.v < 0
+)
+ORDER BY id, dip;
+----
+1 -5
+1 -3
+2 -1
+
+query II
+SELECT * FROM rw_t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES a.v AS v2
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO NEXT ROW
+  PATTERN (a a)
+  DEFINE a AS a.v > 0
+)
+ORDER BY id, v2;
+----
+2 6
+2 7
+
+# 2. RisingWave match_recognize_skip.slt: overlapping SKIP TO LAST b
+query IIII
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 10), (1, 2, 20), (1, 3, 30), (1, 4, 40), (1, 5, 50), (1, 6, 60)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES first(a.v) AS a0, last(b.v) AS b_last, count(*) AS n
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST b
+  PATTERN (a b b)
+  DEFINE a AS a.v > 0, b AS b.v > 0
+)
+ORDER BY a0;
+----
+1 10 30 3
+1 30 50 3
+
+# 3. RisingWave match_recognize_permute.slt: PERMUTE(a, b) matches both orderings
+query II
+WITH t(id, ts, v) AS (
+  VALUES
+    (1, 1, -1), (1, 2, 5), (1, 3, 0),
+    (2, 1, 5),  (2, 2, -1), (2, 3, 0)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (PERMUTE(a, b))
+  DEFINE a AS a.v > 0, b AS b.v < 0
+)
+ORDER BY id;
+----
+1 2
+2 2
+
+# 4. RisingWave match_recognize_aggregate.slt & match_recognize_navigation.slt
+query IIIIIIRI
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 10), (1, 2, 20), (1, 3, 30), (1, 4, -3), (1, 5, 1)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES
+    count(*) AS n,
+    count(a.v) AS a_cnt,
+    min(a.v) AS lo,
+    max(a.v) AS hi,
+    sum(a.v) AS total,
+    avg(a.v) AS mean,
+    b.v AS dip
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a+ b)
+  DEFINE a AS a.v > 0, b AS b.v < 0
+);
+----
+1 4 3 10 30 60 20.0 -3
+
+query IIIIIT
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 10), (1, 2, 20), (1, 3, -5), (1, 4, 1)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES
+    first(a.v) AS first_up,
+    last(a.v) AS last_up,
+    b.v AS dip,
+    b.v - a.v AS spread,
+    classifier() AS cls
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a+ b)
+  DEFINE a AS a.v > 0, b AS b.v < 0
+);
+----
+1 10 20 -5 -25 B
+
+# 5. RisingWave match_recognize_define_running.slt: self-referential LAST(a.v) = a.v & FIRST(a.v) = a.v runs
+query III
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 10), (1, 2, 20), (1, 3, 5)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES a.v AS av, b.v AS bv
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a b)
+  DEFINE a AS last(a.v) = a.v, b AS b.v > a.v
+);
+----
+1 10 20
+
+query IIII
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 7), (1, 2, 7), (1, 3, 9), (1, 4, 11), (1, 5, 11), (1, 6, 11)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES first(a.v) AS v_first, last(a.v) AS v_last, count(*) AS n
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a+)
+  DEFINE a AS first(a.v) = a.v
+)
+ORDER BY v_first;
+----
+1 7 7 2
+1 9 9 1
+1 11 11 3
+
+# 6. RisingWave match_recognize_order_multi.slt: secondary ORDER BY tie-breaking
+query III
+WITH t(id, ts, k, v) AS (
+  VALUES (1, 1, 2, -1), (1, 1, 1, 5), (1, 20, 9, 0)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts, k
+  MEASURES a.v AS av, b.v AS bv
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a b)
+  DEFINE a AS a.v > 0, b AS b.v < 0
+);
+----
+1 5 -1
+
+# 7. RisingWave match_recognize_long_match.slt: iterative NFA over a{600} across 1,300 rows
+query III
+WITH t AS (
+  SELECT 1 AS id, value AS ts, 1 AS v FROM generate_series(1, 1300)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES a.ts AS t_last, count(*) AS n
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a{600})
+  DEFINE a AS a.v > 0
+)
+ORDER BY t_last;
+----
+1 600 600
+1 1200 600
+
+# 8. RisingWave match_recognize_validation.slt: navigation nested in CASE, NOT IN, IS DISTINCT FROM, and ARRAY[...][1] subscript
+query III
+WITH t(id, ts, v) AS (
+  VALUES (1, 1, 5), (1, 2, 10), (1, 3, 2), (1, 4, 20)
+)
+SELECT * FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES a.v AS av, b.v AS bv
+  ONE ROW PER MATCH
+  PATTERN (a b)
+  DEFINE
+    a AS a.v > 0,
+    b AS b.v > CASE WHEN prev(b.v) > 0 THEN prev(b.v) ELSE 0 END
+      AND b.v NOT IN (prev(b.v), last(a.v))
+      AND (prev(b.v) IS DISTINCT FROM b.v)
+      AND ((ARRAY[prev(b.v), last(a.v)])[1] < b.v)
+)
+ORDER BY av;
+----
+1 2 20
+1 5 10
+
+# 9. RisingWave match_recognize_projection.slt: projecting only partition key preserves duplicate match rows
+query I
+WITH tp(id, ts, v) AS (
+  VALUES
+    (1, 1, 5), (1, 2, -1), (1, 3, 5), (1, 4, -1), (1, 5, 0),
+    (2, 1, 9), (2, 2, -2), (2, 3, 0)
+)
+SELECT id FROM tp
+MATCH_RECOGNIZE (
+  PARTITION BY id
+  ORDER BY ts
+  MEASURES b.v AS dip
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a b)
+  DEFINE a AS a.v > 0, b AS b.v < 0
+)
+ORDER BY id;
+----
+1
+1
+2
+
+# 10. Snowflake official stock_price_history V-shape over DATE columns + SKIP TO LAST + COUNT(sym.*) + WHERE pushdown
+statement ok
+CREATE TABLE sf_stocks (company VARCHAR, price_date DATE, price INT) AS VALUES
+  ('ABCD', DATE '2020-10-01', 50),
+  ('XYZ',  DATE '2020-10-01', 89),
+  ('ABCD', DATE '2020-10-02', 36),
+  ('XYZ',  DATE '2020-10-02', 24),
+  ('ABCD', DATE '2020-10-03', 39),
+  ('XYZ',  DATE '2020-10-03', 37),
+  ('ABCD', DATE '2020-10-04', 42),
+  ('XYZ',  DATE '2020-10-04', 63),
+  ('ABCD', DATE '2020-10-05', 30),
+  ('XYZ',  DATE '2020-10-05', 65),
+  ('ABCD', DATE '2020-10-06', 47),
+  ('XYZ',  DATE '2020-10-06', 56),
+  ('ABCD', DATE '2020-10-07', 71),
+  ('XYZ',  DATE '2020-10-07', 50),
+  ('ABCD', DATE '2020-10-08', 80),
+  ('XYZ',  DATE '2020-10-08', 54),
+  ('ABCD', DATE '2020-10-09', 75),
+  ('XYZ',  DATE '2020-10-09', 30),
+  ('ABCD', DATE '2020-10-10', 63),
+  ('XYZ',  DATE '2020-10-10', 32);
+
+query TITTIII
+SELECT * FROM sf_stocks
+MATCH_RECOGNIZE (
+  PARTITION BY company
+  ORDER BY price_date
+  MEASURES
+    MATCH_NUMBER() AS match_number,
+    FIRST(price_date) AS start_date,
+    LAST(price_date) AS end_date,
+    COUNT(*) AS rows_in_sequence,
+    COUNT(row_with_price_decrease.*) AS num_decreases,
+    COUNT(row_with_price_increase.*) AS num_increases
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST row_with_price_increase
+  PATTERN (row_before_decrease row_with_price_decrease+ row_with_price_increase+)
+  DEFINE
+    row_with_price_decrease AS price < PREV(price),
+    row_with_price_increase AS price > PREV(price)
+)
+WHERE company = 'ABCD'
+ORDER BY company, match_number;
+----
+ABCD 1 2020-10-01 2020-10-04 4 1 2
+ABCD 2 2020-10-04 2020-10-08 5 1 3

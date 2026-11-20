@@ -141,6 +141,7 @@ This crate builds on work across the Apache DataFusion, Trino, Apache Calcite, a
 - Trino (`trinodb/trino`) for its SQL:2016 row pattern bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` / `TestAggregationsInRowPatternMatching` / `TestPatternMatchingMachine` test suites, which shaped our NFA compilation and live differential oracle.
 - Apache Calcite (`apache/calcite`) for its `match.iq` SQL:2016 test cases.
 - Apache Flink (`apache/flink`) for its `MatchRecognizeITCase` batch and streaming SQL test cases.
+- RisingWave (`risingwavelabs/risingwave`) for its `e2e_test/streaming/match_recognize*.slt` SQL logic test suites.
 
 ## License
 

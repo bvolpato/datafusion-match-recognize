@@ -579,6 +579,33 @@ fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
                 .map(|e| qualify_identifiers(e, sym))
                 .collect(),
         ),
+        SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            SqlExpr::CompoundFieldAccess {
+                root: Box::new(qualify_identifiers(*root, sym)),
+                access_chain: access_chain
+                    .into_iter()
+                    .map(|a| match a {
+                        ast::AccessExpr::Dot(e) => {
+                            ast::AccessExpr::Dot(qualify_identifiers(e, sym))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            ast::AccessExpr::Subscript(ast::Subscript::Index {
+                                index: qualify_identifiers(index, sym),
+                            })
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound: lower_bound.map(|e| qualify_identifiers(e, sym)),
+                            upper_bound: upper_bound.map(|e| qualify_identifiers(e, sym)),
+                            stride: stride.map(|e| qualify_identifiers(e, sym)),
+                        }),
+                    })
+                    .collect(),
+            }
+        }
         other => other,
     }
 }
@@ -723,6 +750,33 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
                 .map(|e| substitute_slots(e, map))
                 .collect(),
         ),
+        SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            SqlExpr::CompoundFieldAccess {
+                root: Box::new(substitute_slots(*root, map)),
+                access_chain: access_chain
+                    .into_iter()
+                    .map(|a| match a {
+                        ast::AccessExpr::Dot(e) => {
+                            ast::AccessExpr::Dot(substitute_slots(e, map))
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                            ast::AccessExpr::Subscript(ast::Subscript::Index {
+                                index: substitute_slots(index, map),
+                            })
+                        }
+                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound,
+                            upper_bound,
+                            stride,
+                        }) => ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                            lower_bound: lower_bound.map(|e| substitute_slots(e, map)),
+                            upper_bound: upper_bound.map(|e| substitute_slots(e, map)),
+                            stride: stride.map(|e| substitute_slots(e, map)),
+                        }),
+                    })
+                    .collect(),
+            }
+        }
         other => other,
     }
 }
