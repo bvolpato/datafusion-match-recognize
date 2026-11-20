@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Builder, Int64Builder, RecordBatch,
-    RecordBatchOptions, StringBuilder, UInt32Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Float64Array, Float64Builder, Int32Array, Int64Array,
+    Int64Builder, RecordBatch, RecordBatchOptions, StringBuilder, UInt32Array,
+    new_null_array,
 };
 use arrow::compute::{self, kernels::zip};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -17,12 +18,19 @@ use datafusion_common::{
     DataFusionError, HashMap, HashSet, Result, ScalarValue, exec_err,
     internal_datafusion_err,
 };
+use datafusion_expr::Operator;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
+};
 
 use crate::ast::{AggKind, EvalSemantics, LogicalNavKind, PhysicalNavKind, RowsPerMatch};
 use crate::logical::build_agg_metadata_arrow_schema;
-use crate::matcher::{FoundMatch, MatchStep, PartitionEvent, StatefulPredicateEvaluator};
+use crate::matcher::{
+    FlatMatchPool, FlatPartitionEvent, MatchStep, PartitionEvent,
+    StatefulPredicateEvaluator,
+};
 use crate::pattern::{Program, SymbolId, SymbolSet};
 
 /// Physical counterpart of [`crate::ast::MeasureSlotKind`].
@@ -80,12 +88,950 @@ pub struct PhysicalMeasure {
     pub slots: Vec<PhysicalMeasureSlot>,
 }
 
+/// Evaluates `expr` on `batch`, avoiding `PhysicalExpr::evaluate` overhead for direct [`Column`] refs.
+#[inline]
+pub(crate) fn eval_expr_or_col(
+    expr: &Arc<dyn PhysicalExpr>,
+    batch: &RecordBatch,
+    num_rows: usize,
+) -> Result<ArrayRef> {
+    if let Some(col) = expr.downcast_ref::<Column>() {
+        return Ok(Arc::clone(batch.column(col.index())));
+    }
+    expr.evaluate(batch)?.into_array(num_rows)
+}
+
+/// Returns true when a stateful `DEFINE` symbol depends ONLY on the current row and
+/// self-anchored `PREV`/`NEXT` physical shifts (no match history, no aggregates, no metadata).
+///
+/// Because `RUNNING LAST(self)` on a tentative transition `(pos, self)` is always `pos`,
+/// `PREV(self.col, k)` is identically `col[pos - k]` within `[part_start, part_end)` (and `NULL`
+/// outside), so the entire predicate can be evaluated once in vectorized Arrow into the Tier 1
+/// bitmask!
+pub fn is_physical_only_stateful(
+    sym_id: SymbolId,
+    slots: &[PhysicalMeasureSlot],
+) -> bool {
+    slots.iter().all(|slot| match &slot.kind {
+        PhysicalMeasureSlotKind::CurrentRow { .. } => true,
+        PhysicalMeasureSlotKind::Nav {
+            logical_nav,
+            logical_offset,
+            physical_nav: Some(_),
+            symbol_set,
+            uses_match_metadata: false,
+            ..
+        } => {
+            *logical_offset == 0
+                && matches!(logical_nav, None | Some(LogicalNavKind::Last))
+                && match symbol_set {
+                    None => true,
+                    Some(SymbolSet::Single(id)) => *id == sym_id,
+                    Some(set) => set.contains(sym_id),
+                }
+        }
+        _ => false,
+    })
+}
+
+/// Evaluates a physical-only stateful `DEFINE` predicate directly into `bitmasks` (`bit` set on
+/// every row where the predicate holds), using a zero-allocation primitive fast path when
+/// possible and falling back to vectorized Arrow evaluation for general expressions.
+pub fn eval_physical_only_into_bitmask(
+    batch: &RecordBatch,
+    runs: &[(usize, usize)],
+    outer_expr: &Arc<dyn PhysicalExpr>,
+    slot_schema: &SchemaRef,
+    slots: &[PhysicalMeasureSlot],
+    bitmasks: &mut [u64],
+    bit: u64,
+) -> Result<()> {
+    // Zero-allocation fast path: compile outer_expr to FastScalarExpr and evaluate directly
+    // over raw primitive Arrow slices without allocating shift index arrays, take buffers,
+    // slot RecordBatches, or BooleanArrays.
+    if let Some(fast_expr) = try_compile_fast_scalar_expr(outer_expr) {
+        let num_rows = batch.num_rows();
+        let mut slot_specs: Vec<(
+            FastPrecomputedArray,
+            Option<(PhysicalNavKind, usize)>,
+        )> = Vec::with_capacity(slots.len());
+        let mut all_fast = true;
+        for slot in slots {
+            match &slot.kind {
+                PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+                    let arr = eval_expr_or_col(inner_expr, batch, num_rows)?;
+                    let fa = FastPrecomputedArray::from_array(&arr);
+                    if !fa.is_supported() {
+                        all_fast = false;
+                        break;
+                    }
+                    slot_specs.push((fa, None));
+                }
+                PhysicalMeasureSlotKind::Nav {
+                    physical_nav: Some(pnav),
+                    physical_offset,
+                    inner_expr,
+                    ..
+                } => {
+                    let arr = eval_expr_or_col(inner_expr, batch, num_rows)?;
+                    let fa = FastPrecomputedArray::from_array(&arr);
+                    if !fa.is_supported() {
+                        all_fast = false;
+                        break;
+                    }
+                    slot_specs.push((fa, Some((*pnav, *physical_offset as usize))));
+                }
+                _ => {
+                    all_fast = false;
+                    break;
+                }
+            }
+        }
+        if all_fast {
+            // Ultra-fast specialized loop for common 2-slot `col <op> PREV(col, off)` comparisons
+            // (e.g. V-shape `down.price < PREV(down.price)`): zero per-row dynamic dispatch,
+            // auto-vectorizes cleanly over raw Arrow primitive slices.
+            if let FastScalarExpr::Bin { op, left, right } = &fast_expr
+                && let (FastScalarExpr::Slot(l_idx), FastScalarExpr::Slot(r_idx)) =
+                    (left.as_ref(), right.as_ref())
+                && slot_specs.len() == 2
+                && let (FastPrecomputedArray::Int64(la), None) = &slot_specs[*l_idx]
+                && let (
+                    FastPrecomputedArray::Int64(ra),
+                    Some((PhysicalNavKind::Prev, off)),
+                ) = &slot_specs[*r_idx]
+                && la.null_count() == 0
+                && ra.null_count() == 0
+            {
+                let lv = la.values();
+                let rv = ra.values();
+                let off = *off;
+                macro_rules! cmp_loop {
+                    ($op:tt) => {
+                        for &(p_start, p_end) in runs {
+                            let first = (p_start + off).min(p_end);
+                            for r in first..p_end {
+                                if lv[r] $op rv[r - off] {
+                                    bitmasks[r] |= bit;
+                                }
+                            }
+                        }
+                    };
+                }
+                match op {
+                    Operator::Lt => {
+                        cmp_loop!(<);
+                        return Ok(());
+                    }
+                    Operator::LtEq => {
+                        cmp_loop!(<=);
+                        return Ok(());
+                    }
+                    Operator::Gt => {
+                        cmp_loop!(>);
+                        return Ok(());
+                    }
+                    Operator::GtEq => {
+                        cmp_loop!(>=);
+                        return Ok(());
+                    }
+                    Operator::Eq => {
+                        cmp_loop!(==);
+                        return Ok(());
+                    }
+                    Operator::NotEq => {
+                        cmp_loop!(!=);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut slot_vals = vec![FastVal::Null; slot_specs.len()];
+            for &(p_start, p_end) in runs {
+                for (r, mask) in bitmasks.iter_mut().enumerate().take(p_end).skip(p_start)
+                {
+                    for (i, (fa, shift)) in slot_specs.iter().enumerate() {
+                        slot_vals[i] = match shift {
+                            None => fa.get_fast(r),
+                            Some((PhysicalNavKind::Prev, off)) => {
+                                if r >= p_start + off {
+                                    fa.get_fast(r - off)
+                                } else {
+                                    FastVal::Null
+                                }
+                            }
+                            Some((PhysicalNavKind::Next, off)) => {
+                                if r + off < p_end {
+                                    fa.get_fast(r + off)
+                                } else {
+                                    FastVal::Null
+                                }
+                            }
+                        };
+                    }
+                    if matches!(fast_expr.eval(&slot_vals), FastVal::Bool(true)) {
+                        *mask |= bit;
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    let bool_arr =
+        eval_physical_only_stateful_batch(batch, runs, outer_expr, slot_schema, slots)?;
+    if bool_arr.null_count() == 0 {
+        for idx in bool_arr.values().set_indices() {
+            bitmasks[idx] |= bit;
+        }
+    } else if let Some(nulls) = bool_arr.nulls() {
+        let valid_and_true = bool_arr.values() & nulls.inner();
+        for idx in valid_and_true.set_indices() {
+            bitmasks[idx] |= bit;
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates a physical-only stateful `DEFINE` predicate across all partition runs `(p_start, p_end)`
+/// in `batch` using vectorized Arrow operations with exact per-partition boundary clamping.
+pub fn eval_physical_only_stateful_batch(
+    batch: &RecordBatch,
+    runs: &[(usize, usize)],
+    outer_expr: &Arc<dyn PhysicalExpr>,
+    slot_schema: &SchemaRef,
+    slots: &[PhysicalMeasureSlot],
+) -> Result<BooleanArray> {
+    let num_rows = batch.num_rows();
+    let mut slot_arrays: Vec<ArrayRef> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match &slot.kind {
+            PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+                slot_arrays.push(eval_expr_or_col(inner_expr, batch, num_rows)?);
+            }
+            PhysicalMeasureSlotKind::Nav {
+                physical_nav: Some(pnav),
+                physical_offset,
+                inner_expr,
+                ..
+            } => {
+                let raw = eval_expr_or_col(inner_expr, batch, num_rows)?;
+                let off = *physical_offset as usize;
+                let mut indices: Vec<Option<u32>> = vec![None; num_rows];
+                match pnav {
+                    PhysicalNavKind::Prev => {
+                        for &(p_start, p_end) in runs {
+                            let first_valid = (p_start + off).min(p_end);
+                            for (dst, r) in indices[first_valid..p_end]
+                                .iter_mut()
+                                .zip(first_valid..p_end)
+                            {
+                                *dst = Some((r - off) as u32);
+                            }
+                        }
+                    }
+                    PhysicalNavKind::Next => {
+                        for &(p_start, p_end) in runs {
+                            let valid_end = p_end.saturating_sub(off).max(p_start);
+                            for (dst, r) in indices[p_start..valid_end]
+                                .iter_mut()
+                                .zip(p_start..valid_end)
+                            {
+                                *dst = Some((r + off) as u32);
+                            }
+                        }
+                    }
+                }
+                let idx_arr = UInt32Array::from(indices);
+                slot_arrays.push(compute::take(raw.as_ref(), &idx_arr, None)?);
+            }
+            _ => {
+                return Err(internal_datafusion_err!(
+                    "eval_physical_only_stateful_batch called on non-physical-only slot"
+                ));
+            }
+        }
+    }
+    let slot_batch = RecordBatch::try_new_with_options(
+        Arc::clone(slot_schema),
+        slot_arrays,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?;
+    let evaluated = outer_expr.evaluate(&slot_batch)?.into_array(num_rows)?;
+    let bool_arr = evaluated
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "DEFINE predicate must evaluate to Boolean, got {}",
+                evaluated.data_type()
+            ))
+        })?;
+    Ok(bool_arr.clone())
+}
+
+/// Pre-filter extracted from top-level `AND` conjuncts of a Tier 2 stateful `DEFINE` that
+/// reference only `CurrentRow` slots (evaluated once per batch into the symbol bitmask).
+#[derive(Debug, Clone)]
+pub struct RowLocalPrefilter {
+    conjuncts: Vec<Arc<dyn PhysicalExpr>>,
+    slot_schema: SchemaRef,
+    /// `(slot_idx_in_full_slots, inner_expr)` for all slots referenced by `conjuncts`.
+    needed_slots: Vec<(usize, Arc<dyn PhysicalExpr>)>,
+}
+
+/// Extracts all top-level `AND` conjuncts of `outer_expr` whose columns are all `CurrentRow`.
+pub fn extract_row_local_prefilter(
+    outer_expr: &Arc<dyn PhysicalExpr>,
+    slot_schema: &SchemaRef,
+    slots: &[PhysicalMeasureSlot],
+) -> Option<RowLocalPrefilter> {
+    let mut parts = Vec::new();
+    collect_and_conjuncts(outer_expr, &mut parts);
+
+    let mut row_local_conjuncts = Vec::new();
+    let mut referenced_slot_indices = HashSet::new();
+    for p in parts {
+        let mut cols = Vec::new();
+        collect_phys_columns(&p, &mut cols);
+        if !cols.is_empty()
+            && cols.iter().all(|&idx| {
+                matches!(
+                    slots.get(idx).map(|s| &s.kind),
+                    Some(PhysicalMeasureSlotKind::CurrentRow { .. })
+                )
+            })
+        {
+            for idx in cols {
+                referenced_slot_indices.insert(idx);
+            }
+            row_local_conjuncts.push(p);
+        }
+    }
+
+    if row_local_conjuncts.is_empty() {
+        return None;
+    }
+
+    let mut needed_slots = Vec::with_capacity(referenced_slot_indices.len());
+    for (idx, slot) in slots.iter().enumerate() {
+        if referenced_slot_indices.contains(&idx)
+            && let PhysicalMeasureSlotKind::CurrentRow { inner_expr } = &slot.kind
+        {
+            needed_slots.push((idx, Arc::clone(inner_expr)));
+        }
+    }
+
+    let nullable_fields: Vec<Field> = slot_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    Some(RowLocalPrefilter {
+        conjuncts: row_local_conjuncts,
+        slot_schema: Arc::new(Schema::new(nullable_fields)),
+        needed_slots,
+    })
+}
+
+/// Evaluates a [`RowLocalPrefilter`] in vectorized Arrow across the whole `batch`.
+pub fn eval_row_local_prefilter_batch(
+    batch: &RecordBatch,
+    prefilter: &RowLocalPrefilter,
+) -> Result<BooleanArray> {
+    let num_rows = batch.num_rows();
+    let mut slot_arrays: Vec<ArrayRef> = prefilter
+        .slot_schema
+        .fields()
+        .iter()
+        .map(|f| new_null_array(f.data_type(), num_rows))
+        .collect();
+    for (idx, expr) in &prefilter.needed_slots {
+        slot_arrays[*idx] = eval_expr_or_col(expr, batch, num_rows)?;
+    }
+    let slot_batch = RecordBatch::try_new_with_options(
+        Arc::clone(&prefilter.slot_schema),
+        slot_arrays,
+        &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+    )?;
+    let mut acc: Option<BooleanArray> = None;
+    for conj in &prefilter.conjuncts {
+        let arr = conj.evaluate(&slot_batch)?.into_array(num_rows)?;
+        let b = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "DEFINE conjunct must evaluate to Boolean, got {}",
+                arr.data_type()
+            ))
+        })?;
+        acc = Some(match acc {
+            None => b.clone(),
+            Some(prev) => compute::and(&prev, b)?,
+        });
+    }
+    acc.ok_or_else(|| internal_datafusion_err!("empty RowLocalPrefilter conjuncts"))
+}
+
+fn collect_and_conjuncts(
+    expr: &Arc<dyn PhysicalExpr>,
+    out: &mut Vec<Arc<dyn PhysicalExpr>>,
+) {
+    if let Some(bin) = expr.downcast_ref::<BinaryExpr>()
+        && *bin.op() == Operator::And
+    {
+        collect_and_conjuncts(bin.left(), out);
+        collect_and_conjuncts(bin.right(), out);
+        return;
+    }
+    out.push(Arc::clone(expr));
+}
+
+fn collect_phys_columns(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<usize>) {
+    if let Some(col) = expr.downcast_ref::<Column>() {
+        out.push(col.index());
+        return;
+    }
+    for child in expr.children() {
+        collect_phys_columns(child, out);
+    }
+}
+
+/// Compact primitive value for the zero-allocation Tier 2 scalar predicate evaluator.
+#[derive(Debug, Clone, Copy)]
+enum FastVal {
+    Null,
+    Bool(bool),
+    Int64(i64),
+    Float64(f64),
+}
+
+/// Compiled native scalar expression tree for Tier 2 stateful `DEFINE` predicates, avoiding
+/// per-transition 1-row `RecordBatch` allocations and `ScalarValue` boxing.
+#[derive(Debug, Clone)]
+enum FastScalarExpr {
+    Slot(usize),
+    Lit(FastVal),
+    Not(Box<FastScalarExpr>),
+    IsNull(Box<FastScalarExpr>),
+    IsNotNull(Box<FastScalarExpr>),
+    CastToInt64(Box<FastScalarExpr>),
+    CastToFloat64(Box<FastScalarExpr>),
+    Bin {
+        op: Operator,
+        left: Box<FastScalarExpr>,
+        right: Box<FastScalarExpr>,
+    },
+}
+
+fn try_compile_fast_scalar_expr(expr: &Arc<dyn PhysicalExpr>) -> Option<FastScalarExpr> {
+    if let Some(col) = expr.downcast_ref::<Column>() {
+        return Some(FastScalarExpr::Slot(col.index()));
+    }
+    if let Some(lit) = expr.downcast_ref::<Literal>() {
+        let v = match lit.value() {
+            ScalarValue::Boolean(Some(b)) => FastVal::Bool(*b),
+            ScalarValue::Int64(Some(n)) => FastVal::Int64(*n),
+            ScalarValue::Int32(Some(n)) => FastVal::Int64(i64::from(*n)),
+            ScalarValue::Int16(Some(n)) => FastVal::Int64(i64::from(*n)),
+            ScalarValue::Int8(Some(n)) => FastVal::Int64(i64::from(*n)),
+            ScalarValue::Float64(Some(f)) => FastVal::Float64(*f),
+            ScalarValue::Float32(Some(f)) => FastVal::Float64(f64::from(*f)),
+            ScalarValue::Null
+            | ScalarValue::Boolean(None)
+            | ScalarValue::Int64(None)
+            | ScalarValue::Int32(None)
+            | ScalarValue::Float64(None) => FastVal::Null,
+            _ => return None,
+        };
+        return Some(FastScalarExpr::Lit(v));
+    }
+    if let Some(not) = expr.downcast_ref::<NotExpr>() {
+        return Some(FastScalarExpr::Not(Box::new(try_compile_fast_scalar_expr(
+            not.arg(),
+        )?)));
+    }
+    if let Some(isn) = expr.downcast_ref::<IsNullExpr>() {
+        return Some(FastScalarExpr::IsNull(Box::new(
+            try_compile_fast_scalar_expr(isn.arg())?,
+        )));
+    }
+    if let Some(isnn) = expr.downcast_ref::<IsNotNullExpr>() {
+        return Some(FastScalarExpr::IsNotNull(Box::new(
+            try_compile_fast_scalar_expr(isnn.arg())?,
+        )));
+    }
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        let inner = Box::new(try_compile_fast_scalar_expr(cast.expr())?);
+        return match cast.cast_type() {
+            DataType::Int64 | DataType::Int32 => Some(FastScalarExpr::CastToInt64(inner)),
+            DataType::Float64 | DataType::Float32 => {
+                Some(FastScalarExpr::CastToFloat64(inner))
+            }
+            _ => None,
+        };
+    }
+    if let Some(bin) = expr.downcast_ref::<BinaryExpr>() {
+        let op = *bin.op();
+        if !matches!(
+            op,
+            Operator::And
+                | Operator::Or
+                | Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::Plus
+                | Operator::Minus
+                | Operator::Multiply
+                | Operator::Divide
+        ) {
+            return None;
+        }
+        let left = Box::new(try_compile_fast_scalar_expr(bin.left())?);
+        let right = Box::new(try_compile_fast_scalar_expr(bin.right())?);
+        return Some(FastScalarExpr::Bin { op, left, right });
+    }
+    None
+}
+
+impl FastScalarExpr {
+    #[inline]
+    fn eval(&self, slot_vals: &[FastVal]) -> FastVal {
+        match self {
+            FastScalarExpr::Slot(idx) => slot_vals[*idx],
+            FastScalarExpr::Lit(v) => *v,
+            FastScalarExpr::Not(inner) => match inner.eval(slot_vals) {
+                FastVal::Bool(b) => FastVal::Bool(!b),
+                _ => FastVal::Null,
+            },
+            FastScalarExpr::IsNull(inner) => {
+                FastVal::Bool(matches!(inner.eval(slot_vals), FastVal::Null))
+            }
+            FastScalarExpr::IsNotNull(inner) => {
+                FastVal::Bool(!matches!(inner.eval(slot_vals), FastVal::Null))
+            }
+            FastScalarExpr::CastToInt64(inner) => match inner.eval(slot_vals) {
+                FastVal::Int64(v) => FastVal::Int64(v),
+                FastVal::Float64(f) => FastVal::Int64(f as i64),
+                _ => FastVal::Null,
+            },
+            FastScalarExpr::CastToFloat64(inner) => match inner.eval(slot_vals) {
+                FastVal::Float64(f) => FastVal::Float64(f),
+                FastVal::Int64(v) => FastVal::Float64(v as f64),
+                _ => FastVal::Null,
+            },
+            FastScalarExpr::Bin { op, left, right } => {
+                let lv = left.eval(slot_vals);
+                match op {
+                    Operator::And => match lv {
+                        FastVal::Bool(false) => FastVal::Bool(false),
+                        FastVal::Bool(true) => right.eval(slot_vals),
+                        _ => match right.eval(slot_vals) {
+                            FastVal::Bool(false) => FastVal::Bool(false),
+                            _ => FastVal::Null,
+                        },
+                    },
+                    Operator::Or => match lv {
+                        FastVal::Bool(true) => FastVal::Bool(true),
+                        FastVal::Bool(false) => right.eval(slot_vals),
+                        _ => match right.eval(slot_vals) {
+                            FastVal::Bool(true) => FastVal::Bool(true),
+                            _ => FastVal::Null,
+                        },
+                    },
+                    _ => {
+                        let rv = right.eval(slot_vals);
+                        match (lv, rv) {
+                            (FastVal::Int64(a), FastVal::Int64(b)) => match op {
+                                Operator::Eq => FastVal::Bool(a == b),
+                                Operator::NotEq => FastVal::Bool(a != b),
+                                Operator::Lt => FastVal::Bool(a < b),
+                                Operator::LtEq => FastVal::Bool(a <= b),
+                                Operator::Gt => FastVal::Bool(a > b),
+                                Operator::GtEq => FastVal::Bool(a >= b),
+                                Operator::Plus => FastVal::Int64(a.wrapping_add(b)),
+                                Operator::Minus => FastVal::Int64(a.wrapping_sub(b)),
+                                Operator::Multiply => FastVal::Int64(a.wrapping_mul(b)),
+                                Operator::Divide => {
+                                    if b == 0 {
+                                        FastVal::Null
+                                    } else {
+                                        FastVal::Int64(a / b)
+                                    }
+                                }
+                                _ => FastVal::Null,
+                            },
+                            (FastVal::Float64(a), FastVal::Float64(b)) => match op {
+                                Operator::Eq => FastVal::Bool(a == b),
+                                Operator::NotEq => FastVal::Bool(a != b),
+                                Operator::Lt => FastVal::Bool(a < b),
+                                Operator::LtEq => FastVal::Bool(a <= b),
+                                Operator::Gt => FastVal::Bool(a > b),
+                                Operator::GtEq => FastVal::Bool(a >= b),
+                                Operator::Plus => FastVal::Float64(a + b),
+                                Operator::Minus => FastVal::Float64(a - b),
+                                Operator::Multiply => FastVal::Float64(a * b),
+                                Operator::Divide => FastVal::Float64(a / b),
+                                _ => FastVal::Null,
+                            },
+                            (FastVal::Bool(a), FastVal::Bool(b)) => match op {
+                                Operator::Eq => FastVal::Bool(a == b),
+                                Operator::NotEq => FastVal::Bool(a != b),
+                                _ => FastVal::Null,
+                            },
+                            _ => FastVal::Null,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Typed primitive view over a precomputed slot argument array for zero-boxing Tier 2 reads.
+enum FastPrecomputedArray {
+    Int64(Int64Array),
+    Int32(Int32Array),
+    Float64(Float64Array),
+    Bool(BooleanArray),
+    Other,
+}
+
+impl FastPrecomputedArray {
+    fn from_array(arr: &ArrayRef) -> Self {
+        if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+            Self::Int64(a.clone())
+        } else if let Some(a) = arr.as_any().downcast_ref::<Int32Array>() {
+            Self::Int32(a.clone())
+        } else if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+            Self::Float64(a.clone())
+        } else if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
+            Self::Bool(a.clone())
+        } else {
+            Self::Other
+        }
+    }
+
+    #[inline]
+    fn get_fast(&self, idx: usize) -> FastVal {
+        match self {
+            FastPrecomputedArray::Int64(a) => {
+                if a.is_valid(idx) {
+                    FastVal::Int64(a.value(idx))
+                } else {
+                    FastVal::Null
+                }
+            }
+            FastPrecomputedArray::Int32(a) => {
+                if a.is_valid(idx) {
+                    FastVal::Int64(i64::from(a.value(idx)))
+                } else {
+                    FastVal::Null
+                }
+            }
+            FastPrecomputedArray::Float64(a) => {
+                if a.is_valid(idx) {
+                    FastVal::Float64(a.value(idx))
+                } else {
+                    FastVal::Null
+                }
+            }
+            FastPrecomputedArray::Bool(a) => {
+                if a.is_valid(idx) {
+                    FastVal::Bool(a.value(idx))
+                } else {
+                    FastVal::Null
+                }
+            }
+            FastPrecomputedArray::Other => FastVal::Null,
+        }
+    }
+
+    fn is_supported(&self) -> bool {
+        !matches!(self, FastPrecomputedArray::Other)
+    }
+}
+
+fn slot_supports_fast_eval(
+    slot: &PhysicalMeasureSlot,
+    fast_args: &[FastPrecomputedArray],
+) -> bool {
+    match &slot.kind {
+        PhysicalMeasureSlotKind::MatchNumber => true,
+        PhysicalMeasureSlotKind::CurrentRow { .. } => fast_args
+            .first()
+            .is_some_and(FastPrecomputedArray::is_supported),
+        PhysicalMeasureSlotKind::Nav {
+            uses_match_metadata: false,
+            ..
+        } => fast_args
+            .first()
+            .is_some_and(FastPrecomputedArray::is_supported),
+        PhysicalMeasureSlotKind::Agg {
+            agg_kind,
+            distinct: false,
+            uses_match_metadata: false,
+            ..
+        } => match agg_kind {
+            AggKind::CountStar | AggKind::CountSymbol => true,
+            AggKind::Count
+            | AggKind::Sum
+            | AggKind::Avg
+            | AggKind::Min
+            | AggKind::Max => fast_args
+                .first()
+                .is_some_and(FastPrecomputedArray::is_supported),
+            AggKind::Udaf(_) => false,
+        },
+        _ => false,
+    }
+}
+
+#[inline]
+fn eval_slot_fast(
+    horizon: &[MatchStep],
+    match_number: i64,
+    current_row: usize,
+    part_start: usize,
+    part_end: usize,
+    slot: &PhysicalMeasureSlot,
+    fast_args: &[FastPrecomputedArray],
+) -> FastVal {
+    match &slot.kind {
+        PhysicalMeasureSlotKind::MatchNumber => FastVal::Int64(match_number),
+        PhysicalMeasureSlotKind::CurrentRow { .. } => fast_args[0].get_fast(current_row),
+        PhysicalMeasureSlotKind::Nav {
+            logical_nav,
+            logical_offset,
+            physical_nav,
+            physical_offset,
+            symbol_set,
+            ..
+        } => {
+            let Some(base_row) = navigate_logical_row(
+                horizon,
+                *logical_nav,
+                *logical_offset as usize,
+                symbol_set.as_ref(),
+            ) else {
+                return FastVal::Null;
+            };
+            let Some(final_row) = navigate_physical_in_range(
+                base_row,
+                *physical_nav,
+                *physical_offset as usize,
+                part_start,
+                part_end,
+            ) else {
+                return FastVal::Null;
+            };
+            fast_args[0].get_fast(final_row)
+        }
+        PhysicalMeasureSlotKind::Agg {
+            agg_kind,
+            symbol_set,
+            arg_physical_nav,
+            ..
+        } => match agg_kind {
+            AggKind::CountStar | AggKind::CountSymbol => {
+                let c = matching_row_indices_in_range(
+                    horizon,
+                    symbol_set.as_ref(),
+                    None,
+                    part_start,
+                    part_end,
+                )
+                .flatten()
+                .count();
+                FastVal::Int64(c as i64)
+            }
+            AggKind::Count => {
+                let fa = &fast_args[0];
+                let mut c = 0i64;
+                for idx in matching_row_indices_in_range(
+                    horizon,
+                    symbol_set.as_ref(),
+                    *arg_physical_nav,
+                    part_start,
+                    part_end,
+                )
+                .flatten()
+                {
+                    if !matches!(fa.get_fast(idx), FastVal::Null) {
+                        c += 1;
+                    }
+                }
+                FastVal::Int64(c)
+            }
+            AggKind::Sum => {
+                let fa = &fast_args[0];
+                match fa {
+                    FastPrecomputedArray::Int64(a) => {
+                        let mut acc: Option<i64> = None;
+                        for idx in matching_row_indices_in_range(
+                            horizon,
+                            symbol_set.as_ref(),
+                            *arg_physical_nav,
+                            part_start,
+                            part_end,
+                        )
+                        .flatten()
+                        {
+                            if a.is_valid(idx) {
+                                acc = Some(acc.unwrap_or(0).wrapping_add(a.value(idx)));
+                            }
+                        }
+                        acc.map_or(FastVal::Null, FastVal::Int64)
+                    }
+                    FastPrecomputedArray::Float64(a) => {
+                        let mut acc: Option<f64> = None;
+                        for idx in matching_row_indices_in_range(
+                            horizon,
+                            symbol_set.as_ref(),
+                            *arg_physical_nav,
+                            part_start,
+                            part_end,
+                        )
+                        .flatten()
+                        {
+                            if a.is_valid(idx) {
+                                acc = Some(acc.unwrap_or(0.0) + a.value(idx));
+                            }
+                        }
+                        acc.map_or(FastVal::Null, FastVal::Float64)
+                    }
+                    _ => FastVal::Null,
+                }
+            }
+            AggKind::Avg => {
+                let FastPrecomputedArray::Float64(a) = &fast_args[0] else {
+                    return FastVal::Null;
+                };
+                let mut sum = 0.0f64;
+                let mut count = 0u64;
+                for idx in matching_row_indices_in_range(
+                    horizon,
+                    symbol_set.as_ref(),
+                    *arg_physical_nav,
+                    part_start,
+                    part_end,
+                )
+                .flatten()
+                {
+                    if a.is_valid(idx) {
+                        sum += a.value(idx);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    FastVal::Null
+                } else {
+                    FastVal::Float64(sum / count as f64)
+                }
+            }
+            AggKind::Min | AggKind::Max => {
+                let is_min = matches!(agg_kind, AggKind::Min);
+                let fa = &fast_args[0];
+                match fa {
+                    FastPrecomputedArray::Int64(a) => {
+                        let mut best: Option<i64> = None;
+                        for idx in matching_row_indices_in_range(
+                            horizon,
+                            symbol_set.as_ref(),
+                            *arg_physical_nav,
+                            part_start,
+                            part_end,
+                        )
+                        .flatten()
+                        {
+                            if a.is_valid(idx) {
+                                let v = a.value(idx);
+                                best = Some(match best {
+                                    None => v,
+                                    Some(c) => {
+                                        if is_min {
+                                            c.min(v)
+                                        } else {
+                                            c.max(v)
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        best.map_or(FastVal::Null, FastVal::Int64)
+                    }
+                    FastPrecomputedArray::Int32(a) => {
+                        let mut best: Option<i64> = None;
+                        for idx in matching_row_indices_in_range(
+                            horizon,
+                            symbol_set.as_ref(),
+                            *arg_physical_nav,
+                            part_start,
+                            part_end,
+                        )
+                        .flatten()
+                        {
+                            if a.is_valid(idx) {
+                                let v = i64::from(a.value(idx));
+                                best = Some(match best {
+                                    None => v,
+                                    Some(c) => {
+                                        if is_min {
+                                            c.min(v)
+                                        } else {
+                                            c.max(v)
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        best.map_or(FastVal::Null, FastVal::Int64)
+                    }
+                    FastPrecomputedArray::Float64(a) => {
+                        let mut best: Option<f64> = None;
+                        for idx in matching_row_indices_in_range(
+                            horizon,
+                            symbol_set.as_ref(),
+                            *arg_physical_nav,
+                            part_start,
+                            part_end,
+                        )
+                        .flatten()
+                        {
+                            if a.is_valid(idx) {
+                                let v = a.value(idx);
+                                best = Some(match best {
+                                    None => v,
+                                    Some(c) => {
+                                        if (is_min && v < c) || (!is_min && v > c) {
+                                            v
+                                        } else {
+                                            c
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        best.map_or(FastVal::Null, FastVal::Float64)
+                    }
+                    _ => FastVal::Null,
+                }
+            }
+            AggKind::Udaf(_) => FastVal::Null,
+        },
+        _ => FastVal::Null,
+    }
+}
+
 /// Borrowed specification for one stateful `DEFINE` symbol passed to [`PartitionStatefulEvaluator`].
 pub struct StatefulDefineInput<'a> {
     pub sym_id: SymbolId,
     pub outer_expr: &'a Arc<dyn PhysicalExpr>,
     pub slot_schema: &'a SchemaRef,
     pub slots: &'a [PhysicalMeasureSlot],
+    pub has_prefilter: bool,
 }
 
 struct CompiledStatefulSymbol {
@@ -94,15 +1040,22 @@ struct CompiledStatefulSymbol {
     slots: Vec<PhysicalMeasureSlot>,
     /// Pre-evaluated inner Arrow arrays (`precomputed_args[slot_idx][arg_idx]`).
     precomputed_args: Vec<Vec<ArrayRef>>,
+    /// Typed primitive views over `precomputed_args` for zero-boxing Tier 2 evaluation.
+    fast_args: Vec<Vec<FastPrecomputedArray>>,
+    /// Optional compiled scalar expression tree (bypasses 1-row `RecordBatch` creation).
+    fast_expr: Option<FastScalarExpr>,
+    has_prefilter: bool,
 }
 
-/// Evaluates Tier 2 stateful `DEFINE` predicates against a partition's precomputed slot arrays.
+/// Evaluates Tier 2 stateful `DEFINE` predicates against a batch's precomputed slot arrays.
 pub struct PartitionStatefulEvaluator<'a> {
     program: &'a Program,
     partition_batch: &'a RecordBatch,
     input_schema: SchemaRef,
-    num_part_rows: usize,
+    part_start: usize,
+    part_end: usize,
     by_symbol: HashMap<SymbolId, CompiledStatefulSymbol>,
+    fast_slot_buf: Vec<FastVal>,
 }
 
 impl<'a> PartitionStatefulEvaluator<'a> {
@@ -112,11 +1065,14 @@ impl<'a> PartitionStatefulEvaluator<'a> {
         program: &'a Program,
         stateful_defs: &[StatefulDefineInput<'_>],
     ) -> Result<Self> {
-        let num_part_rows = partition_batch.num_rows();
+        let num_rows = partition_batch.num_rows();
         let mut by_symbol = HashMap::with_capacity(stateful_defs.len());
+        let mut max_slots = 0usize;
 
         for def in stateful_defs {
+            max_slots = max_slots.max(def.slots.len());
             let mut precomputed_args = Vec::with_capacity(def.slots.len());
+            let mut fast_args = Vec::with_capacity(def.slots.len());
             for slot in def.slots {
                 let arrs = match &slot.kind {
                     PhysicalMeasureSlotKind::Nav {
@@ -127,19 +1083,11 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                         if *uses_match_metadata {
                             vec![]
                         } else {
-                            vec![
-                                inner_expr
-                                    .evaluate(partition_batch)?
-                                    .into_array(num_part_rows)?,
-                            ]
+                            vec![eval_expr_or_col(inner_expr, partition_batch, num_rows)?]
                         }
                     }
                     PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
-                        vec![
-                            inner_expr
-                                .evaluate(partition_batch)?
-                                .into_array(num_part_rows)?,
-                        ]
+                        vec![eval_expr_or_col(inner_expr, partition_batch, num_rows)?]
                     }
                     PhysicalMeasureSlotKind::Agg {
                         agg_kind,
@@ -152,9 +1100,7 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                         } else {
                             let mut evaluated = Vec::with_capacity(args.len());
                             for (i, e) in args.iter().enumerate() {
-                                let raw = e
-                                    .evaluate(partition_batch)?
-                                    .into_array(num_part_rows)?;
+                                let raw = eval_expr_or_col(e, partition_batch, num_rows)?;
                                 let pre = if i == 0 {
                                     match agg_kind {
                                         AggKind::Avg => compute::cast(
@@ -179,8 +1125,21 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                     PhysicalMeasureSlotKind::MatchNumber
                     | PhysicalMeasureSlotKind::Classifier { .. } => vec![],
                 };
+                let fargs: Vec<FastPrecomputedArray> =
+                    arrs.iter().map(FastPrecomputedArray::from_array).collect();
                 precomputed_args.push(arrs);
+                fast_args.push(fargs);
             }
+            let all_slots_fast = def
+                .slots
+                .iter()
+                .zip(&fast_args)
+                .all(|(s, fa)| slot_supports_fast_eval(s, fa));
+            let fast_expr = if all_slots_fast {
+                try_compile_fast_scalar_expr(def.outer_expr)
+            } else {
+                None
+            };
             by_symbol.insert(
                 def.sym_id,
                 CompiledStatefulSymbol {
@@ -188,6 +1147,9 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                     slot_schema: Arc::clone(def.slot_schema),
                     slots: def.slots.to_vec(),
                     precomputed_args,
+                    fast_args,
+                    fast_expr,
+                    has_prefilter: def.has_prefilter,
                 },
             );
         }
@@ -196,9 +1158,18 @@ impl<'a> PartitionStatefulEvaluator<'a> {
             program,
             partition_batch,
             input_schema: partition_batch.schema(),
-            num_part_rows,
+            part_start: 0,
+            part_end: num_rows,
             by_symbol,
+            fast_slot_buf: vec![FastVal::Null; max_slots],
         })
+    }
+
+    /// Updates the active logical partition bounds `[part_start..part_end)` within the batch.
+    #[inline]
+    pub fn set_partition_bounds(&mut self, part_start: usize, part_end: usize) {
+        self.part_start = part_start;
+        self.part_end = part_end;
     }
 }
 
@@ -211,6 +1182,11 @@ impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
     #[inline]
     fn has_any_stateful(&self) -> bool {
         !self.by_symbol.is_empty()
+    }
+
+    #[inline]
+    fn has_prefilter(&self, sym: SymbolId) -> bool {
+        self.by_symbol.get(&sym).is_some_and(|c| c.has_prefilter)
     }
 
     fn eval_stateful(
@@ -233,6 +1209,26 @@ impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
             })?
             .row_idx;
 
+        if let Some(fast_expr) = &compiled.fast_expr {
+            for (i, (slot, fargs)) in
+                compiled.slots.iter().zip(&compiled.fast_args).enumerate()
+            {
+                self.fast_slot_buf[i] = eval_slot_fast(
+                    tentative_steps,
+                    candidate_match_number,
+                    current_row,
+                    self.part_start,
+                    self.part_end,
+                    slot,
+                    fargs,
+                );
+            }
+            return Ok(matches!(
+                fast_expr.eval(&self.fast_slot_buf[..compiled.slots.len()]),
+                FastVal::Bool(true)
+            ));
+        }
+
         let mut slot_arrays: Vec<ArrayRef> = Vec::with_capacity(compiled.slots.len());
         for (slot, pre_args) in compiled.slots.iter().zip(&compiled.precomputed_args) {
             let scalar = eval_single_slot_scalar(
@@ -241,7 +1237,8 @@ impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
                 tentative_steps,
                 candidate_match_number,
                 current_row,
-                self.num_part_rows,
+                self.part_start,
+                self.part_end,
                 self.program,
                 self.input_schema.as_ref(),
                 slot,
@@ -276,7 +1273,8 @@ fn eval_single_slot_scalar(
     full_steps: &[MatchStep],
     match_number: i64,
     current_row: usize,
-    num_part_rows: usize,
+    part_start: usize,
+    part_end: usize,
     program: &Program,
     input_schema: &Schema,
     slot: &PhysicalMeasureSlot,
@@ -328,11 +1326,12 @@ fn eval_single_slot_scalar(
             ) else {
                 return ScalarValue::try_from(&slot.data_type);
             };
-            let Some(final_row) = navigate_physical(
+            let Some(final_row) = navigate_physical_in_range(
                 base_row,
                 *physical_nav,
                 *physical_offset as usize,
-                num_part_rows,
+                part_start,
+                part_end,
             ) else {
                 return ScalarValue::try_from(&slot.data_type);
             };
@@ -364,6 +1363,8 @@ fn eval_single_slot_scalar(
                     partition_batch,
                     horizon,
                     match_number,
+                    part_start,
+                    part_end,
                     program,
                     agg_kind,
                     symbol_set.as_ref(),
@@ -375,7 +1376,8 @@ fn eval_single_slot_scalar(
             } else {
                 eval_single_agg_scalar(
                     horizon,
-                    num_part_rows,
+                    part_start,
+                    part_end,
                     input_schema,
                     agg_kind,
                     symbol_set.as_ref(),
@@ -510,6 +1512,8 @@ fn eval_metadata_agg_scalar(
     partition_batch: &RecordBatch,
     horizon: &[MatchStep],
     match_number: i64,
+    part_start: usize,
+    part_end: usize,
     program: &Program,
     agg_kind: &AggKind,
     symbol_set: Option<&SymbolSet>,
@@ -518,7 +1522,6 @@ fn eval_metadata_agg_scalar(
     arg_physical_nav: Option<(PhysicalNavKind, u32)>,
     result_type: &DataType,
 ) -> Result<ScalarValue> {
-    let num_part_rows = partition_batch.num_rows();
     let matched_steps: Vec<(Option<usize>, SymbolId)> = horizon
         .iter()
         .filter_map(|s| {
@@ -529,9 +1532,13 @@ fn eval_metadata_agg_scalar(
             }
             let row_idx = match arg_physical_nav {
                 None => Some(s.row_idx),
-                Some((kind, off)) => {
-                    navigate_physical(s.row_idx, Some(kind), off as usize, num_part_rows)
-                }
+                Some((kind, off)) => navigate_physical_in_range(
+                    s.row_idx,
+                    Some(kind),
+                    off as usize,
+                    part_start,
+                    part_end,
+                ),
             };
             Some((row_idx, s.sym))
         })
@@ -590,6 +1597,7 @@ fn eval_metadata_agg_scalar(
         .collect();
     eval_single_agg_scalar(
         &local_steps,
+        0,
         n,
         ext_schema.as_ref(),
         agg_kind,
@@ -605,7 +1613,8 @@ fn eval_metadata_agg_scalar(
 #[expect(clippy::too_many_arguments)]
 fn eval_single_agg_scalar(
     horizon: &[MatchStep],
-    num_part_rows: usize,
+    part_start: usize,
+    part_end: usize,
     input_schema: &Schema,
     agg_kind: &AggKind,
     symbol_set: Option<&SymbolSet>,
@@ -617,20 +1626,23 @@ fn eval_single_agg_scalar(
 ) -> Result<ScalarValue> {
     match agg_kind {
         AggKind::CountStar | AggKind::CountSymbol => {
-            let count = matching_row_indices(horizon, symbol_set, None, num_part_rows)
-                .flatten()
-                .count();
+            let count = matching_row_indices_in_range(
+                horizon, symbol_set, None, part_start, part_end,
+            )
+            .flatten()
+            .count();
             Ok(ScalarValue::Int64(Some(count as i64)))
         }
         AggKind::Count => {
             let arr = &precomputed_args[0];
             if distinct {
                 let mut seen: HashSet<ScalarValue> = HashSet::new();
-                for maybe_idx in matching_row_indices(
+                for maybe_idx in matching_row_indices_in_range(
                     horizon,
                     symbol_set,
                     arg_physical_nav,
-                    num_part_rows,
+                    part_start,
+                    part_end,
                 ) {
                     if let Some(idx) = maybe_idx
                         && arr.is_valid(idx)
@@ -640,11 +1652,12 @@ fn eval_single_agg_scalar(
                 }
                 Ok(ScalarValue::Int64(Some(seen.len() as i64)))
             } else {
-                let count = matching_row_indices(
+                let count = matching_row_indices_in_range(
                     horizon,
                     symbol_set,
                     arg_physical_nav,
-                    num_part_rows,
+                    part_start,
+                    part_end,
                 )
                 .filter(|maybe_idx| maybe_idx.is_some_and(|idx| arr.is_valid(idx)))
                 .count();
@@ -653,10 +1666,8 @@ fn eval_single_agg_scalar(
         }
         AggKind::Avg => {
             let arr = &precomputed_args[0];
-            let f64_arr = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| {
+            let f64_arr =
+                arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
                     datafusion_common::exec_datafusion_err!(
                         "Expected Float64Array for AVG"
                     )
@@ -665,11 +1676,12 @@ fn eval_single_agg_scalar(
             let mut count = 0u64;
             if distinct {
                 let mut seen: HashSet<u64> = HashSet::new();
-                for maybe_idx in matching_row_indices(
+                for maybe_idx in matching_row_indices_in_range(
                     horizon,
                     symbol_set,
                     arg_physical_nav,
-                    num_part_rows,
+                    part_start,
+                    part_end,
                 ) {
                     if let Some(idx) = maybe_idx
                         && f64_arr.is_valid(idx)
@@ -682,11 +1694,12 @@ fn eval_single_agg_scalar(
                     }
                 }
             } else {
-                for maybe_idx in matching_row_indices(
+                for maybe_idx in matching_row_indices_in_range(
                     horizon,
                     symbol_set,
                     arg_physical_nav,
-                    num_part_rows,
+                    part_start,
+                    part_end,
                 ) {
                     if let Some(idx) = maybe_idx
                         && f64_arr.is_valid(idx)
@@ -704,11 +1717,12 @@ fn eval_single_agg_scalar(
         }
         AggKind::Sum => {
             let arr = &precomputed_args[0];
-            let valid_indices = matching_row_indices(
+            let valid_indices = matching_row_indices_in_range(
                 horizon,
                 symbol_set,
                 arg_physical_nav,
-                num_part_rows,
+                part_start,
+                part_end,
             )
             .flatten();
             if distinct {
@@ -721,9 +1735,14 @@ fn eval_single_agg_scalar(
             let arr = &precomputed_args[0];
             let is_min = matches!(agg_kind, AggKind::Min);
             let mut best: Option<ScalarValue> = None;
-            for idx in
-                matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                    .flatten()
+            for idx in matching_row_indices_in_range(
+                horizon,
+                symbol_set,
+                arg_physical_nav,
+                part_start,
+                part_end,
+            )
+            .flatten()
             {
                 if !arr.is_valid(idx) {
                     continue;
@@ -773,11 +1792,12 @@ fn eval_single_agg_scalar(
                 })
                 .collect::<Result<_>>()?;
 
-            let take_indices: Vec<Option<u32>> = matching_row_indices(
+            let take_indices: Vec<Option<u32>> = matching_row_indices_in_range(
                 horizon,
                 symbol_set,
                 arg_physical_nav,
-                num_part_rows,
+                part_start,
+                part_end,
             )
             .map(|opt| opt.map(|i| i as u32))
             .collect();
@@ -826,17 +1846,120 @@ fn eval_single_agg_scalar(
     }
 }
 
+/// Matched events belonging to one logical partition `[part_start..part_end)` inside a
+/// shared [`RecordBatch`].
+pub struct PartitionEventsSlice<'a> {
+    pub part_start: usize,
+    pub part_end: usize,
+    pub events: &'a [PartitionEvent],
+}
+
 #[derive(Debug, Clone, Copy)]
 enum EmitRow<'a> {
     Matched {
-        found: &'a FoundMatch,
+        match_id: usize,
+        match_number: i64,
+        steps: &'a [MatchStep],
         step_pos: Option<usize>,
         source_row: usize,
+        part_start: usize,
+        part_end: usize,
         is_empty_match: bool,
     },
     Unmatched {
         source_row: usize,
     },
+}
+
+/// Builds a single coalesced output [`RecordBatch`] from a zero-allocation [`FlatMatchPool`].
+#[expect(clippy::too_many_arguments)]
+pub fn build_flat_pool_output_batch(
+    batch: &RecordBatch,
+    pool: &FlatMatchPool,
+    program: &Program,
+    partition_by_exprs: &[Arc<dyn PhysicalExpr>],
+    partition_by_input_indices: &[Option<usize>],
+    order_by_input_indices: &[Option<usize>],
+    measures: &[PhysicalMeasure],
+    rows_per_match: RowsPerMatch,
+    output_schema: &SchemaRef,
+    output_projection: Option<&[String]>,
+) -> Result<Option<RecordBatch>> {
+    if pool.events.is_empty() {
+        return Ok(None);
+    }
+    let mut emitted: Vec<EmitRow<'_>> = Vec::with_capacity(pool.events.len());
+    for (match_id, event) in pool.events.iter().enumerate() {
+        match event {
+            FlatPartitionEvent::Match(found) => {
+                let steps = &pool.steps[found.steps_start..found.steps_end];
+                if rows_per_match.is_one_row() {
+                    let is_empty = steps.is_empty();
+                    let step_pos = if is_empty {
+                        None
+                    } else {
+                        Some(steps.len() - 1)
+                    };
+                    emitted.push(EmitRow::Matched {
+                        match_id,
+                        match_number: found.match_number,
+                        steps,
+                        step_pos,
+                        source_row: found.start_row,
+                        part_start: found.part_start,
+                        part_end: found.part_end,
+                        is_empty_match: is_empty,
+                    });
+                } else if steps.is_empty() {
+                    if rows_per_match.show_empty_matches() {
+                        emitted.push(EmitRow::Matched {
+                            match_id,
+                            match_number: found.match_number,
+                            steps,
+                            step_pos: None,
+                            source_row: found.start_row,
+                            part_start: found.part_start,
+                            part_end: found.part_end,
+                            is_empty_match: true,
+                        });
+                    }
+                } else {
+                    for (idx, step) in steps.iter().enumerate() {
+                        if !step.excluded {
+                            emitted.push(EmitRow::Matched {
+                                match_id,
+                                match_number: found.match_number,
+                                steps,
+                                step_pos: Some(idx),
+                                source_row: step.row_idx,
+                                part_start: found.part_start,
+                                part_end: found.part_end,
+                                is_empty_match: false,
+                            });
+                        }
+                    }
+                }
+            }
+            FlatPartitionEvent::UnmatchedRow { row_idx } => {
+                emitted.push(EmitRow::Unmatched {
+                    source_row: *row_idx,
+                });
+            }
+        }
+    }
+
+    build_output_from_emitted(
+        batch,
+        &emitted,
+        program,
+        partition_by_exprs,
+        partition_by_input_indices,
+        order_by_input_indices,
+        measures,
+        rows_per_match,
+        output_schema,
+        output_projection,
+    )
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -851,92 +1974,145 @@ pub fn build_partition_output_batch(
     rows_per_match: RowsPerMatch,
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>> {
-    let mut emitted: Vec<EmitRow<'_>> = Vec::new();
-    for event in events {
-        match event {
-            PartitionEvent::Match(found) => {
-                if rows_per_match.is_one_row() {
-                    let is_empty = found.steps.is_empty();
-                    let step_pos = if is_empty {
-                        None
-                    } else {
-                        Some(found.steps.len() - 1)
-                    };
-                    emitted.push(EmitRow::Matched {
-                        found,
-                        step_pos,
-                        source_row: found.start_row,
-                        is_empty_match: is_empty,
-                    });
-                } else if found.steps.is_empty() {
-                    if rows_per_match.show_empty_matches() {
+    let slice = [PartitionEventsSlice {
+        part_start: 0,
+        part_end: partition_batch.num_rows(),
+        events,
+    }];
+    build_multi_partition_output_batch(
+        partition_batch,
+        &slice,
+        program,
+        partition_by_exprs,
+        partition_by_input_indices,
+        order_by_input_indices,
+        measures,
+        rows_per_match,
+        output_schema,
+        None,
+    )
+}
+
+/// Builds a single coalesced output [`RecordBatch`] covering one or more complete logical
+/// partitions that reside inside `batch`, evaluating all projected `MEASURES` and `PARTITION BY`
+/// expressions once across the whole batch instead of once per partition.
+#[expect(clippy::too_many_arguments)]
+pub fn build_multi_partition_output_batch(
+    batch: &RecordBatch,
+    partitions: &[PartitionEventsSlice<'_>],
+    program: &Program,
+    partition_by_exprs: &[Arc<dyn PhysicalExpr>],
+    partition_by_input_indices: &[Option<usize>],
+    order_by_input_indices: &[Option<usize>],
+    measures: &[PhysicalMeasure],
+    rows_per_match: RowsPerMatch,
+    output_schema: &SchemaRef,
+    output_projection: Option<&[String]>,
+) -> Result<Option<RecordBatch>> {
+    let total_events: usize = partitions.iter().map(|p| p.events.len()).sum();
+    if total_events == 0 {
+        return Ok(None);
+    }
+    let mut emitted: Vec<EmitRow<'_>> = Vec::with_capacity(total_events);
+    let mut match_id = 0usize;
+    for part in partitions {
+        let part_start = part.part_start;
+        let part_end = part.part_end;
+        for event in part.events {
+            match event {
+                PartitionEvent::Match(found) => {
+                    let mid = match_id;
+                    match_id += 1;
+                    let steps = found.steps.as_slice();
+                    if rows_per_match.is_one_row() {
+                        let is_empty = steps.is_empty();
+                        let step_pos = if is_empty {
+                            None
+                        } else {
+                            Some(steps.len() - 1)
+                        };
                         emitted.push(EmitRow::Matched {
-                            found,
-                            step_pos: None,
+                            match_id: mid,
+                            match_number: found.match_number,
+                            steps,
+                            step_pos,
                             source_row: found.start_row,
-                            is_empty_match: true,
+                            part_start,
+                            part_end,
+                            is_empty_match: is_empty,
                         });
-                    }
-                } else {
-                    for (idx, step) in found.steps.iter().enumerate() {
-                        if !step.excluded {
+                    } else if steps.is_empty() {
+                        if rows_per_match.show_empty_matches() {
                             emitted.push(EmitRow::Matched {
-                                found,
-                                step_pos: Some(idx),
-                                source_row: step.row_idx,
-                                is_empty_match: false,
+                                match_id: mid,
+                                match_number: found.match_number,
+                                steps,
+                                step_pos: None,
+                                source_row: found.start_row,
+                                part_start,
+                                part_end,
+                                is_empty_match: true,
                             });
+                        }
+                    } else {
+                        for (idx, step) in steps.iter().enumerate() {
+                            if !step.excluded {
+                                emitted.push(EmitRow::Matched {
+                                    match_id: mid,
+                                    match_number: found.match_number,
+                                    steps,
+                                    step_pos: Some(idx),
+                                    source_row: step.row_idx,
+                                    part_start,
+                                    part_end,
+                                    is_empty_match: false,
+                                });
+                            }
                         }
                     }
                 }
-            }
-            PartitionEvent::UnmatchedRow { row_idx } => {
-                emitted.push(EmitRow::Unmatched {
-                    source_row: *row_idx,
-                });
+                PartitionEvent::UnmatchedRow { row_idx } => {
+                    emitted.push(EmitRow::Unmatched {
+                        source_row: *row_idx,
+                    });
+                }
             }
         }
     }
 
+    build_output_from_emitted(
+        batch,
+        &emitted,
+        program,
+        partition_by_exprs,
+        partition_by_input_indices,
+        order_by_input_indices,
+        measures,
+        rows_per_match,
+        output_schema,
+        output_projection,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn build_output_from_emitted(
+    batch: &RecordBatch,
+    emitted: &[EmitRow<'_>],
+    program: &Program,
+    partition_by_exprs: &[Arc<dyn PhysicalExpr>],
+    partition_by_input_indices: &[Option<usize>],
+    order_by_input_indices: &[Option<usize>],
+    measures: &[PhysicalMeasure],
+    rows_per_match: RowsPerMatch,
+    output_schema: &SchemaRef,
+    output_projection: Option<&[String]>,
+) -> Result<Option<RecordBatch>> {
     if emitted.is_empty() {
         return Ok(None);
     }
 
+    let partition_batch = batch;
     let out_len = emitted.len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-    let mut included_input_indices: HashSet<usize> = HashSet::new();
-
-    let source_indices = UInt32Array::from_iter_values(emitted.iter().map(|r| match r {
-        EmitRow::Matched { source_row, .. } | EmitRow::Unmatched { source_row } => {
-            *source_row as u32
-        }
-    }));
-
-    for (expr, maybe_idx) in partition_by_exprs.iter().zip(partition_by_input_indices) {
-        if let Some(col_idx) = maybe_idx {
-            if included_input_indices.insert(*col_idx) {
-                let col_arr = partition_batch.column(*col_idx);
-                columns.push(compute::take(col_arr.as_ref(), &source_indices, None)?);
-            }
-        } else {
-            let evaluated = expr
-                .evaluate(partition_batch)?
-                .into_array(partition_batch.num_rows())?;
-            columns.push(compute::take(evaluated.as_ref(), &source_indices, None)?);
-        }
-    }
-
-    if !rows_per_match.is_one_row() {
-        for maybe_idx in order_by_input_indices {
-            if let Some(col_idx) = maybe_idx
-                && included_input_indices.insert(*col_idx)
-            {
-                let col_arr = partition_batch.column(*col_idx);
-                columns.push(compute::take(col_arr.as_ref(), &source_indices, None)?);
-            }
-        }
-    }
-
     let unmatched_mask = if rows_per_match.include_unmatched_rows() {
         Some(BooleanArray::from_iter(
             emitted
@@ -947,10 +2123,91 @@ pub fn build_partition_output_batch(
         None
     };
 
+    // Fast projected output path: materialize ONLY the columns requested by `output_projection`
+    // (skipping unused `compute::take` copies on input columns and unused measure evaluations).
+    if let Some(proj_names) = output_projection {
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(proj_names.len());
+        let mut source_indices_cache: Option<UInt32Array> = None;
+        let input_schema = partition_batch.schema();
+        for name in proj_names {
+            if let Some(m) = measures.iter().find(|m| m.alias == *name) {
+                columns.push(evaluate_measure(
+                    partition_batch,
+                    emitted,
+                    program,
+                    m,
+                    unmatched_mask.as_ref(),
+                )?);
+            } else if let Ok(col_idx) = input_schema.index_of(name) {
+                let idx_arr = source_indices_cache
+                    .get_or_insert_with(|| build_source_indices(emitted));
+                let col_arr = partition_batch.column(col_idx);
+                columns.push(take_fast(col_arr, idx_arr)?);
+            } else {
+                // Expression PARTITION BY column
+                let mut matched_pb = None;
+                for (expr, maybe_idx) in
+                    partition_by_exprs.iter().zip(partition_by_input_indices)
+                {
+                    if maybe_idx.is_none() && expr.to_string() == *name {
+                        matched_pb = Some(expr);
+                        break;
+                    }
+                }
+                let expr = matched_pb.ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "Projected MATCH_RECOGNIZE output column '{name}' not found"
+                    )
+                })?;
+                let idx_arr = source_indices_cache
+                    .get_or_insert_with(|| build_source_indices(emitted));
+                let evaluated = expr
+                    .evaluate(partition_batch)?
+                    .into_array(partition_batch.num_rows())?;
+                columns.push(take_fast(&evaluated, idx_arr)?);
+            }
+        }
+        let out_batch = RecordBatch::try_new_with_options(
+            Arc::clone(output_schema),
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(out_len)),
+        )?;
+        return Ok(Some(out_batch));
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    let mut included_input_indices: HashSet<usize> = HashSet::new();
+    let source_indices = build_source_indices(emitted);
+
+    for (expr, maybe_idx) in partition_by_exprs.iter().zip(partition_by_input_indices) {
+        if let Some(col_idx) = maybe_idx {
+            if included_input_indices.insert(*col_idx) {
+                let col_arr = partition_batch.column(*col_idx);
+                columns.push(take_fast(col_arr, &source_indices)?);
+            }
+        } else {
+            let evaluated = expr
+                .evaluate(partition_batch)?
+                .into_array(partition_batch.num_rows())?;
+            columns.push(take_fast(&evaluated, &source_indices)?);
+        }
+    }
+
+    if !rows_per_match.is_one_row() {
+        for maybe_idx in order_by_input_indices {
+            if let Some(col_idx) = maybe_idx
+                && included_input_indices.insert(*col_idx)
+            {
+                let col_arr = partition_batch.column(*col_idx);
+                columns.push(take_fast(col_arr, &source_indices)?);
+            }
+        }
+    }
+
     for measure in measures {
         let arr = evaluate_measure(
             partition_batch,
-            &emitted,
+            emitted,
             program,
             measure,
             unmatched_mask.as_ref(),
@@ -962,7 +2219,7 @@ pub fn build_partition_output_batch(
         for col_idx in 0..partition_batch.num_columns() {
             if included_input_indices.insert(col_idx) {
                 let col_arr = partition_batch.column(col_idx);
-                columns.push(compute::take(col_arr.as_ref(), &source_indices, None)?);
+                columns.push(take_fast(col_arr, &source_indices)?);
             }
         }
     }
@@ -975,6 +2232,44 @@ pub fn build_partition_output_batch(
     Ok(Some(batch))
 }
 
+fn build_source_indices(emitted: &[EmitRow<'_>]) -> UInt32Array {
+    let mut v = Vec::with_capacity(emitted.len());
+    for r in emitted {
+        let row = match r {
+            EmitRow::Matched { source_row, .. } | EmitRow::Unmatched { source_row } => {
+                *source_row as u32
+            }
+        };
+        v.push(row);
+    }
+    UInt32Array::from(v)
+}
+
+/// Fast primitive gather bypassing Arrow's generic `compute::take` dispatch for non-null
+/// `Int64Array` / `Float64Array` columns.
+#[inline]
+fn take_fast(arr: &ArrayRef, indices: &UInt32Array) -> Result<ArrayRef> {
+    if arr.null_count() == 0 && indices.null_count() == 0 {
+        if let Some(i64_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+            let src = i64_arr.values();
+            let mut out = Vec::with_capacity(indices.len());
+            for &idx in indices.values() {
+                out.push(src[idx as usize]);
+            }
+            return Ok(Arc::new(Int64Array::from(out)));
+        }
+        if let Some(f64_arr) = arr.as_any().downcast_ref::<Float64Array>() {
+            let src = f64_arr.values();
+            let mut out = Vec::with_capacity(indices.len());
+            for &idx in indices.values() {
+                out.push(src[idx as usize]);
+            }
+            return Ok(Arc::new(Float64Array::from(out)));
+        }
+    }
+    Ok(compute::take(arr.as_ref(), indices, None)?)
+}
+
 fn evaluate_measure(
     partition_batch: &RecordBatch,
     emitted: &[EmitRow<'_>],
@@ -983,21 +2278,32 @@ fn evaluate_measure(
     unmatched_mask: Option<&BooleanArray>,
 ) -> Result<ArrayRef> {
     let out_len = emitted.len();
-    let mut slot_arrays = Vec::with_capacity(measure.slots.len());
-    for slot in &measure.slots {
-        slot_arrays.push(evaluate_slot(partition_batch, emitted, program, slot)?);
-    }
+    // Single-slot direct Column(0) shortcut: avoids building a temporary slot RecordBatch
+    // and dispatching outer_expr.evaluate() for measures like `SUM(price)` or `LAST(down.price)`.
+    let mut result = if measure.slots.len() == 1
+        && measure
+            .outer_expr
+            .downcast_ref::<Column>()
+            .is_some_and(|c| c.index() == 0)
+    {
+        evaluate_slot(partition_batch, emitted, program, &measure.slots[0])?
+    } else {
+        let mut slot_arrays = Vec::with_capacity(measure.slots.len());
+        for slot in &measure.slots {
+            slot_arrays.push(evaluate_slot(partition_batch, emitted, program, slot)?);
+        }
 
-    let slot_batch = RecordBatch::try_new_with_options(
-        Arc::clone(&measure.slot_schema),
-        slot_arrays,
-        &RecordBatchOptions::new().with_row_count(Some(out_len)),
-    )?;
+        let slot_batch = RecordBatch::try_new_with_options(
+            Arc::clone(&measure.slot_schema),
+            slot_arrays,
+            &RecordBatchOptions::new().with_row_count(Some(out_len)),
+        )?;
 
-    let mut result = measure
-        .outer_expr
-        .evaluate(&slot_batch)?
-        .into_array(out_len)?;
+        measure
+            .outer_expr
+            .evaluate(&slot_batch)?
+            .into_array(out_len)?
+    };
 
     if let Some(mask) = unmatched_mask {
         let nulls = new_null_array(result.data_type(), out_len);
@@ -1021,8 +2327,8 @@ fn evaluate_slot(
             let mut builder = Int64Builder::with_capacity(out_len);
             for row in emitted {
                 match row {
-                    EmitRow::Matched { found, .. } => {
-                        builder.append_value(found.match_number)
+                    EmitRow::Matched { match_number, .. } => {
+                        builder.append_value(*match_number)
                     }
                     EmitRow::Unmatched { .. } => builder.append_null(),
                 }
@@ -1042,7 +2348,7 @@ fn evaluate_slot(
                 match row {
                     EmitRow::Unmatched { .. } => builder.append_null(),
                     EmitRow::Matched {
-                        found,
+                        steps,
                         step_pos,
                         is_empty_match,
                         ..
@@ -1050,10 +2356,10 @@ fn evaluate_slot(
                         if *is_empty_match {
                             builder.append_null();
                         } else {
-                            let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                            let horizon = horizon_steps(steps, *step_pos, slot.semantics);
                             match eval_classifier_on_horizon(
                                 horizon,
-                                &found.steps,
+                                steps,
                                 symbol_set.as_ref(),
                                 *logical_nav,
                                 *logical_offset as usize,
@@ -1071,24 +2377,27 @@ fn evaluate_slot(
             Ok(Arc::new(builder.finish()))
         }
         PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
-            let evaluated = inner_expr
-                .evaluate(partition_batch)?
-                .into_array(num_part_rows)?;
-            let indices = UInt32Array::from_iter(emitted.iter().map(|row| match row {
-                EmitRow::Matched {
-                    source_row,
-                    is_empty_match,
-                    ..
-                } => {
-                    if *is_empty_match {
-                        None
-                    } else {
-                        Some(*source_row as u32)
+            let evaluated = eval_expr_or_col(inner_expr, partition_batch, num_part_rows)?;
+            let mut idx_vec = Vec::with_capacity(out_len);
+            for row in emitted {
+                let idx = match row {
+                    EmitRow::Matched {
+                        source_row,
+                        is_empty_match,
+                        ..
+                    } => {
+                        if *is_empty_match {
+                            None
+                        } else {
+                            Some(*source_row as u32)
+                        }
                     }
-                }
-                EmitRow::Unmatched { .. } => None,
-            }));
-            Ok(compute::take(evaluated.as_ref(), &indices, None)?)
+                    EmitRow::Unmatched { .. } => None,
+                };
+                idx_vec.push(idx);
+            }
+            let indices = UInt32Array::from(idx_vec);
+            take_fast(&evaluated, &indices)
         }
         PhysicalMeasureSlotKind::Nav {
             logical_nav,
@@ -1108,8 +2417,11 @@ fn evaluate_slot(
                             scalars.push(ScalarValue::try_from(&slot.data_type)?);
                         }
                         EmitRow::Matched {
-                            found,
+                            match_number,
+                            steps,
                             step_pos,
+                            part_start,
+                            part_end,
                             is_empty_match,
                             ..
                         } => {
@@ -1117,7 +2429,7 @@ fn evaluate_slot(
                                 scalars.push(ScalarValue::try_from(&slot.data_type)?);
                             } else {
                                 let horizon =
-                                    horizon_steps(found, *step_pos, slot.semantics);
+                                    horizon_steps(steps, *step_pos, slot.semantics);
                                 let target = navigate_logical_row(
                                     horizon,
                                     *logical_nav,
@@ -1125,11 +2437,12 @@ fn evaluate_slot(
                                     symbol_set.as_ref(),
                                 )
                                 .and_then(|base| {
-                                    navigate_physical(
+                                    navigate_physical_in_range(
                                         base,
                                         *physical_nav,
                                         *physical_offset as usize,
-                                        num_part_rows,
+                                        *part_start,
+                                        *part_end,
                                     )
                                 });
                                 match target {
@@ -1137,15 +2450,13 @@ fn evaluate_slot(
                                         .push(ScalarValue::try_from(&slot.data_type)?),
                                     Some(final_row) => {
                                         let cls = classifier_at_partition_row(
-                                            &found.steps,
-                                            final_row,
-                                            program,
+                                            steps, final_row, program,
                                         );
                                         scalars.push(eval_metadata_nav_scalar(
                                             partition_batch,
                                             final_row,
                                             cls.as_deref(),
-                                            found.match_number,
+                                            *match_number,
                                             inner_expr,
                                         )?);
                                     }
@@ -1156,38 +2467,48 @@ fn evaluate_slot(
                 }
                 ScalarValue::iter_to_array(scalars)
             } else {
-                let evaluated = inner_expr
-                    .evaluate(partition_batch)?
-                    .into_array(num_part_rows)?;
-                let indices =
-                    UInt32Array::from_iter(emitted.iter().map(|row| match row {
+                let evaluated =
+                    eval_expr_or_col(inner_expr, partition_batch, num_part_rows)?;
+                let mut idx_vec = Vec::with_capacity(out_len);
+                for row in emitted {
+                    let idx = match row {
                         EmitRow::Unmatched { .. } => None,
                         EmitRow::Matched {
-                            found,
+                            steps,
                             step_pos,
+                            part_start,
+                            part_end,
                             is_empty_match,
                             ..
                         } => {
                             if *is_empty_match {
-                                return None;
+                                None
+                            } else {
+                                let horizon =
+                                    horizon_steps(steps, *step_pos, slot.semantics);
+                                navigate_logical_row(
+                                    horizon,
+                                    *logical_nav,
+                                    *logical_offset as usize,
+                                    symbol_set.as_ref(),
+                                )
+                                .and_then(|base| {
+                                    navigate_physical_in_range(
+                                        base,
+                                        *physical_nav,
+                                        *physical_offset as usize,
+                                        *part_start,
+                                        *part_end,
+                                    )
+                                })
+                                .map(|r| r as u32)
                             }
-                            let horizon = horizon_steps(found, *step_pos, slot.semantics);
-                            let base_row = navigate_logical_row(
-                                horizon,
-                                *logical_nav,
-                                *logical_offset as usize,
-                                symbol_set.as_ref(),
-                            )?;
-                            let final_row = navigate_physical(
-                                base_row,
-                                *physical_nav,
-                                *physical_offset as usize,
-                                num_part_rows,
-                            )?;
-                            Some(final_row as u32)
                         }
-                    }));
-                Ok(compute::take(evaluated.as_ref(), &indices, None)?)
+                    };
+                    idx_vec.push(idx);
+                }
+                let indices = UInt32Array::from(idx_vec);
+                take_fast(&evaluated, &indices)
             }
         }
         PhysicalMeasureSlotKind::Agg {
@@ -1207,8 +2528,11 @@ fn evaluate_slot(
                             scalars.push(ScalarValue::try_from(&slot.data_type)?);
                         }
                         EmitRow::Matched {
-                            found,
+                            match_number,
+                            steps,
                             step_pos,
+                            part_start,
+                            part_end,
                             is_empty_match,
                             ..
                         } => {
@@ -1219,7 +2543,9 @@ fn evaluate_slot(
                                     scalars.push(eval_metadata_agg_scalar(
                                         partition_batch,
                                         &[],
-                                        found.match_number,
+                                        *match_number,
+                                        *part_start,
+                                        *part_end,
                                         program,
                                         agg_kind,
                                         symbol_set.as_ref(),
@@ -1233,11 +2559,13 @@ fn evaluate_slot(
                                 }
                             } else {
                                 let horizon =
-                                    horizon_steps(found, *step_pos, slot.semantics);
+                                    horizon_steps(steps, *step_pos, slot.semantics);
                                 scalars.push(eval_metadata_agg_scalar(
                                     partition_batch,
                                     horizon,
-                                    found.match_number,
+                                    *match_number,
+                                    *part_start,
+                                    *part_end,
                                     program,
                                     agg_kind,
                                     symbol_set.as_ref(),
@@ -1270,14 +2598,14 @@ fn evaluate_slot(
 
 #[inline]
 fn horizon_steps(
-    found: &FoundMatch,
+    steps: &[MatchStep],
     step_pos: Option<usize>,
     semantics: EvalSemantics,
 ) -> &[MatchStep] {
     match semantics {
-        EvalSemantics::Final => &found.steps,
+        EvalSemantics::Final => steps,
         EvalSemantics::Running => match step_pos {
-            Some(idx) => &found.steps[..=idx],
+            Some(idx) => &steps[..=idx],
             None => &[],
         },
     }
@@ -1317,18 +2645,27 @@ fn navigate_logical_row(
     }
 }
 
-fn navigate_physical(
+#[inline]
+fn navigate_physical_in_range(
     base_row: usize,
     physical_nav: Option<PhysicalNavKind>,
     offset: usize,
-    num_part_rows: usize,
+    part_start: usize,
+    part_end: usize,
 ) -> Option<usize> {
     match physical_nav {
         None => Some(base_row),
-        Some(PhysicalNavKind::Prev) => base_row.checked_sub(offset),
+        Some(PhysicalNavKind::Prev) => {
+            let target = base_row.checked_sub(offset)?;
+            if target >= part_start {
+                Some(target)
+            } else {
+                None
+            }
+        }
         Some(PhysicalNavKind::Next) => {
             let target = base_row.checked_add(offset)?;
-            if target < num_part_rows {
+            if target < part_end {
                 Some(target)
             } else {
                 None
@@ -1359,7 +2696,7 @@ fn evaluate_agg_slot(
                 match row {
                     EmitRow::Unmatched { .. } => builder.append_null(),
                     EmitRow::Matched {
-                        found,
+                        steps,
                         step_pos,
                         is_empty_match,
                         ..
@@ -1367,14 +2704,13 @@ fn evaluate_agg_slot(
                         if *is_empty_match {
                             builder.append_value(0);
                         } else {
-                            let horizon = horizon_steps(found, *step_pos, semantics);
-                            let count = matching_row_indices(
-                                horizon,
-                                symbol_set,
-                                None,
-                                num_part_rows,
-                            )
-                            .count();
+                            let horizon = horizon_steps(steps, *step_pos, semantics);
+                            let count = match symbol_set {
+                                None => horizon.len(),
+                                Some(set) => {
+                                    horizon.iter().filter(|s| set.contains(s.sym)).count()
+                                }
+                            };
                             builder.append_value(count as i64);
                         }
                     }
@@ -1387,7 +2723,7 @@ fn evaluate_agg_slot(
 
     let mut prepared_args = Vec::with_capacity(arg_exprs.len());
     for (i, expr) in arg_exprs.iter().enumerate() {
-        let raw = expr.evaluate(partition_batch)?.into_array(num_part_rows)?;
+        let raw = eval_expr_or_col(expr, partition_batch, num_part_rows)?;
         let prepared = if i == 0 {
             match agg_kind {
                 AggKind::Avg => compute::cast(raw.as_ref(), &DataType::Float64)?,
@@ -1402,35 +2738,211 @@ fn evaluate_agg_slot(
         prepared_args.push(prepared);
     }
 
-    // Fast path for common non-distinct COUNT and AVG without physical shift.
+    // Fast path for non-distinct COUNT, SUM (Int64/Float64), and AVG without physical shift,
+    // using O(1) incremental prefix accumulation when RUNNING progresses monotonically within a
+    // match (eliminating O(L^2) rescanning and ScalarValue boxing).
     if !distinct && arg_physical_nav.is_none() {
         match agg_kind {
             AggKind::Count => {
                 let evaluated = &prepared_args[0];
                 let mut builder = Int64Builder::with_capacity(out_len);
+                let mut last_match: Option<usize> = None;
+                let mut last_step_pos: usize = 0;
+                let mut running_count: i64 = 0;
                 for row in emitted {
                     match row {
-                        EmitRow::Unmatched { .. } => builder.append_null(),
+                        EmitRow::Unmatched { .. } => {
+                            last_match = None;
+                            builder.append_null();
+                        }
                         EmitRow::Matched {
-                            found,
+                            match_id,
+                            steps,
                             step_pos,
                             is_empty_match,
                             ..
                         } => {
                             if *is_empty_match {
+                                last_match = None;
                                 builder.append_value(0);
+                            } else if semantics == EvalSemantics::Running
+                                && let Some(pos) = *step_pos
+                            {
+                                let start_idx = if last_match == Some(*match_id)
+                                    && pos >= last_step_pos
+                                {
+                                    last_step_pos + 1
+                                } else {
+                                    running_count = 0;
+                                    0
+                                };
+                                for s in &steps[start_idx..=pos] {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && evaluated.is_valid(s.row_idx)
+                                    {
+                                        running_count += 1;
+                                    }
+                                }
+                                last_match = Some(*match_id);
+                                last_step_pos = pos;
+                                builder.append_value(running_count);
                             } else {
-                                let horizon = horizon_steps(found, *step_pos, semantics);
-                                let count = matching_row_indices(
-                                    horizon,
-                                    symbol_set,
-                                    None,
-                                    num_part_rows,
-                                )
-                                .flatten()
-                                .filter(|&idx| evaluated.is_valid(idx))
-                                .count();
-                                builder.append_value(count as i64);
+                                last_match = None;
+                                let horizon = horizon_steps(steps, *step_pos, semantics);
+                                let mut count = 0i64;
+                                for s in horizon {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && evaluated.is_valid(s.row_idx)
+                                    {
+                                        count += 1;
+                                    }
+                                }
+                                builder.append_value(count);
+                            }
+                        }
+                    }
+                }
+                return Ok(Arc::new(builder.finish()));
+            }
+            AggKind::Sum if result_type == &DataType::Int64 => {
+                let i64_arr = prepared_args[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::exec_datafusion_err!("Expected Int64Array")
+                    })?;
+                let vals = i64_arr.values();
+                let has_nulls = i64_arr.null_count() > 0;
+                let mut builder = Int64Builder::with_capacity(out_len);
+                let mut last_match: Option<usize> = None;
+                let mut last_step_pos: usize = 0;
+                let mut running_acc: Option<i64> = None;
+                for row in emitted {
+                    match row {
+                        EmitRow::Unmatched { .. } => {
+                            last_match = None;
+                            builder.append_null();
+                        }
+                        EmitRow::Matched {
+                            match_id,
+                            steps,
+                            step_pos,
+                            is_empty_match,
+                            ..
+                        } => {
+                            if *is_empty_match {
+                                last_match = None;
+                                builder.append_null();
+                            } else if semantics == EvalSemantics::Running
+                                && let Some(pos) = *step_pos
+                            {
+                                let start_idx = if last_match == Some(*match_id)
+                                    && pos >= last_step_pos
+                                {
+                                    last_step_pos + 1
+                                } else {
+                                    running_acc = None;
+                                    0
+                                };
+                                for s in &steps[start_idx..=pos] {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || i64_arr.is_valid(s.row_idx))
+                                    {
+                                        running_acc = Some(
+                                            running_acc
+                                                .unwrap_or(0)
+                                                .wrapping_add(vals[s.row_idx]),
+                                        );
+                                    }
+                                }
+                                last_match = Some(*match_id);
+                                last_step_pos = pos;
+                                builder.append_option(running_acc);
+                            } else {
+                                last_match = None;
+                                let horizon = horizon_steps(steps, *step_pos, semantics);
+                                let mut acc: Option<i64> = None;
+                                for s in horizon {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || i64_arr.is_valid(s.row_idx))
+                                    {
+                                        acc = Some(
+                                            acc.unwrap_or(0)
+                                                .wrapping_add(vals[s.row_idx]),
+                                        );
+                                    }
+                                }
+                                builder.append_option(acc);
+                            }
+                        }
+                    }
+                }
+                return Ok(Arc::new(builder.finish()));
+            }
+            AggKind::Sum if result_type == &DataType::Float64 => {
+                let f64_arr = prepared_args[0]
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        datafusion_common::exec_datafusion_err!("Expected Float64Array")
+                    })?;
+                let vals = f64_arr.values();
+                let has_nulls = f64_arr.null_count() > 0;
+                let mut builder = Float64Builder::with_capacity(out_len);
+                let mut last_match: Option<usize> = None;
+                let mut last_step_pos: usize = 0;
+                let mut running_acc: Option<f64> = None;
+                for row in emitted {
+                    match row {
+                        EmitRow::Unmatched { .. } => {
+                            last_match = None;
+                            builder.append_null();
+                        }
+                        EmitRow::Matched {
+                            match_id,
+                            steps,
+                            step_pos,
+                            is_empty_match,
+                            ..
+                        } => {
+                            if *is_empty_match {
+                                last_match = None;
+                                builder.append_null();
+                            } else if semantics == EvalSemantics::Running
+                                && let Some(pos) = *step_pos
+                            {
+                                let start_idx = if last_match == Some(*match_id)
+                                    && pos >= last_step_pos
+                                {
+                                    last_step_pos + 1
+                                } else {
+                                    running_acc = None;
+                                    0
+                                };
+                                for s in &steps[start_idx..=pos] {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || f64_arr.is_valid(s.row_idx))
+                                    {
+                                        running_acc = Some(
+                                            running_acc.unwrap_or(0.0) + vals[s.row_idx],
+                                        );
+                                    }
+                                }
+                                last_match = Some(*match_id);
+                                last_step_pos = pos;
+                                builder.append_option(running_acc);
+                            } else {
+                                last_match = None;
+                                let horizon = horizon_steps(steps, *step_pos, semantics);
+                                let mut acc: Option<f64> = None;
+                                for s in horizon {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || f64_arr.is_valid(s.row_idx))
+                                    {
+                                        acc = Some(acc.unwrap_or(0.0) + vals[s.row_idx]);
+                                    }
+                                }
+                                builder.append_option(acc);
                             }
                         }
                     }
@@ -1440,38 +2952,73 @@ fn evaluate_agg_slot(
             AggKind::Avg => {
                 let f64_arr = prepared_args[0]
                     .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
+                    .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
                         datafusion_common::exec_datafusion_err!(
                             "Expected Float64Array for AVG"
                         )
                     })?;
+                let vals = f64_arr.values();
+                let has_nulls = f64_arr.null_count() > 0;
                 let mut builder = Float64Builder::with_capacity(out_len);
+                let mut last_match: Option<usize> = None;
+                let mut last_step_pos: usize = 0;
+                let mut running_sum = 0.0f64;
+                let mut running_cnt = 0u64;
                 for row in emitted {
                     match row {
-                        EmitRow::Unmatched { .. } => builder.append_null(),
+                        EmitRow::Unmatched { .. } => {
+                            last_match = None;
+                            builder.append_null();
+                        }
                         EmitRow::Matched {
-                            found,
+                            match_id,
+                            steps,
                             step_pos,
                             is_empty_match,
                             ..
                         } => {
                             if *is_empty_match {
+                                last_match = None;
                                 builder.append_null();
+                            } else if semantics == EvalSemantics::Running
+                                && let Some(pos) = *step_pos
+                            {
+                                let start_idx = if last_match == Some(*match_id)
+                                    && pos >= last_step_pos
+                                {
+                                    last_step_pos + 1
+                                } else {
+                                    running_sum = 0.0;
+                                    running_cnt = 0;
+                                    0
+                                };
+                                for s in &steps[start_idx..=pos] {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || f64_arr.is_valid(s.row_idx))
+                                    {
+                                        running_sum += vals[s.row_idx];
+                                        running_cnt += 1;
+                                    }
+                                }
+                                last_match = Some(*match_id);
+                                last_step_pos = pos;
+                                if running_cnt == 0 {
+                                    builder.append_null();
+                                } else {
+                                    builder
+                                        .append_value(running_sum / running_cnt as f64);
+                                }
                             } else {
-                                let horizon = horizon_steps(found, *step_pos, semantics);
+                                last_match = None;
+                                let horizon = horizon_steps(steps, *step_pos, semantics);
                                 let mut sum = 0.0f64;
                                 let mut count = 0u64;
-                                for idx in matching_row_indices(
-                                    horizon,
-                                    symbol_set,
-                                    None,
-                                    num_part_rows,
-                                )
-                                .flatten()
-                                {
-                                    if f64_arr.is_valid(idx) {
-                                        sum += f64_arr.value(idx);
+                                for s in horizon {
+                                    if symbol_set.is_none_or(|set| set.contains(s.sym))
+                                        && (!has_nulls || f64_arr.is_valid(s.row_idx))
+                                    {
+                                        sum += vals[s.row_idx];
                                         count += 1;
                                     }
                                 }
@@ -1505,8 +3052,10 @@ fn evaluate_agg_slot(
                 scalars.push(ScalarValue::try_from(scalar_dt)?);
             }
             EmitRow::Matched {
-                found,
+                steps,
                 step_pos,
+                part_start,
+                part_end,
                 is_empty_match,
                 ..
             } => {
@@ -1516,7 +3065,8 @@ fn evaluate_agg_slot(
                     } else if matches!(agg_kind, AggKind::Udaf(_)) {
                         scalars.push(eval_single_agg_scalar(
                             &[],
-                            num_part_rows,
+                            *part_start,
+                            *part_end,
                             input_schema.as_ref(),
                             agg_kind,
                             symbol_set,
@@ -1530,10 +3080,11 @@ fn evaluate_agg_slot(
                         scalars.push(ScalarValue::try_from(scalar_dt)?);
                     }
                 } else {
-                    let horizon = horizon_steps(found, *step_pos, semantics);
+                    let horizon = horizon_steps(steps, *step_pos, semantics);
                     scalars.push(eval_single_agg_scalar(
                         horizon,
-                        num_part_rows,
+                        *part_start,
+                        *part_end,
                         input_schema.as_ref(),
                         agg_kind,
                         symbol_set,
@@ -1550,11 +3101,12 @@ fn evaluate_agg_slot(
     ScalarValue::iter_to_array(scalars)
 }
 
-fn matching_row_indices<'a>(
+fn matching_row_indices_in_range<'a>(
     horizon: &'a [MatchStep],
     symbol_set: Option<&'a SymbolSet>,
     arg_physical_nav: Option<(PhysicalNavKind, u32)>,
-    num_part_rows: usize,
+    part_start: usize,
+    part_end: usize,
 ) -> impl Iterator<Item = Option<usize>> + 'a {
     horizon.iter().filter_map(move |s| {
         if let Some(set) = symbol_set
@@ -1564,9 +3116,13 @@ fn matching_row_indices<'a>(
         }
         let shifted = match arg_physical_nav {
             None => Some(s.row_idx),
-            Some((kind, off)) => {
-                navigate_physical(s.row_idx, Some(kind), off as usize, num_part_rows)
-            }
+            Some((kind, off)) => navigate_physical_in_range(
+                s.row_idx,
+                Some(kind),
+                off as usize,
+                part_start,
+                part_end,
+            ),
         };
         Some(shifted)
     })
@@ -1579,12 +3135,9 @@ fn sum_indices(
 ) -> Result<ScalarValue> {
     match result_type {
         DataType::Int64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!("Expected Int64Array")
-                })?;
+            let a = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Expected Int64Array")
+            })?;
             let mut acc: Option<i64> = None;
             for idx in indices {
                 if a.is_valid(idx) {
@@ -1609,12 +3162,9 @@ fn sum_indices(
             Ok(ScalarValue::UInt64(acc))
         }
         DataType::Float64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!("Expected Float64Array")
-                })?;
+            let a = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Expected Float64Array")
+            })?;
             let mut acc: Option<f64> = None;
             for idx in indices {
                 if a.is_valid(idx) {
@@ -1649,12 +3199,9 @@ fn sum_indices_distinct(
 ) -> Result<ScalarValue> {
     match result_type {
         DataType::Int64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!("Expected Int64Array")
-                })?;
+            let a = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Expected Int64Array")
+            })?;
             let mut seen = HashSet::new();
             let mut acc: Option<i64> = None;
             for idx in indices {
@@ -1687,12 +3234,9 @@ fn sum_indices_distinct(
             Ok(ScalarValue::UInt64(acc))
         }
         DataType::Float64 => {
-            let a = arr
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!("Expected Float64Array")
-                })?;
+            let a = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("Expected Float64Array")
+            })?;
             let mut seen = HashSet::new();
             let mut acc: Option<f64> = None;
             for idx in indices {

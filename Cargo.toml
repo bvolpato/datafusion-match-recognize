@@ -8,7 +8,6 @@ rust-version = "1.95.0"
 license = "Apache-2.0"
 readme = "README.md"
 description = "SQL:2016 MATCH_RECOGNIZE (Row Pattern Recognition) extension for Apache DataFusion"
-homepage = "https://github.com/bvolpato/datafusion-match-recognize"
 repository = "https://github.com/bvolpato/datafusion-match-recognize"
 keywords = ["datafusion", "sql", "match_recognize", "pattern-matching", "arrow"]
 categories = ["database"]

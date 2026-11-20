@@ -454,6 +454,23 @@ fn main() {
             let mut df_med: Option<f64> = None;
             let mut df_out: Option<Vec<Vec<String>>> = None;
             if let Some(ctx) = &ctx {
+                if std::env::var("BENCH_EXPLAIN").as_deref() == Ok("1") {
+                    let explain_sql = format!("EXPLAIN ANALYZE {sql}");
+                    let batches = ctx
+                        .sql(&explain_sql)
+                        .await
+                        .unwrap()
+                        .collect()
+                        .await
+                        .unwrap();
+                    println!("=== EXPLAIN ANALYZE {name} ===");
+                    for r in format_df_rows(&batches) {
+                        for col in r {
+                            println!("{col}");
+                        }
+                    }
+                    continue;
+                }
                 for _ in 0..WARMUP_ITERS {
                     let _ = ctx.sql(sql).await.unwrap().collect().await.unwrap();
                 }

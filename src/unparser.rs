@@ -44,6 +44,15 @@ impl UserDefinedLogicalNodeUnparser for MatchRecognizeUnparser {
             return Ok(UnparseToStatementResult::Unmodified);
         };
         let table_factor = match_recognize_to_table_factor(mr, unparser)?;
+        let projection = match &mr.output_projection {
+            Some(cols) => cols
+                .iter()
+                .map(|c| SelectItem::UnnamedExpr(SqlExpr::Identifier(Ident::new(c))))
+                .collect(),
+            None => vec![SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )],
+        };
         let select = Select {
             select_token: ast::helpers::attached_token::AttachedToken::empty(),
             optimizer_hints: vec![],
@@ -51,9 +60,7 @@ impl UserDefinedLogicalNodeUnparser for MatchRecognizeUnparser {
             select_modifiers: None,
             top: None,
             top_before_distinct: false,
-            projection: vec![SelectItem::Wildcard(
-                ast::WildcardAdditionalOptions::default(),
-            )],
+            projection,
             exclude: None,
             into: None,
             from: vec![TableWithJoins {

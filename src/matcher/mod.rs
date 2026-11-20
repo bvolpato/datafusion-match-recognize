@@ -131,6 +131,13 @@ pub trait StatefulPredicateEvaluator {
     /// Returns true if any symbol in the query is stateful.
     fn has_any_stateful(&self) -> bool;
 
+    /// Returns true if `symbols.matches(pos, sym)` holds a necessary row-local pre-filter bit
+    /// for stateful symbol `sym` (allowing O(1) bitmask rejection before calling `eval_stateful`).
+    #[inline]
+    fn has_prefilter(&self, _sym: SymbolId) -> bool {
+        false
+    }
+
     /// Evaluates the stateful `DEFINE` predicate for `sym` on `tentative_steps`, where the last
     /// element of `tentative_steps` is the candidate row `(pos, sym)`.
     fn eval_stateful(
@@ -199,6 +206,39 @@ pub enum PartitionEvent {
     UnmatchedRow { row_idx: usize },
 }
 
+/// Zero-allocation flat match record indexing into a shared `steps_pool: Vec<MatchStep>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlatFoundMatch {
+    pub match_number: i64,
+    pub start_row: usize,
+    pub end_row: usize,
+    pub steps_start: usize,
+    pub steps_end: usize,
+    pub part_start: usize,
+    pub part_end: usize,
+}
+
+/// Flat partition output event avoiding per-match `Vec<MatchStep>` heap allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatPartitionEvent {
+    Match(FlatFoundMatch),
+    UnmatchedRow { row_idx: usize },
+}
+
+/// Batch-wide flat storage for all matched steps and events across all partitions in a batch.
+#[derive(Debug, Default)]
+pub struct FlatMatchPool {
+    pub steps: Vec<MatchStep>,
+    pub events: Vec<FlatPartitionEvent>,
+}
+
+impl FlatMatchPool {
+    pub fn clear(&mut self) {
+        self.steps.clear();
+        self.events.clear();
+    }
+}
+
 /// Diagnostic counters collected during matching (used for complexity tests and metrics).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MatchStats {
@@ -222,15 +262,38 @@ struct Thread {
     history_head: u32,
 }
 
-/// Reusable hybrid PikeVM matcher for a compiled [`Program`].
-#[derive(Debug)]
-pub struct Matcher<'a> {
-    program: &'a Program,
+/// Reusable scratch buffers for [`Matcher`] so streams avoid allocating per partition.
+#[derive(Debug, Default)]
+pub struct MatcherBuffers {
     visited: Vec<u32>,
     visit_gen: u32,
     arena: Vec<HistoryEntry>,
     epsilon_stack: Vec<Thread>,
     scratch_steps: Vec<MatchStep>,
+    current: Vec<Thread>,
+    next: Vec<Thread>,
+}
+
+impl MatcherBuffers {
+    /// Creates reusable buffers sized for `program`.
+    pub fn new(program: &Program) -> Self {
+        Self {
+            visited: vec![0; program.instructions.len()],
+            visit_gen: 0,
+            arena: Vec::new(),
+            epsilon_stack: Vec::new(),
+            scratch_steps: Vec::new(),
+            current: Vec::new(),
+            next: Vec::new(),
+        }
+    }
+}
+
+/// Reusable hybrid PikeVM matcher for a compiled [`Program`].
+#[derive(Debug)]
+pub struct Matcher<'a> {
+    program: &'a Program,
+    buf: MatcherBuffers,
     max_active_threads: usize,
 }
 
@@ -249,14 +312,32 @@ impl<'a> Matcher<'a> {
         max_active_threads: usize,
     ) -> Self {
         Self {
-            visited: vec![0; program.instructions.len()],
+            buf: MatcherBuffers::new(program),
             program,
-            visit_gen: 0,
-            arena: Vec::new(),
-            epsilon_stack: Vec::new(),
-            scratch_steps: Vec::new(),
             max_active_threads,
         }
+    }
+
+    /// Creates a matcher reusing an existing [`MatcherBuffers`] allocation.
+    pub fn from_buffers(
+        program: &'a Program,
+        max_active_threads: usize,
+        mut buf: MatcherBuffers,
+    ) -> Self {
+        if buf.visited.len() != program.instructions.len() {
+            buf.visited.resize(program.instructions.len(), 0);
+            buf.visit_gen = 0;
+        }
+        Self {
+            program,
+            buf,
+            max_active_threads,
+        }
+    }
+
+    /// Returns the underlying reusable buffers for the next partition.
+    pub fn into_buffers(self) -> MatcherBuffers {
+        self.buf
     }
 
     /// Scans an entire partition using the Tier 1 stateless fast path.
@@ -279,7 +360,28 @@ impl<'a> Matcher<'a> {
         rows_per_match: RowsPerMatch,
         evaluator: &mut E,
     ) -> Result<(Vec<PartitionEvent>, MatchStats)> {
-        let num_rows = symbols.num_rows();
+        self.match_partition_range_with_evaluator(
+            symbols,
+            0,
+            symbols.num_rows(),
+            skip,
+            rows_per_match,
+            evaluator,
+        )
+    }
+
+    /// Scans rows `[part_start..part_end)` of a batch-wide [`PartitionSymbols`] table as a single
+    /// logical partition. Emitted `MatchStep.row_idx` and `FoundMatch.start_row`/`end_row` use
+    /// batch-global row indices within `part_start..part_end`.
+    pub fn match_partition_range_with_evaluator<E: StatefulPredicateEvaluator>(
+        &mut self,
+        symbols: &PartitionSymbols,
+        part_start: usize,
+        part_end: usize,
+        skip: &AfterMatchSkip,
+        rows_per_match: RowsPerMatch,
+        evaluator: &mut E,
+    ) -> Result<(Vec<PartitionEvent>, MatchStats)> {
         let skip_target_set = match skip {
             AfterMatchSkip::ToFirst(name) | AfterMatchSkip::ToLast(name) => {
                 let set = self.program.resolve_symbol_set(name).ok_or_else(|| {
@@ -293,24 +395,50 @@ impl<'a> Matcher<'a> {
         };
 
         let has_stateful = evaluator.has_any_stateful();
-        let start_mask = if !has_stateful {
-            self.program.start_symbols_mask
-        } else {
-            None
-        };
+        let start_mask = self.program.start_symbols_mask.filter(|&mask| {
+            !has_stateful
+                || (0..self.program.num_symbols()).all(|s| {
+                    let sym = s as SymbolId;
+                    (mask & (1u64 << s)) == 0
+                        || !evaluator.is_stateful(sym)
+                        || evaluator.has_prefilter(sym)
+                })
+        });
+        let second_mask = self.program.second_symbols_mask.filter(|&mask| {
+            !has_stateful
+                || (0..self.program.num_symbols()).all(|s| {
+                    let sym = s as SymbolId;
+                    (mask & (1u64 << s)) == 0
+                        || !evaluator.is_stateful(sym)
+                        || evaluator.has_prefilter(sym)
+                })
+        });
 
         let mut events = Vec::new();
         let mut stats = MatchStats::default();
         let mut match_number: i64 = 0;
-        let mut start_row: usize = 0;
-        let mut max_matched_end: usize = 0;
+        let mut start_row: usize = part_start;
+        let mut max_matched_end: usize = part_start;
 
-        while start_row < num_rows {
-            // Tier 1 O(1) fast skip: if no symbol on the pattern's start frontier matches this
-            // row (and the pattern is non-nullable & anchor-free), no match can start here.
+        while start_row < part_end {
+            // O(1) 1-row and 2-row frontier fast skip.
             if let (Some(mask), Some(row_bits)) =
                 (start_mask, symbols.row_bitmask64(start_row))
                 && (row_bits & mask) == 0
+            {
+                stats.fast_skipped_rows += 1;
+                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
+                {
+                    events.push(PartitionEvent::UnmatchedRow { row_idx: start_row });
+                }
+                start_row += 1;
+                continue;
+            }
+            if let Some(mask2) = second_mask
+                && (start_row + 1 >= part_end
+                    || symbols
+                        .row_bitmask64(start_row + 1)
+                        .is_some_and(|bits2| (bits2 & mask2) == 0))
             {
                 stats.fast_skipped_rows += 1;
                 if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
@@ -324,15 +452,19 @@ impl<'a> Matcher<'a> {
             stats.attempts += 1;
             let candidate_mn = match_number + 1;
             let found = if has_stateful {
-                self.find_match_at_stateful(
+                self.find_match_at_stateful_in_range(
                     symbols,
                     start_row,
+                    part_start,
+                    part_end,
                     candidate_mn,
                     evaluator,
                     &mut stats,
                 )?
             } else {
-                self.find_match_at(symbols, start_row, &mut stats)
+                self.find_match_at_in_range(
+                    symbols, start_row, part_start, part_end, &mut stats,
+                )
             };
 
             match found {
@@ -382,6 +514,160 @@ impl<'a> Matcher<'a> {
         Ok((events, stats))
     }
 
+    /// Zero-allocation variant of [`Self::match_partition_range_with_evaluator`] that appends
+    /// matched steps and events contiguously into `pool` (avoiding per-match `Vec<MatchStep>`
+    /// heap allocations across millions of matches).
+    #[expect(clippy::too_many_arguments)]
+    pub fn match_partition_range_into_pool<E: StatefulPredicateEvaluator>(
+        &mut self,
+        symbols: &PartitionSymbols,
+        part_start: usize,
+        part_end: usize,
+        skip: &AfterMatchSkip,
+        rows_per_match: RowsPerMatch,
+        evaluator: &mut E,
+        pool: &mut FlatMatchPool,
+    ) -> Result<()> {
+        let skip_target_set = match skip {
+            AfterMatchSkip::ToFirst(name) | AfterMatchSkip::ToLast(name) => {
+                let set = self.program.resolve_symbol_set(name).ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!(
+                        "AFTER MATCH SKIP references unknown pattern variable '{name}'"
+                    )
+                })?;
+                Some(set)
+            }
+            AfterMatchSkip::PastLastRow | AfterMatchSkip::ToNextRow => None,
+        };
+
+        let has_stateful = evaluator.has_any_stateful();
+        let start_mask = self.program.start_symbols_mask.filter(|&mask| {
+            !has_stateful
+                || (0..self.program.num_symbols()).all(|s| {
+                    let sym = s as SymbolId;
+                    (mask & (1u64 << s)) == 0
+                        || !evaluator.is_stateful(sym)
+                        || evaluator.has_prefilter(sym)
+                })
+        });
+        let second_mask = self.program.second_symbols_mask.filter(|&mask| {
+            !has_stateful
+                || (0..self.program.num_symbols()).all(|s| {
+                    let sym = s as SymbolId;
+                    (mask & (1u64 << s)) == 0
+                        || !evaluator.is_stateful(sym)
+                        || evaluator.has_prefilter(sym)
+                })
+        });
+
+        let mut stats = MatchStats::default();
+        let mut match_number: i64 = 0;
+        let mut start_row: usize = part_start;
+        let mut max_matched_end: usize = part_start;
+
+        while start_row < part_end {
+            if let (Some(mask), Some(row_bits)) =
+                (start_mask, symbols.row_bitmask64(start_row))
+                && (row_bits & mask) == 0
+            {
+                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
+                {
+                    pool.events
+                        .push(FlatPartitionEvent::UnmatchedRow { row_idx: start_row });
+                }
+                start_row += 1;
+                continue;
+            }
+            if let Some(mask2) = second_mask
+                && (start_row + 1 >= part_end
+                    || symbols
+                        .row_bitmask64(start_row + 1)
+                        .is_some_and(|bits2| (bits2 & mask2) == 0))
+            {
+                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
+                {
+                    pool.events
+                        .push(FlatPartitionEvent::UnmatchedRow { row_idx: start_row });
+                }
+                start_row += 1;
+                continue;
+            }
+
+            let candidate_mn = match_number + 1;
+            let best_head = if has_stateful {
+                self.find_match_head_stateful_in_range(
+                    symbols,
+                    start_row,
+                    part_start,
+                    part_end,
+                    candidate_mn,
+                    evaluator,
+                    &mut stats,
+                )?
+            } else {
+                self.find_match_head_in_range(
+                    symbols, start_row, part_start, part_end, &mut stats,
+                )
+            };
+
+            match best_head {
+                Some(head) => {
+                    let steps_start = pool.steps.len();
+                    materialize_history_into(&self.buf.arena, head, &mut pool.steps);
+                    let steps_end = pool.steps.len();
+                    let steps_slice = &pool.steps[steps_start..steps_end];
+                    let end_row = start_row + steps_slice.len();
+                    let is_empty = steps_slice.is_empty();
+                    match_number = candidate_mn;
+                    if !is_empty {
+                        max_matched_end = max_matched_end.max(end_row);
+                    }
+
+                    let next_start = if is_empty {
+                        start_row + 1
+                    } else {
+                        compute_next_start(
+                            start_row,
+                            end_row,
+                            steps_slice,
+                            skip,
+                            skip_target_set.as_ref(),
+                        )?
+                    };
+
+                    let should_emit = !is_empty || rows_per_match.show_empty_matches();
+                    if should_emit {
+                        pool.events.push(FlatPartitionEvent::Match(FlatFoundMatch {
+                            match_number,
+                            start_row,
+                            end_row,
+                            steps_start,
+                            steps_end,
+                            part_start,
+                            part_end,
+                        }));
+                    } else {
+                        pool.steps.truncate(steps_start);
+                    }
+
+                    start_row = next_start;
+                }
+                None => {
+                    if rows_per_match.include_unmatched_rows()
+                        && start_row >= max_matched_end
+                    {
+                        pool.events.push(FlatPartitionEvent::UnmatchedRow {
+                            row_idx: start_row,
+                        });
+                    }
+                    start_row += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Tier 1 stateless fast path: finds the highest-priority SQL:2016 match starting at
     /// `start_row` in O(N * |states|) time using per-position `visited[pc]` deduplication.
     pub fn find_match_at(
@@ -390,38 +676,62 @@ impl<'a> Matcher<'a> {
         start_row: usize,
         stats: &mut MatchStats,
     ) -> Option<Vec<MatchStep>> {
-        let num_rows = symbols.num_rows();
-        self.arena.clear();
-        let mut current: Vec<Thread> = Vec::new();
-        let mut next: Vec<Thread> = Vec::new();
+        self.find_match_at_in_range(symbols, start_row, 0, symbols.num_rows(), stats)
+    }
+
+    fn find_match_at_in_range(
+        &mut self,
+        symbols: &PartitionSymbols,
+        start_row: usize,
+        part_start: usize,
+        part_end: usize,
+        stats: &mut MatchStats,
+    ) -> Option<Vec<MatchStep>> {
+        self.find_match_head_in_range(symbols, start_row, part_start, part_end, stats)
+            .map(|head| materialize_history(&self.buf.arena, head))
+    }
+
+    fn find_match_head_in_range(
+        &mut self,
+        symbols: &PartitionSymbols,
+        start_row: usize,
+        part_start: usize,
+        part_end: usize,
+        stats: &mut MatchStats,
+    ) -> Option<u32> {
+        self.buf.arena.clear();
+        self.buf.current.clear();
+        self.buf.next.clear();
         let mut best_match: Option<u32> = None;
 
         self.bump_gen();
-        self.add_thread(
+        self.add_thread_into_current(
             Thread {
                 pc: 0,
                 exclude_depth: 0,
                 history_head: NO_HISTORY,
             },
             start_row,
-            num_rows,
-            &mut current,
+            part_start,
+            part_end,
             &mut best_match,
             stats,
         );
 
         let mut pos = start_row;
-        while !current.is_empty() && pos < num_rows {
-            next.clear();
+        while !self.buf.current.is_empty() && pos < part_end {
+            self.buf.next.clear();
             self.bump_gen();
 
-            for thread in current.drain(..) {
+            let cur_len = self.buf.current.len();
+            for idx in 0..cur_len {
+                let thread = self.buf.current[idx];
                 stats.total_thread_steps += 1;
                 match self.program.instructions[thread.pc] {
                     Inst::MatchLabel { sym } => {
                         if symbols.matches(pos, sym) {
-                            let new_head = self.arena.len() as u32;
-                            self.arena.push(HistoryEntry {
+                            let new_head = self.buf.arena.len() as u32;
+                            self.buf.arena.push(HistoryEntry {
                                 step: MatchStep {
                                     row_idx: pos,
                                     sym,
@@ -429,15 +739,15 @@ impl<'a> Matcher<'a> {
                                 },
                                 prev: thread.history_head,
                             });
-                            let hit_accept = self.add_thread(
+                            let hit_accept = self.add_thread_into_next(
                                 Thread {
                                     pc: thread.pc + 1,
                                     exclude_depth: thread.exclude_depth,
                                     history_head: new_head,
                                 },
                                 pos + 1,
-                                num_rows,
-                                &mut next,
+                                part_start,
+                                part_end,
                                 &mut best_match,
                                 stats,
                             );
@@ -454,11 +764,11 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(&mut self.buf.current, &mut self.buf.next);
             pos += 1;
         }
 
-        best_match.map(|head| materialize_history(&self.arena, head))
+        best_match
     }
 
     /// Tier 2 hybrid stateful path: stateless symbols resolve in O(1) from `symbols`; stateful
@@ -474,58 +784,110 @@ impl<'a> Matcher<'a> {
         evaluator: &mut E,
         stats: &mut MatchStats,
     ) -> Result<Option<Vec<MatchStep>>> {
-        let num_rows = symbols.num_rows();
-        self.arena.clear();
-        let mut current: Vec<Thread> = Vec::new();
-        let mut next: Vec<Thread> = Vec::new();
+        self.find_match_at_stateful_in_range(
+            symbols,
+            start_row,
+            0,
+            symbols.num_rows(),
+            candidate_match_number,
+            evaluator,
+            stats,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn find_match_at_stateful_in_range<E: StatefulPredicateEvaluator>(
+        &mut self,
+        symbols: &PartitionSymbols,
+        start_row: usize,
+        part_start: usize,
+        part_end: usize,
+        candidate_match_number: i64,
+        evaluator: &mut E,
+        stats: &mut MatchStats,
+    ) -> Result<Option<Vec<MatchStep>>> {
+        Ok(self
+            .find_match_head_stateful_in_range(
+                symbols,
+                start_row,
+                part_start,
+                part_end,
+                candidate_match_number,
+                evaluator,
+                stats,
+            )?
+            .map(|head| materialize_history(&self.buf.arena, head)))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn find_match_head_stateful_in_range<E: StatefulPredicateEvaluator>(
+        &mut self,
+        symbols: &PartitionSymbols,
+        start_row: usize,
+        part_start: usize,
+        part_end: usize,
+        candidate_match_number: i64,
+        evaluator: &mut E,
+        stats: &mut MatchStats,
+    ) -> Result<Option<u32>> {
+        self.buf.arena.clear();
+        self.buf.current.clear();
+        self.buf.next.clear();
         let mut best_match: Option<u32> = None;
 
         self.bump_gen();
-        self.add_thread(
+        self.add_thread_into_current(
             Thread {
                 pc: 0,
                 exclude_depth: 0,
                 history_head: NO_HISTORY,
             },
             start_row,
-            num_rows,
-            &mut current,
+            part_start,
+            part_end,
             &mut best_match,
             stats,
         );
 
         let mut pos = start_row;
-        while !current.is_empty() && pos < num_rows {
-            next.clear();
+        while !self.buf.current.is_empty() && pos < part_end {
+            self.buf.next.clear();
 
-            for thread in current.drain(..) {
+            let cur_len = self.buf.current.len();
+            for idx in 0..cur_len {
+                let thread = self.buf.current[idx];
                 stats.total_thread_steps += 1;
                 match self.program.instructions[thread.pc] {
                     Inst::MatchLabel { sym } => {
                         let matched = if evaluator.is_stateful(sym) {
-                            let step = MatchStep {
-                                row_idx: pos,
-                                sym,
-                                excluded: thread.exclude_depth > 0,
-                            };
-                            fill_tentative_steps(
-                                &self.arena,
-                                thread.history_head,
-                                step,
-                                &mut self.scratch_steps,
-                            );
-                            evaluator.eval_stateful(
-                                sym,
-                                &self.scratch_steps,
-                                candidate_match_number,
-                            )?
+                            if evaluator.has_prefilter(sym) && !symbols.matches(pos, sym)
+                            {
+                                false
+                            } else {
+                                let step = MatchStep {
+                                    row_idx: pos,
+                                    sym,
+                                    excluded: thread.exclude_depth > 0,
+                                };
+                                fill_tentative_steps(
+                                    &self.buf.arena,
+                                    thread.history_head,
+                                    step,
+                                    &mut self.buf.scratch_steps,
+                                );
+                                evaluator.eval_stateful(
+                                    sym,
+                                    &self.buf.scratch_steps,
+                                    candidate_match_number,
+                                )?
+                            }
                         } else {
                             symbols.matches(pos, sym)
                         };
 
                         if matched {
-                            let new_head = self.arena.len() as u32;
-                            self.arena.push(HistoryEntry {
+                            let new_head = self.buf.arena.len() as u32;
+                            self.buf.arena.push(HistoryEntry {
                                 step: MatchStep {
                                     row_idx: pos,
                                     sym,
@@ -537,22 +899,22 @@ impl<'a> Matcher<'a> {
                             // Per-thread visited generation prevents epsilon cycles without
                             // merging distinct stateful histories across different threads.
                             self.bump_gen();
-                            let hit_accept = self.add_thread(
+                            let hit_accept = self.add_thread_into_next(
                                 Thread {
                                     pc: thread.pc + 1,
                                     exclude_depth: thread.exclude_depth,
                                     history_head: new_head,
                                 },
                                 pos + 1,
-                                num_rows,
-                                &mut next,
+                                part_start,
+                                part_end,
                                 &mut best_match,
                                 stats,
                             );
                             if hit_accept {
                                 break;
                             }
-                            if next.len() > self.max_active_threads {
+                            if self.buf.next.len() > self.max_active_threads {
                                 return exec_err!(
                                     "MATCH_RECOGNIZE stateful matching exceeded maximum active thread limit ({})",
                                     self.max_active_threads
@@ -568,113 +930,176 @@ impl<'a> Matcher<'a> {
                 }
             }
 
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(&mut self.buf.current, &mut self.buf.next);
             pos += 1;
         }
 
-        Ok(best_match.map(|head| materialize_history(&self.arena, head)))
+        Ok(best_match)
     }
 
     #[inline]
     fn bump_gen(&mut self) {
-        self.visit_gen = self.visit_gen.wrapping_add(1);
-        if self.visit_gen == 0 {
-            self.visited.fill(0);
-            self.visit_gen = 1;
+        self.buf.visit_gen = self.buf.visit_gen.wrapping_add(1);
+        if self.buf.visit_gen == 0 {
+            self.buf.visited.fill(0);
+            self.buf.visit_gen = 1;
         }
     }
 
-    fn add_thread(
+    fn add_thread_into_current(
         &mut self,
         initial: Thread,
         pos: usize,
-        num_rows: usize,
-        out: &mut Vec<Thread>,
+        part_start: usize,
+        part_end: usize,
         best_match: &mut Option<u32>,
         stats: &mut MatchStats,
     ) -> bool {
-        self.epsilon_stack.clear();
-        self.epsilon_stack.push(initial);
+        add_thread_impl(
+            self.program,
+            &mut self.buf.visited,
+            self.buf.visit_gen,
+            &mut self.buf.epsilon_stack,
+            initial,
+            pos,
+            part_start,
+            part_end,
+            &mut self.buf.current,
+            best_match,
+            stats,
+        )
+    }
 
-        while let Some(thread) = self.epsilon_stack.pop() {
-            let pc = thread.pc;
-            if self.visited[pc] == self.visit_gen {
-                continue;
-            }
-            self.visited[pc] = self.visit_gen;
-            stats.total_thread_steps += 1;
-
-            match self.program.instructions[pc] {
-                Inst::MatchLabel { .. } => {
-                    out.push(thread);
-                }
-                Inst::Jump(target) => {
-                    self.epsilon_stack.push(Thread {
-                        pc: target,
-                        ..thread
-                    });
-                }
-                Inst::Split { first, second } => {
-                    self.epsilon_stack.push(Thread {
-                        pc: second,
-                        ..thread
-                    });
-                    self.epsilon_stack.push(Thread {
-                        pc: first,
-                        ..thread
-                    });
-                }
-                Inst::AnchorStart => {
-                    if pos == 0 {
-                        self.epsilon_stack.push(Thread {
-                            pc: pc + 1,
-                            ..thread
-                        });
-                    }
-                }
-                Inst::AnchorEnd => {
-                    if pos == num_rows {
-                        self.epsilon_stack.push(Thread {
-                            pc: pc + 1,
-                            ..thread
-                        });
-                    }
-                }
-                Inst::ExcludeEnter => {
-                    self.epsilon_stack.push(Thread {
-                        pc: pc + 1,
-                        exclude_depth: thread.exclude_depth + 1,
-                        ..thread
-                    });
-                }
-                Inst::ExcludeExit => {
-                    self.epsilon_stack.push(Thread {
-                        pc: pc + 1,
-                        exclude_depth: thread.exclude_depth.saturating_sub(1),
-                        ..thread
-                    });
-                }
-                Inst::Accept => {
-                    *best_match = Some(thread.history_head);
-                    self.epsilon_stack.clear();
-                    return true;
-                }
-            }
-        }
-
-        false
+    fn add_thread_into_next(
+        &mut self,
+        initial: Thread,
+        pos: usize,
+        part_start: usize,
+        part_end: usize,
+        best_match: &mut Option<u32>,
+        stats: &mut MatchStats,
+    ) -> bool {
+        add_thread_impl(
+            self.program,
+            &mut self.buf.visited,
+            self.buf.visit_gen,
+            &mut self.buf.epsilon_stack,
+            initial,
+            pos,
+            part_start,
+            part_end,
+            &mut self.buf.next,
+            best_match,
+            stats,
+        )
     }
 }
 
-fn materialize_history(arena: &[HistoryEntry], mut head: u32) -> Vec<MatchStep> {
+#[expect(clippy::too_many_arguments)]
+fn add_thread_impl(
+    program: &Program,
+    visited: &mut [u32],
+    visit_gen: u32,
+    epsilon_stack: &mut Vec<Thread>,
+    initial: Thread,
+    pos: usize,
+    part_start: usize,
+    part_end: usize,
+    out: &mut Vec<Thread>,
+    best_match: &mut Option<u32>,
+    stats: &mut MatchStats,
+) -> bool {
+    epsilon_stack.clear();
+    epsilon_stack.push(initial);
+
+    while let Some(thread) = epsilon_stack.pop() {
+        let pc = thread.pc;
+        if visited[pc] == visit_gen {
+            continue;
+        }
+        visited[pc] = visit_gen;
+        stats.total_thread_steps += 1;
+
+        match program.instructions[pc] {
+            Inst::MatchLabel { .. } => {
+                out.push(thread);
+            }
+            Inst::Jump(target) => {
+                epsilon_stack.push(Thread {
+                    pc: target,
+                    ..thread
+                });
+            }
+            Inst::Split { first, second } => {
+                epsilon_stack.push(Thread {
+                    pc: second,
+                    ..thread
+                });
+                epsilon_stack.push(Thread {
+                    pc: first,
+                    ..thread
+                });
+            }
+            Inst::AnchorStart => {
+                if pos == part_start {
+                    epsilon_stack.push(Thread {
+                        pc: pc + 1,
+                        ..thread
+                    });
+                }
+            }
+            Inst::AnchorEnd => {
+                if pos == part_end {
+                    epsilon_stack.push(Thread {
+                        pc: pc + 1,
+                        ..thread
+                    });
+                }
+            }
+            Inst::ExcludeEnter => {
+                epsilon_stack.push(Thread {
+                    pc: pc + 1,
+                    exclude_depth: thread.exclude_depth + 1,
+                    ..thread
+                });
+            }
+            Inst::ExcludeExit => {
+                epsilon_stack.push(Thread {
+                    pc: pc + 1,
+                    exclude_depth: thread.exclude_depth.saturating_sub(1),
+                    ..thread
+                });
+            }
+            Inst::Accept => {
+                *best_match = Some(thread.history_head);
+                epsilon_stack.clear();
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn materialize_history(arena: &[HistoryEntry], head: u32) -> Vec<MatchStep> {
     let mut steps = Vec::new();
+    materialize_history_into(arena, head, &mut steps);
+    steps
+}
+
+#[inline]
+fn materialize_history_into(
+    arena: &[HistoryEntry],
+    mut head: u32,
+    out: &mut Vec<MatchStep>,
+) {
+    let start = out.len();
     while head != NO_HISTORY {
         let entry = arena[head as usize];
-        steps.push(entry.step);
+        out.push(entry.step);
         head = entry.prev;
     }
-    steps.reverse();
-    steps
+    out[start..].reverse();
 }
 
 fn fill_tentative_steps(

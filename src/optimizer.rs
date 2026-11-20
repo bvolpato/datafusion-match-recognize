@@ -36,6 +36,53 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // Push pure column projections into MatchRecognizeNode so unused output columns
+        // (especially in ALL ROWS PER MATCH) skip materialization and allow upstream column
+        // pruning into Parquet/Repartition/Sort.
+        if let LogicalPlan::Projection(proj) = &plan
+            && let LogicalPlan::Extension(Extension { node }) = proj.input.as_ref()
+            && let Some(mr_node) = node.as_any().downcast_ref::<MatchRecognizeNode>()
+            && mr_node.output_projection.is_none()
+            && !proj.expr.is_empty()
+            && proj.expr.len() < mr_node.schema.fields().len()
+        {
+            let mut col_names: Vec<String> = Vec::with_capacity(proj.expr.len());
+            let mut seen = HashSet::new();
+            let mut all_pure_unaliased_cols = true;
+            for (expr, out_field) in proj.expr.iter().zip(proj.schema.fields()) {
+                if let Expr::Column(c) = expr
+                    && c.name == *out_field.name()
+                    && seen.insert(c.name.clone())
+                    && mr_node.schema.field_with_unqualified_name(&c.name).is_ok()
+                {
+                    col_names.push(c.name.clone());
+                } else {
+                    all_pure_unaliased_cols = false;
+                    break;
+                }
+            }
+            if all_pure_unaliased_cols {
+                let projected_mr = MatchRecognizeNode::try_new_with_projection(
+                    mr_node.input.clone(),
+                    mr_node.partition_by.clone(),
+                    mr_node.order_by.clone(),
+                    mr_node.measures.clone(),
+                    mr_node.rows_per_match,
+                    mr_node.after_match_skip.clone(),
+                    mr_node.pattern.clone(),
+                    mr_node.subsets.clone(),
+                    mr_node.definitions.clone(),
+                    mr_node.config,
+                    Some(col_names),
+                )?
+                .into_plan();
+                // Keep outer schema qualifiers (if any) intact only if needed.
+                if projected_mr.schema() == &proj.schema {
+                    return Ok(Transformed::yes(projected_mr));
+                }
+            }
+        }
+
         let LogicalPlan::Filter(filter) = plan else {
             return Ok(Transformed::no(plan));
         };
@@ -124,7 +171,7 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             Arc::new(mr_node.input.clone()),
         )?);
 
-        let new_mr = MatchRecognizeNode::try_new_with_subsets(
+        let new_mr = MatchRecognizeNode::try_new_with_projection(
             new_input,
             mr_node.partition_by.clone(),
             mr_node.order_by.clone(),
@@ -135,6 +182,7 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             mr_node.subsets.clone(),
             mr_node.definitions.clone(),
             mr_node.config,
+            mr_node.output_projection.clone(),
         )?
         .into_plan();
 

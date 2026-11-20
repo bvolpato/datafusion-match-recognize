@@ -93,6 +93,10 @@ pub struct Program {
     /// start frontier, and has at most 64 primary symbols. Enables O(1) row fast-skipping when
     /// all symbols are stateless.
     pub start_symbols_mask: Option<u64>,
+    /// Optional bitmask of symbols reachable at `start_row + 1` when `instructions[0]` is an
+    /// unconditional `MatchLabel` and `pc = 1` cannot accept or hit an anchor without consuming
+    /// a second row (e.g. `A B+ C` or `STRT DOWN+ UP+`). Enables O(1) two-row lookahead skip.
+    pub second_symbols_mask: Option<u64>,
 }
 
 impl Program {
@@ -169,7 +173,13 @@ impl Program {
         compiler.push(Inst::Accept)?;
 
         let start_symbols_mask =
-            compute_start_symbols_mask(&compiler.instructions, id_to_symbol.len());
+            compute_frontier_mask(&compiler.instructions, 0, id_to_symbol.len());
+        let second_symbols_mask =
+            if matches!(compiler.instructions.first(), Some(Inst::MatchLabel { .. })) {
+                compute_frontier_mask(&compiler.instructions, 1, id_to_symbol.len())
+            } else {
+                None
+            };
 
         Ok(Program {
             instructions: compiler.instructions,
@@ -177,6 +187,7 @@ impl Program {
             symbol_to_id,
             subsets,
             start_symbols_mask,
+            second_symbols_mask,
         })
     }
 
@@ -199,16 +210,20 @@ impl Program {
     }
 }
 
-/// Computes the bitmask of primary symbols reachable on the first consuming step from `pc = 0`.
+/// Computes the bitmask of primary symbols reachable on the next consuming step from `entry_pc`.
 ///
-/// Returns `None` if `Accept` is reachable without consuming a row (nullable pattern), if an
-/// anchor (`^`/`$`) lies on the initial frontier, or if there are more than 64 symbols.
-fn compute_start_symbols_mask(instructions: &[Inst], num_symbols: usize) -> Option<u64> {
-    if num_symbols == 0 || num_symbols > 64 || instructions.is_empty() {
+/// Returns `None` if `Accept` is reachable without consuming a row (nullable), if an anchor
+/// (`^`/`$`) lies on the frontier, or if there are more than 64 symbols.
+fn compute_frontier_mask(
+    instructions: &[Inst],
+    entry_pc: usize,
+    num_symbols: usize,
+) -> Option<u64> {
+    if num_symbols == 0 || num_symbols > 64 || entry_pc >= instructions.len() {
         return None;
     }
     let mut visited = vec![false; instructions.len()];
-    let mut stack = vec![0usize];
+    let mut stack = vec![entry_pc];
     let mut mask = 0u64;
 
     while let Some(pc) = stack.pop() {

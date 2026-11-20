@@ -11,11 +11,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, BooleanArray, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Int32Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt32Array, UInt64Array,
+};
 use arrow::compute::{self, SortOptions};
 use arrow::ipc::reader::StreamReader;
 use arrow::row::{RowConverter, SortField};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::execution::context::QueryPlanner;
@@ -57,13 +62,18 @@ use crate::ast::{
 use crate::logical::{
     MatchRecognizeNode, build_agg_metadata_dfschema, slot_data_type_and_nullability,
 };
-use crate::matcher::{Matcher, PartitionSymbols};
+use crate::matcher::{
+    FlatMatchPool, Matcher, MatcherBuffers, NoopStatefulEvaluator, PartitionSymbols,
+};
 use crate::measures::{
     PartitionStatefulEvaluator, PhysicalMeasure, PhysicalMeasureSlot,
-    PhysicalMeasureSlotKind, StatefulDefineInput, build_partition_output_batch,
-    build_physical_slot_schema,
+    PhysicalMeasureSlotKind, RowLocalPrefilter, StatefulDefineInput,
+    build_flat_pool_output_batch, build_physical_slot_schema, eval_expr_or_col,
+    eval_physical_only_into_bitmask, eval_physical_only_stateful_batch,
+    eval_row_local_prefilter_batch, extract_row_local_prefilter,
+    is_physical_only_stateful,
 };
-use crate::pattern::Program;
+use crate::pattern::{Program, SymbolId};
 
 #[derive(Debug, Clone)]
 pub enum PhysicalSymbolDefKind {
@@ -387,7 +397,7 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
 
         let output_schema = Arc::clone(mr_node.schema.inner());
 
-        let exec = MatchRecognizeExec::try_new_with_subsets(
+        let exec = MatchRecognizeExec::try_new_with_projection(
             input_exec,
             partition_by,
             order_by,
@@ -399,6 +409,7 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
             definitions,
             mr_node.config,
             output_schema,
+            mr_node.output_projection.clone(),
         )?;
         Ok(Some(Arc::new(exec)))
     }
@@ -420,6 +431,7 @@ pub struct MatchRecognizeExec {
     config: MatchRecognizeConfig,
     program: Arc<Program>,
     output_schema: SchemaRef,
+    output_projection: Option<Vec<String>>,
     cache: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -467,6 +479,37 @@ impl MatchRecognizeExec {
         config: MatchRecognizeConfig,
         output_schema: SchemaRef,
     ) -> Result<Self> {
+        Self::try_new_with_projection(
+            input,
+            partition_by,
+            order_by,
+            measures,
+            rows_per_match,
+            after_match_skip,
+            pattern,
+            subsets,
+            definitions,
+            config,
+            output_schema,
+            None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn try_new_with_projection(
+        input: Arc<dyn ExecutionPlan>,
+        partition_by: Vec<Arc<dyn PhysicalExpr>>,
+        order_by: Vec<PhysicalOrderBySpec>,
+        measures: Vec<PhysicalMeasure>,
+        rows_per_match: RowsPerMatch,
+        after_match_skip: AfterMatchSkip,
+        pattern: Pattern,
+        subsets: Vec<SubsetDef>,
+        definitions: Vec<PhysicalSymbolDef>,
+        config: MatchRecognizeConfig,
+        output_schema: SchemaRef,
+        output_projection: Option<Vec<String>>,
+    ) -> Result<Self> {
         let declared_names: Vec<String> =
             definitions.iter().map(|d| d.name.clone()).collect();
         let program = Arc::new(Program::compile_with_subsets(
@@ -504,9 +547,14 @@ impl MatchRecognizeExec {
             config,
             program,
             output_schema,
+            output_projection,
             cache,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    pub fn output_projection(&self) -> Option<&[String]> {
+        self.output_projection.as_deref()
     }
 
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
@@ -701,7 +749,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             );
         }
         let child = children.swap_remove(0);
-        Ok(Arc::new(Self::try_new_with_subsets(
+        Ok(Arc::new(Self::try_new_with_projection(
             child,
             self.partition_by.clone(),
             self.order_by.clone(),
@@ -713,6 +761,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             self.definitions.clone(),
             self.config,
             Arc::clone(&self.output_schema),
+            self.output_projection.clone(),
         )?))
     }
 
@@ -753,7 +802,26 @@ impl ExecutionPlan for MatchRecognizeExec {
         let order_by_input_indices: Vec<Option<usize>> =
             self.order_by.iter().map(|o| o.input_col_idx).collect();
 
-        let row_converter = if self.partition_by.is_empty() {
+        let single_key_fast_supported = self.partition_by.len() == 1
+            && self.partition_by[0]
+                .data_type(input_schema.as_ref())
+                .is_ok_and(|dt| {
+                    matches!(
+                        dt,
+                        DataType::Int64
+                            | DataType::Int32
+                            | DataType::UInt64
+                            | DataType::UInt32
+                            | DataType::Date32
+                            | DataType::Date64
+                            | DataType::Timestamp(_, _)
+                            | DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                    )
+                });
+
+        let row_converter = if self.partition_by.is_empty() || single_key_fast_supported {
             None
         } else {
             let sort_fields: Vec<SortField> = self
@@ -764,19 +832,25 @@ impl ExecutionPlan for MatchRecognizeExec {
             Some(RowConverter::new(sort_fields)?)
         };
 
+        let symbol_plan = compile_stream_symbol_plan(&self.program, &self.definitions);
+        let matcher_buffers = MatcherBuffers::new(&self.program);
+
         Ok(Box::pin(MatchRecognizeStream {
             input: input_stream,
             input_schema,
             output_schema: Arc::clone(&self.output_schema),
+            output_projection: self.output_projection.clone(),
             partition_by: self.partition_by.clone(),
             partition_by_input_indices: self.partition_by_input_indices.clone(),
             order_by_input_indices,
             measures: self.measures.clone(),
             rows_per_match: self.rows_per_match,
             after_match_skip: self.after_match_skip.clone(),
-            definitions: self.definitions.clone(),
+            symbol_plan,
             program: Arc::clone(&self.program),
             max_active_threads: self.config.max_active_threads as usize,
+            matcher_buffers: Some(matcher_buffers),
+            flat_pool: FlatMatchPool::default(),
             row_converter,
             current_partition_key: None,
             buffered_batches: Vec::new(),
@@ -794,21 +868,229 @@ impl ExecutionPlan for MatchRecognizeExec {
     }
 }
 
+/// Pre-classified per-symbol execution strategy computed once per stream.
+enum CompiledSymbolEval {
+    /// Symbol omitted from `DEFINE` (implicitly `TRUE` on every row).
+    ImplicitTrue,
+    /// Row-local stateless `DEFINE` evaluated once per batch into the bitmask.
+    Stateless(Arc<dyn PhysicalExpr>),
+    /// Stateful `DEFINE` depending only on current row + self `PREV`/`NEXT`, promoted to
+    /// vectorized Tier 1 bitmask evaluation with per-partition boundary clamping.
+    PhysicalOnlyStateful {
+        outer_expr: Arc<dyn PhysicalExpr>,
+        slot_schema: SchemaRef,
+        slots: Vec<PhysicalMeasureSlot>,
+    },
+    /// True history-dependent Tier 2 stateful `DEFINE`, with optional row-local `AND` pre-filter.
+    TrueStateful {
+        outer_expr: Arc<dyn PhysicalExpr>,
+        slot_schema: SchemaRef,
+        slots: Vec<PhysicalMeasureSlot>,
+        prefilter: Option<RowLocalPrefilter>,
+    },
+}
+
+struct StreamSymbolPlan {
+    by_sym_id: Vec<CompiledSymbolEval>,
+    has_true_stateful: bool,
+}
+
+fn compile_stream_symbol_plan(
+    program: &Program,
+    definitions: &[PhysicalSymbolDef],
+) -> StreamSymbolPlan {
+    let def_map: HashMap<&str, &PhysicalSymbolDefKind> = definitions
+        .iter()
+        .map(|d| (d.name.as_str(), &d.kind))
+        .collect();
+
+    let mut by_sym_id = Vec::with_capacity(program.num_symbols());
+    let mut has_true_stateful = false;
+
+    for (id, sym_name) in program.id_to_symbol.iter().enumerate() {
+        let sym_id = id as SymbolId;
+        match def_map.get(sym_name.as_str()) {
+            None => by_sym_id.push(CompiledSymbolEval::ImplicitTrue),
+            Some(PhysicalSymbolDefKind::Stateless { predicate }) => {
+                by_sym_id.push(CompiledSymbolEval::Stateless(Arc::clone(predicate)));
+            }
+            Some(PhysicalSymbolDefKind::Stateful {
+                outer_expr,
+                slot_schema,
+                slots,
+            }) => {
+                if is_physical_only_stateful(sym_id, slots) {
+                    by_sym_id.push(CompiledSymbolEval::PhysicalOnlyStateful {
+                        outer_expr: Arc::clone(outer_expr),
+                        slot_schema: Arc::clone(slot_schema),
+                        slots: slots.clone(),
+                    });
+                } else {
+                    has_true_stateful = true;
+                    let prefilter =
+                        extract_row_local_prefilter(outer_expr, slot_schema, slots);
+                    by_sym_id.push(CompiledSymbolEval::TrueStateful {
+                        outer_expr: Arc::clone(outer_expr),
+                        slot_schema: Arc::clone(slot_schema),
+                        slots: slots.clone(),
+                        prefilter,
+                    });
+                }
+            }
+        }
+    }
+
+    StreamSymbolPlan {
+        by_sym_id,
+        has_true_stateful,
+    }
+}
+
+/// Partition key of the active buffered partition (stored once per batch boundary).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivePartitionKey {
+    Int64(Option<i64>),
+    Int32(Option<i32>),
+    UInt64(Option<u64>),
+    UInt32(Option<u32>),
+    Str(Option<String>),
+    RowBytes(Vec<u8>),
+}
+
+struct ScannedPartitionRuns {
+    runs: Vec<(usize, usize)>,
+    first_key: ActivePartitionKey,
+    last_key: ActivePartitionKey,
+}
+
+/// Fast single-column partition run scanner avoiding `RowConverter` byte serialization on
+/// primitive and string partition keys.
+fn scan_single_column_runs(arr: &ArrayRef) -> Option<ScannedPartitionRuns> {
+    let n = arr.len();
+    if n == 0 {
+        return None;
+    }
+
+    macro_rules! scan_prim {
+        ($arr_ty:ty, $variant:ident) => {{
+            let a = arr.as_any().downcast_ref::<$arr_ty>()?;
+            let vals = a.values();
+            let has_nulls = a.null_count() > 0;
+            let mut runs = Vec::new();
+            let mut start = 0usize;
+            if !has_nulls {
+                let mut prev = vals[0];
+                for (i, &v) in vals.iter().enumerate().skip(1) {
+                    if v != prev {
+                        runs.push((start, i));
+                        start = i;
+                        prev = v;
+                    }
+                }
+                runs.push((start, n));
+                return Some(ScannedPartitionRuns {
+                    runs,
+                    first_key: ActivePartitionKey::$variant(Some(vals[0])),
+                    last_key: ActivePartitionKey::$variant(Some(vals[n - 1])),
+                });
+            }
+            let get = |i: usize| {
+                if a.is_valid(i) { Some(vals[i]) } else { None }
+            };
+            let first = get(0);
+            let mut prev = first;
+            for i in 1..n {
+                let cur = get(i);
+                if cur != prev {
+                    runs.push((start, i));
+                    start = i;
+                    prev = cur;
+                }
+            }
+            runs.push((start, n));
+            return Some(ScannedPartitionRuns {
+                runs,
+                first_key: ActivePartitionKey::$variant(first),
+                last_key: ActivePartitionKey::$variant(prev),
+            });
+        }};
+    }
+
+    macro_rules! scan_str {
+        ($arr_ty:ty) => {{
+            let a = arr.as_any().downcast_ref::<$arr_ty>()?;
+            let get = |i: usize| {
+                if a.is_valid(i) {
+                    Some(a.value(i))
+                } else {
+                    None
+                }
+            };
+            let mut runs = Vec::new();
+            let mut start = 0usize;
+            let first = get(0);
+            let mut prev = first;
+            for i in 1..n {
+                let cur = get(i);
+                if cur != prev {
+                    runs.push((start, i));
+                    start = i;
+                    prev = cur;
+                }
+            }
+            runs.push((start, n));
+            Some(ScannedPartitionRuns {
+                runs,
+                first_key: ActivePartitionKey::Str(first.map(str::to_string)),
+                last_key: ActivePartitionKey::Str(prev.map(str::to_string)),
+            })
+        }};
+    }
+
+    match arr.data_type() {
+        DataType::Int64 => scan_prim!(Int64Array, Int64),
+        DataType::Int32 => scan_prim!(Int32Array, Int32),
+        DataType::UInt64 => scan_prim!(UInt64Array, UInt64),
+        DataType::UInt32 => scan_prim!(UInt32Array, UInt32),
+        DataType::Date32 => scan_prim!(Date32Array, Int32),
+        DataType::Date64 => scan_prim!(Date64Array, Int64),
+        DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+            scan_prim!(TimestampSecondArray, Int64)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+            scan_prim!(TimestampMillisecondArray, Int64)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+            scan_prim!(TimestampMicrosecondArray, Int64)
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+            scan_prim!(TimestampNanosecondArray, Int64)
+        }
+        DataType::Utf8 => scan_str!(StringArray),
+        DataType::LargeUtf8 => scan_str!(LargeStringArray),
+        DataType::Utf8View => scan_str!(StringViewArray),
+        _ => None,
+    }
+}
+
 struct MatchRecognizeStream {
     input: SendableRecordBatchStream,
     input_schema: SchemaRef,
     output_schema: SchemaRef,
+    output_projection: Option<Vec<String>>,
     partition_by: Vec<Arc<dyn PhysicalExpr>>,
     partition_by_input_indices: Vec<Option<usize>>,
     order_by_input_indices: Vec<Option<usize>>,
     measures: Vec<PhysicalMeasure>,
     rows_per_match: RowsPerMatch,
     after_match_skip: AfterMatchSkip,
-    definitions: Vec<PhysicalSymbolDef>,
+    symbol_plan: StreamSymbolPlan,
     program: Arc<Program>,
     max_active_threads: usize,
+    matcher_buffers: Option<MatcherBuffers>,
+    flat_pool: FlatMatchPool,
     row_converter: Option<RowConverter>,
-    current_partition_key: Option<Vec<u8>>,
+    current_partition_key: Option<ActivePartitionKey>,
     buffered_batches: Vec<RecordBatch>,
     spilled_files: Vec<Arc<dyn SpillFile>>,
     spill_manager: Option<SpillManager>,
@@ -843,7 +1125,8 @@ impl MatchRecognizeStream {
     }
 
     fn ingest_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        if batch.num_rows() == 0 {
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
             return Ok(());
         }
 
@@ -851,46 +1134,177 @@ impl MatchRecognizeStream {
             return self.push_partition_batch(batch);
         }
 
-        let key_arrays: Vec<_> = self
-            .partition_by
-            .iter()
-            .map(|e| e.evaluate(&batch)?.into_array(batch.num_rows()))
-            .collect::<Result<_>>()?;
-        let converter = self.row_converter.as_ref().ok_or_else(|| {
-            internal_datafusion_err!(
-                "RowConverter missing when partition_by is non-empty"
-            )
-        })?;
-        let rows = converter.convert_columns(&key_arrays)?;
-
-        let num_rows = batch.num_rows();
-        let mut slice_start = 0;
-
-        for row_idx in 0..num_rows {
-            let row = rows.row(row_idx);
-            let key_bytes = row.as_ref();
-            let same_partition = match &self.current_partition_key {
-                None => {
-                    self.current_partition_key = Some(key_bytes.to_vec());
-                    true
+        let ScannedPartitionRuns {
+            runs,
+            first_key,
+            last_key,
+        } = if self.row_converter.is_none() {
+            let key_arr = eval_expr_or_col(&self.partition_by[0], &batch, num_rows)?;
+            scan_single_column_runs(&key_arr).ok_or_else(|| {
+                internal_datafusion_err!("Unexpected partition column type for fast scan")
+            })?
+        } else {
+            let key_arrays: Vec<_> = self
+                .partition_by
+                .iter()
+                .map(|e| eval_expr_or_col(e, &batch, num_rows))
+                .collect::<Result<_>>()?;
+            let converter = self.row_converter.as_ref().ok_or_else(|| {
+                internal_datafusion_err!(
+                    "RowConverter missing when partition_by is non-empty"
+                )
+            })?;
+            let rows = converter.convert_columns(&key_arrays)?;
+            let mut runs = Vec::new();
+            let mut start = 0usize;
+            for i in 1..num_rows {
+                if rows.row(i).as_ref() != rows.row(start).as_ref() {
+                    runs.push((start, i));
+                    start = i;
                 }
-                Some(curr) => curr.as_slice() == key_bytes,
-            };
-
-            if !same_partition {
-                if row_idx > slice_start {
-                    let sub = batch.slice(slice_start, row_idx - slice_start);
-                    self.push_partition_batch(sub)?;
-                }
-                self.flush_current_partition()?;
-                self.current_partition_key = Some(key_bytes.to_vec());
-                slice_start = row_idx;
             }
+            runs.push((start, num_rows));
+            let first_key = ActivePartitionKey::RowBytes(rows.row(0).as_ref().to_vec());
+            let last_key =
+                ActivePartitionKey::RowBytes(rows.row(num_rows - 1).as_ref().to_vec());
+            ScannedPartitionRuns {
+                runs,
+                first_key,
+                last_key,
+            }
+        };
+
+        if runs.len() == 1 {
+            if let Some(curr) = &self.current_partition_key {
+                if *curr != first_key {
+                    self.flush_current_partition()?;
+                    self.current_partition_key = Some(first_key);
+                }
+            } else {
+                self.current_partition_key = Some(first_key);
+            }
+            return self.push_partition_batch(batch);
         }
 
-        if slice_start < num_rows {
-            let sub = batch.slice(slice_start, num_rows - slice_start);
-            self.push_partition_batch(sub)?;
+        // Multiple partition runs reside in this incoming batch:
+        // - Run 0 either continues the active buffered partition or starts a brand-new complete
+        //   partition entirely contained within `batch`.
+        // - Runs `interior_start .. runs.len() - 1` are all complete partitions inside `batch`
+        //   and are evaluated together in ONE vectorized batch pass + ONE coalesced output batch!
+        // - The last run might continue into the next incoming batch, so we buffer it.
+        let interior_start = match &self.current_partition_key {
+            Some(curr) if *curr == first_key => {
+                let (s, e) = runs[0];
+                self.push_partition_batch(batch.slice(s, e - s))?;
+                self.flush_current_partition()?;
+                1
+            }
+            Some(_) => {
+                self.flush_current_partition()?;
+                0
+            }
+            None => 0,
+        };
+
+        let interior_runs = &runs[interior_start..runs.len() - 1];
+        if !interior_runs.is_empty() {
+            self.process_batch_partitions(&batch, interior_runs)?;
+        }
+
+        let (last_s, last_e) = runs[runs.len() - 1];
+        self.current_partition_key = Some(last_key);
+        self.push_partition_batch(batch.slice(last_s, last_e - last_s))?;
+        Ok(())
+    }
+
+    /// Vectorized batch-level fast path: evaluates all stateless, Tier 1b physical-only, and
+    /// Tier 2 pre-filter predicates ONCE on `batch`, matches each complete partition slice
+    /// `(p_start, p_end)` with reused [`MatcherBuffers`], and emits ONE coalesced output batch.
+    fn process_batch_partitions(
+        &mut self,
+        batch: &RecordBatch,
+        runs: &[(usize, usize)],
+    ) -> Result<()> {
+        let symbols =
+            evaluate_batch_symbols(batch, runs, &self.program, &self.symbol_plan)?;
+        let buf = self
+            .matcher_buffers
+            .take()
+            .unwrap_or_else(|| MatcherBuffers::new(&self.program));
+        let mut matcher =
+            Matcher::from_buffers(&self.program, self.max_active_threads, buf);
+
+        self.flat_pool.clear();
+
+        let match_res: Result<()> = if !self.symbol_plan.has_true_stateful {
+            let mut noop = NoopStatefulEvaluator;
+            let mut res = Ok(());
+            for &(p_start, p_end) in runs {
+                if let Err(e) = matcher.match_partition_range_into_pool(
+                    &symbols,
+                    p_start,
+                    p_end,
+                    &self.after_match_skip,
+                    self.rows_per_match,
+                    &mut noop,
+                    &mut self.flat_pool,
+                ) {
+                    res = Err(e);
+                    break;
+                }
+            }
+            res
+        } else {
+            let stateful_defs = collect_true_stateful_inputs(&self.symbol_plan);
+            match PartitionStatefulEvaluator::try_new(
+                batch,
+                &self.program,
+                &stateful_defs,
+            ) {
+                Ok(mut stateful_eval) => {
+                    let mut res = Ok(());
+                    for &(p_start, p_end) in runs {
+                        stateful_eval.set_partition_bounds(p_start, p_end);
+                        if let Err(e) = matcher.match_partition_range_into_pool(
+                            &symbols,
+                            p_start,
+                            p_end,
+                            &self.after_match_skip,
+                            self.rows_per_match,
+                            &mut stateful_eval,
+                            &mut self.flat_pool,
+                        ) {
+                            res = Err(e);
+                            break;
+                        }
+                    }
+                    res
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        self.matcher_buffers = Some(matcher.into_buffers());
+        match_res?;
+
+        if self.flat_pool.events.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(out_batch) = build_flat_pool_output_batch(
+            batch,
+            &self.flat_pool,
+            &self.program,
+            &self.partition_by,
+            &self.partition_by_input_indices,
+            &self.order_by_input_indices,
+            &self.measures,
+            self.rows_per_match,
+            &self.output_schema,
+            self.output_projection.as_deref(),
+        )? {
+            self.metrics.record_output(out_batch.num_rows());
+            self.pending_outputs.push_back(out_batch);
         }
 
         Ok(())
@@ -936,68 +1350,71 @@ impl MatchRecognizeStream {
             self.reservation.try_resize(work_mem)?;
         }
 
-        let symbols = evaluate_stateless_symbols(
+        let num_rows = partition_batch.num_rows();
+        let runs = [(0, num_rows)];
+        let symbols = evaluate_batch_symbols(
             &partition_batch,
+            &runs,
             &self.program,
-            &self.definitions,
+            &self.symbol_plan,
         )?;
         if !had_spills {
             self.reservation.try_grow(symbols.memory_bytes())?;
         }
 
-        let stateful_defs: Vec<StatefulDefineInput<'_>> =
-            self.definitions
-                .iter()
-                .filter_map(|d| match &d.kind {
-                    PhysicalSymbolDefKind::Stateless { .. } => None,
-                    PhysicalSymbolDefKind::Stateful {
-                        outer_expr,
-                        slot_schema,
-                        slots,
-                    } => self.program.symbol_id(&d.name).map(|sym_id| {
-                        StatefulDefineInput {
-                            sym_id,
-                            outer_expr,
-                            slot_schema,
-                            slots: slots.as_slice(),
-                        }
-                    }),
-                })
-                .collect();
-
+        let buf = self
+            .matcher_buffers
+            .take()
+            .unwrap_or_else(|| MatcherBuffers::new(&self.program));
         let mut matcher =
-            Matcher::with_max_active_threads(&self.program, self.max_active_threads);
-        let (events, _stats) = if stateful_defs.is_empty() {
-            matcher.match_partition(
+            Matcher::from_buffers(&self.program, self.max_active_threads, buf);
+
+        self.flat_pool.clear();
+        let match_res = if !self.symbol_plan.has_true_stateful {
+            let mut noop = NoopStatefulEvaluator;
+            matcher.match_partition_range_into_pool(
                 &symbols,
+                0,
+                num_rows,
                 &self.after_match_skip,
                 self.rows_per_match,
-            )?
+                &mut noop,
+                &mut self.flat_pool,
+            )
         } else {
+            let stateful_defs = collect_true_stateful_inputs(&self.symbol_plan);
             let mut stateful_eval = PartitionStatefulEvaluator::try_new(
                 &partition_batch,
                 &self.program,
                 &stateful_defs,
             )?;
-            matcher.match_partition_with_evaluator(
+            matcher.match_partition_range_into_pool(
                 &symbols,
+                0,
+                num_rows,
                 &self.after_match_skip,
                 self.rows_per_match,
                 &mut stateful_eval,
-            )?
+                &mut self.flat_pool,
+            )
         };
+        self.matcher_buffers = Some(matcher.into_buffers());
+        match_res?;
 
-        if let Some(out_batch) = build_partition_output_batch(
-            &partition_batch,
-            &events,
-            &self.program,
-            &self.partition_by,
-            &self.partition_by_input_indices,
-            &self.order_by_input_indices,
-            &self.measures,
-            self.rows_per_match,
-            &self.output_schema,
-        )? {
+        if !self.flat_pool.events.is_empty()
+            && let Some(out_batch) = build_flat_pool_output_batch(
+                &partition_batch,
+                &self.flat_pool,
+                &self.program,
+                &self.partition_by,
+                &self.partition_by_input_indices,
+                &self.order_by_input_indices,
+                &self.measures,
+                self.rows_per_match,
+                &self.output_schema,
+                self.output_projection.as_deref(),
+            )?
+        {
             self.metrics.record_output(out_batch.num_rows());
             self.pending_outputs.push_back(out_batch);
         }
@@ -1007,30 +1424,106 @@ impl MatchRecognizeStream {
     }
 }
 
-fn evaluate_stateless_symbols(
-    partition_batch: &RecordBatch,
-    program: &Program,
-    definitions: &[PhysicalSymbolDef],
-) -> Result<PartitionSymbols> {
-    let num_rows = partition_batch.num_rows();
-    let num_symbols = program.num_symbols();
-    let def_map: HashMap<&str, &PhysicalSymbolDefKind> = definitions
+fn collect_true_stateful_inputs(plan: &StreamSymbolPlan) -> Vec<StatefulDefineInput<'_>> {
+    plan.by_sym_id
         .iter()
-        .map(|d| (d.name.as_str(), &d.kind))
-        .collect();
+        .enumerate()
+        .filter_map(|(id, eval)| match eval {
+            CompiledSymbolEval::TrueStateful {
+                outer_expr,
+                slot_schema,
+                slots,
+                prefilter,
+            } => Some(StatefulDefineInput {
+                sym_id: id as SymbolId,
+                outer_expr,
+                slot_schema,
+                slots: slots.as_slice(),
+                has_prefilter: prefilter.is_some(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Evaluates all stateless, Tier 1b physical-only, and Tier 2 pre-filter predicates directly
+/// into a packed `Bitmask64` (fast path for <= 64 symbols) or `Bitset` across the entire `batch`.
+fn evaluate_batch_symbols(
+    batch: &RecordBatch,
+    runs: &[(usize, usize)],
+    program: &Program,
+    plan: &StreamSymbolPlan,
+) -> Result<PartitionSymbols> {
+    let num_rows = batch.num_rows();
+    let num_symbols = program.num_symbols();
+
+    if num_symbols <= 64 {
+        let mut bitmasks = vec![0u64; num_rows];
+        for (sym_idx, eval) in plan.by_sym_id.iter().enumerate() {
+            let bit = 1u64 << sym_idx;
+            match eval {
+                CompiledSymbolEval::ImplicitTrue => {
+                    for m in &mut bitmasks {
+                        *m |= bit;
+                    }
+                }
+                CompiledSymbolEval::Stateless(predicate) => {
+                    let evaluated = predicate.evaluate(batch)?.into_array(num_rows)?;
+                    let bool_arr = evaluated
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "DEFINE predicate for '{}' must evaluate to Boolean, got {}",
+                                program.id_to_symbol[sym_idx],
+                                evaluated.data_type()
+                            ))
+                        })?;
+                    apply_bool_array_bit(&mut bitmasks, bool_arr, bit);
+                }
+                CompiledSymbolEval::PhysicalOnlyStateful {
+                    outer_expr,
+                    slot_schema,
+                    slots,
+                } => {
+                    eval_physical_only_into_bitmask(
+                        batch,
+                        runs,
+                        outer_expr,
+                        slot_schema,
+                        slots,
+                        &mut bitmasks,
+                        bit,
+                    )?;
+                }
+                CompiledSymbolEval::TrueStateful {
+                    prefilter: Some(pf),
+                    ..
+                } => {
+                    let bool_arr = eval_row_local_prefilter_batch(batch, pf)?;
+                    apply_bool_array_bit(&mut bitmasks, &bool_arr, bit);
+                }
+                CompiledSymbolEval::TrueStateful {
+                    prefilter: None, ..
+                } => {}
+            }
+        }
+        return Ok(PartitionSymbols::from_bitmasks(bitmasks, num_symbols));
+    }
 
     let mut columns: Vec<Vec<bool>> = Vec::with_capacity(num_symbols);
-    for sym_name in &program.id_to_symbol {
-        match def_map.get(sym_name.as_str()) {
-            Some(PhysicalSymbolDefKind::Stateless { predicate }) => {
-                let evaluated =
-                    predicate.evaluate(partition_batch)?.into_array(num_rows)?;
+    for (sym_idx, eval) in plan.by_sym_id.iter().enumerate() {
+        match eval {
+            CompiledSymbolEval::ImplicitTrue => columns.push(vec![true; num_rows]),
+            CompiledSymbolEval::Stateless(predicate) => {
+                let evaluated = predicate.evaluate(batch)?.into_array(num_rows)?;
                 let bool_arr = evaluated
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| {
                         DataFusionError::Execution(format!(
-                            "DEFINE predicate for '{sym_name}' must evaluate to Boolean, got {}",
+                            "DEFINE predicate for '{}' must evaluate to Boolean, got {}",
+                            program.id_to_symbol[sym_idx],
                             evaluated.data_type()
                         ))
                     })?;
@@ -1040,16 +1533,57 @@ fn evaluate_stateless_symbols(
                 }
                 columns.push(flags);
             }
-            Some(PhysicalSymbolDefKind::Stateful { .. }) => {
-                columns.push(vec![false; num_rows]);
+            CompiledSymbolEval::PhysicalOnlyStateful {
+                outer_expr,
+                slot_schema,
+                slots,
+            } => {
+                let bool_arr = eval_physical_only_stateful_batch(
+                    batch,
+                    runs,
+                    outer_expr,
+                    slot_schema,
+                    slots,
+                )?;
+                let mut flags = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    flags.push(bool_arr.is_valid(i) && bool_arr.value(i));
+                }
+                columns.push(flags);
             }
-            None => {
-                columns.push(vec![true; num_rows]);
+            CompiledSymbolEval::TrueStateful {
+                prefilter: Some(pf),
+                ..
+            } => {
+                let bool_arr = eval_row_local_prefilter_batch(batch, pf)?;
+                let mut flags = Vec::with_capacity(num_rows);
+                for i in 0..num_rows {
+                    flags.push(bool_arr.is_valid(i) && bool_arr.value(i));
+                }
+                columns.push(flags);
             }
+            CompiledSymbolEval::TrueStateful {
+                prefilter: None, ..
+            } => columns.push(vec![false; num_rows]),
         }
     }
-
     Ok(PartitionSymbols::from_columns(&columns, num_rows))
+}
+
+/// Sets `bit` in `bitmasks[i]` for every row `i` where `bool_arr` is valid and `true`,
+/// using Arrow's packed bit-iteration (`set_indices`) for high throughput.
+#[inline]
+fn apply_bool_array_bit(bitmasks: &mut [u64], bool_arr: &BooleanArray, bit: u64) {
+    if bool_arr.null_count() == 0 {
+        for idx in bool_arr.values().set_indices() {
+            bitmasks[idx] |= bit;
+        }
+    } else if let Some(nulls) = bool_arr.nulls() {
+        let valid_and_true = bool_arr.values() & nulls.inner();
+        for idx in valid_and_true.set_indices() {
+            bitmasks[idx] |= bit;
+        }
+    }
 }
 
 impl Stream for MatchRecognizeStream {

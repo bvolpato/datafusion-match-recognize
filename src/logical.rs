@@ -34,6 +34,8 @@ pub struct MatchRecognizeNode {
     pub subsets: Vec<SubsetDef>,
     pub definitions: Vec<SymbolDef>,
     pub config: MatchRecognizeConfig,
+    /// Optional projected subset of output column names pushed down from a parent `Projection`.
+    pub output_projection: Option<Vec<String>>,
     pub schema: DFSchemaRef,
 }
 
@@ -84,6 +86,35 @@ impl MatchRecognizeNode {
         subsets: Vec<SubsetDef>,
         definitions: Vec<SymbolDef>,
         config: MatchRecognizeConfig,
+    ) -> Result<Self> {
+        Self::try_new_with_projection(
+            input,
+            partition_by,
+            order_by,
+            measures,
+            rows_per_match,
+            after_match_skip,
+            pattern,
+            subsets,
+            definitions,
+            config,
+            None,
+        )
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub fn try_new_with_projection(
+        input: LogicalPlan,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderBySpec>,
+        measures: Vec<MeasureSpec>,
+        rows_per_match: RowsPerMatch,
+        after_match_skip: AfterMatchSkip,
+        pattern: Pattern,
+        subsets: Vec<SubsetDef>,
+        definitions: Vec<SymbolDef>,
+        config: MatchRecognizeConfig,
+        output_projection: Option<Vec<String>>,
     ) -> Result<Self> {
         let meta_schema = build_agg_metadata_dfschema(input.schema())?;
         let coerce_meta_slots = |slots: Vec<MeasureSlot>| -> Result<Vec<MeasureSlot>> {
@@ -178,13 +209,23 @@ impl MatchRecognizeNode {
             });
         }
 
-        let schema = compute_output_schema(
+        let full_schema = compute_output_schema(
             input.schema(),
             &partition_by,
             &order_by,
             &coerced_measures,
             rows_per_match,
         )?;
+        let schema = if let Some(proj_names) = &output_projection {
+            let mut fields = Vec::with_capacity(proj_names.len());
+            for name in proj_names {
+                let f = full_schema.field_with_unqualified_name(name)?;
+                fields.push(f.as_ref().clone());
+            }
+            Arc::new(DFSchema::try_from(Schema::new(fields))?)
+        } else {
+            full_schema
+        };
         Ok(Self {
             input,
             partition_by,
@@ -196,6 +237,7 @@ impl MatchRecognizeNode {
             subsets,
             definitions: coerced_defs,
             config,
+            output_projection,
             schema,
         })
     }
@@ -686,7 +728,7 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             return plan_err!("MatchRecognize: unexpected extra expressions");
         }
 
-        Self::try_new_with_subsets(
+        Self::try_new_with_projection(
             input,
             partition_by,
             order_by,
@@ -697,6 +739,7 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             self.subsets.clone(),
             definitions,
             self.config,
+            self.output_projection.clone(),
         )
     }
 
@@ -704,14 +747,16 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         &self,
         output_columns: &[usize],
     ) -> Option<Vec<Vec<usize>>> {
-        if !self.rows_per_match.is_one_row() {
+        // Without an explicit output_projection, ALL ROWS PER MATCH emits every input column,
+        // so input columns cannot be pruned unless a parent projection was pushed in.
+        if !self.rows_per_match.is_one_row() && self.output_projection.is_none() {
             return None;
         }
         let input_schema = self.input.schema();
         let mut needed: HashSet<usize> = HashSet::new();
 
-        // Include both standard expressions and any metadata-bearing aggregate args (ignoring
-        // the synthetic `__mr_agg_*` columns when mapping back to input_schema).
+        // Include both standard expressions and any metadata-bearing aggregate/nav args
+        // (ignoring synthetic `__mr_agg_*` columns when mapping back to input_schema).
         let mut all_exprs = self.expressions();
         for def in &self.definitions {
             if let SymbolDefKind::Stateful { slots, .. } = &def.kind {
@@ -773,10 +818,14 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             }
         }
 
+        // Preserve any input columns directly emitted by the projected output schema.
+        let measure_names: HashSet<&str> =
+            self.measures.iter().map(|m| m.alias.as_str()).collect();
         for &out_idx in output_columns {
-            if out_idx < self.partition_by.len()
-                && let Expr::Column(col) = &self.partition_by[out_idx]
-                && let Ok(idx) = input_schema.index_of_column(col)
+            if let Some(field) = self.schema.fields().get(out_idx)
+                && !measure_names.contains(field.name().as_str())
+                && let Some(idx) =
+                    input_schema.index_of_column_by_name(None, field.name())
             {
                 needed.insert(idx);
             }

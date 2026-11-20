@@ -308,7 +308,13 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             },
         };
 
-        let node = MatchRecognizeNode::try_new_with_subsets(
+        let output_projection = if msg.has_output_projection {
+            Some(msg.output_projection)
+        } else {
+            None
+        };
+
+        let node = MatchRecognizeNode::try_new_with_projection(
             inputs[0].clone(),
             partition_by,
             order_by,
@@ -319,6 +325,7 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             subsets,
             definitions,
             config,
+            output_projection,
         )?;
         Ok(Extension {
             node: Arc::new(node),
@@ -416,6 +423,8 @@ impl LogicalExtensionCodec for MatchRecognizeLogicalCodec {
             max_nfa_states: mr.config.max_nfa_states,
             max_active_threads: mr.config.max_active_threads,
             subsets,
+            output_projection: mr.output_projection.clone().unwrap_or_default(),
+            has_output_projection: mr.output_projection.is_some(),
         };
         msg.encode(buf).map_err(|e| {
             DataFusionError::Internal(format!(
@@ -876,15 +885,30 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             });
         }
 
-        let output_schema = compute_physical_output_schema(
+        let output_projection = if msg.has_output_projection {
+            Some(msg.output_projection)
+        } else {
+            None
+        };
+
+        let full_output_schema = compute_physical_output_schema(
             input_schema.as_ref(),
             &partition_by,
             &order_by,
             &measures,
             rows_per_match,
         )?;
+        let output_schema = if let Some(proj_names) = &output_projection {
+            let mut fields = Vec::with_capacity(proj_names.len());
+            for name in proj_names {
+                fields.push(full_output_schema.field_with_name(name)?.clone());
+            }
+            Arc::new(Schema::new(fields))
+        } else {
+            full_output_schema
+        };
 
-        Ok(Arc::new(MatchRecognizeExec::try_new_with_subsets(
+        Ok(Arc::new(MatchRecognizeExec::try_new_with_projection(
             input,
             partition_by,
             order_by,
@@ -896,6 +920,7 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             definitions,
             config,
             output_schema,
+            output_projection,
         )?))
     }
 
@@ -995,6 +1020,11 @@ impl PhysicalExtensionCodec for MatchRecognizePhysicalCodec {
             max_nfa_states: exec.config().max_nfa_states,
             max_active_threads: exec.config().max_active_threads,
             subsets,
+            output_projection: exec
+                .output_projection()
+                .map(<[String]>::to_vec)
+                .unwrap_or_default(),
+            has_output_projection: exec.output_projection().is_some(),
         };
         msg.encode(buf).map_err(|e| {
             DataFusionError::Internal(format!(

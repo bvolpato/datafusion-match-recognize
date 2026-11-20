@@ -162,6 +162,8 @@ message MatchRecognizeLogicalNodeProto {
   uint32 max_nfa_states = 9;
   uint32 max_active_threads = 10;
   repeated SubsetDefProto subsets = 11;
+  repeated string output_projection = 12;
+  bool has_output_projection = 13;
 }
 
 message MatchRecognizePhysicalNodeProto {
@@ -176,4 +178,6 @@ message MatchRecognizePhysicalNodeProto {
   uint32 max_nfa_states = 9;
   uint32 max_active_threads = 10;
   repeated SubsetDefProto subsets = 11;
+  repeated string output_projection = 12;
+  bool has_output_projection = 13;
 }
