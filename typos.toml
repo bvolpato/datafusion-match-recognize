@@ -5,6 +5,10 @@ dups = "dups"
 # DataFusion abbreviation for AggregateUDF
 udaf = "udaf"
 udafs = "udafs"
+# Short local variable name for PhysicalNavKind
+pn = "pn"
+# sqllogictest column-type descriptor (Integer, Integer, Text)
+IIT = "IIT"
 
 [files]
 extend-exclude = [
