@@ -1,0 +1,596 @@
+# SPDX-License-Identifier: Apache-2.0
+# SQL:2016 MATCH_RECOGNIZE test suite ported from DuckDB's test/sql/match_recognize/*.test
+# (ISO/IEC 19075-5 worked examples, backtracking algebra, aggregate idioms, NULL semantics,
+# expression PARTITION BY / ORDER BY, and SQL query composition).
+
+# -----------------------------------------------------------------------------
+# 1. ISO/IEC 19075-5 worked examples (from test_match_recognize_spec.test)
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE duck_nest (id INT, price INT, tax INT) AS VALUES
+  (1, 10, 1), (2, 12, 2), (3, 14, 3), (4, 16, 4), (5, 18, 5), (6, 20, 6);
+
+# Compound physical+logical navigation reaching a row before the match starts:
+# PREV(LAST(A.price + A.tax, 1), 3)
+query III
+SELECT id, mn, p FROM duck_nest
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    MATCH_NUMBER() AS mn,
+    PREV(LAST(A.price + A.tax, 1), 3) AS p
+  ALL ROWS PER MATCH
+  PATTERN (A+)
+  DEFINE A AS id >= 4
+)
+ORDER BY id;
+----
+4 1 NULL
+5 1 11
+6 1 14
+
+# Alternating matches selected by MATCH_NUMBER() parity (ISO/IEC 19075-5)
+statement ok
+CREATE TABLE duck_alt_ticks (rn INT, price INT) AS VALUES
+  (1, 10), (2, 20), (3, 15), (4, 10), (5, 12), (6, 25);
+
+query IIIT
+SELECT rn, mn, price, cls FROM duck_alt_ticks
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN (A+ | B+)
+  DEFINE
+    A AS MATCH_NUMBER() % 2 = 1 AND (PREV(A.price) IS NULL OR A.price >= PREV(A.price)),
+    B AS MATCH_NUMBER() % 2 = 0 AND (PREV(B.price) IS NULL OR B.price <= PREV(B.price))
+)
+ORDER BY rn;
+----
+1 1 10 A
+2 1 20 A
+3 2 15 B
+4 2 10 B
+5 3 12 A
+6 3 25 A
+
+# ISO/IEC 19075-5 5.3 Table 12: running average self-comparison in DEFINE
+statement ok
+CREATE TABLE duck_ticks (rn INT, price INT) AS VALUES
+  (1, 10), (2, 16), (3, 13), (4, 9);
+
+query IIIR
+SELECT rn, mn, cls, ra FROM duck_ticks
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls, avg(A.price) AS ra
+  ALL ROWS PER MATCH
+  PATTERN (A+)
+  DEFINE A AS A.price >= avg(A.price)
+)
+ORDER BY rn;
+----
+1 1 A 10.0
+2 1 A 13.0
+3 1 A 13.0
+4 2 A 9.0
+
+# -----------------------------------------------------------------------------
+# 2. Aggregate & backtracking idioms (from test_match_recognize_aggregate_idioms.test)
+# -----------------------------------------------------------------------------
+
+# Multi-leg recurring UP / DOWN variables (head-and-shoulders figure)
+statement ok
+CREATE TABLE duck_shoulders (i INT, v INT) AS VALUES
+  (1, 10), (2, 15), (3, 20), (4, 14), (5, 12),
+  (6, 25), (7, 30), (8, 18), (9, 22), (10, 10), (11, 8);
+
+query IIIT
+SELECT i, mn, v, cls FROM duck_shoulders
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (S UP+ DOWN+ UP2+ DOWN+ UP+ DOWN2+)
+  DEFINE
+    UP AS v > PREV(v),
+    DOWN AS v < PREV(v),
+    UP2 AS v > max(UP.v),
+    DOWN2 AS v < min(DOWN.v)
+)
+ORDER BY i;
+----
+1 1 10 S
+2 1 15 UP
+3 1 20 UP
+4 1 14 DOWN
+5 1 12 DOWN
+6 1 25 UP2
+7 1 30 UP2
+8 1 18 DOWN
+9 1 22 UP
+10 1 10 DOWN2
+11 1 8 DOWN2
+
+# Range spread bounded by first value: max(Y.v) - min(Y.v) < FIRST(Y.v)
+statement ok
+CREATE TABLE duck_spread (i INT, v INT) AS VALUES
+  (1, 10), (2, 14), (3, 19), (4, 21), (5, 8), (6, 12), (7, 15);
+
+query III
+SELECT mn, start_i, end_i FROM duck_spread
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES MATCH_NUMBER() AS mn, FIRST(i) AS start_i, LAST(i) AS end_i
+  ONE ROW PER MATCH
+  PATTERN (Y+)
+  DEFINE Y AS max(Y.v) - min(Y.v) < FIRST(Y.v)
+)
+ORDER BY mn;
+----
+1 1 3
+2 4 7
+
+# Greedy bin-packing skipping non-fitting rows via exclusion ({- REST -})
+statement ok
+CREATE TABLE duck_items (bin INT, i INT, w INT) AS VALUES
+  (1, 1, 6), (1, 2, 7), (1, 3, 4), (1, 4, 5), (1, 5, 1),
+  (2, 1, 8), (2, 2, 3), (2, 3, 2);
+
+query III
+SELECT bin, total_w, packed_cnt FROM duck_items
+MATCH_RECOGNIZE (
+  PARTITION BY bin
+  ORDER BY i
+  MEASURES sum(X.w) AS total_w, count(X.i) AS packed_cnt
+  ONE ROW PER MATCH
+  PATTERN ((X | ({- REST -}))+)
+  DEFINE X AS sum(X.w) <= 10
+)
+ORDER BY bin;
+----
+1 10 2
+2 10 2
+
+# Merging overlapping intervals: DEFINE J AS NEXT(s0) <= max(e0)
+statement ok
+CREATE TABLE duck_intervals (s0 INT, e0 INT) AS VALUES
+  (1, 4), (2, 6), (5, 7), (10, 12), (11, 15), (20, 22);
+
+query III
+SELECT merged_s, merged_e, n FROM duck_intervals
+MATCH_RECOGNIZE (
+  ORDER BY s0, e0
+  MEASURES FIRST(s0) AS merged_s, max(e0) AS merged_e, count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (J* L)
+  DEFINE J AS NEXT(s0) <= max(e0)
+)
+ORDER BY merged_s;
+----
+1 7 3
+10 15 2
+20 22 1
+
+# Word wrapping with running sum of lengths + separator: length(I.w) + sum(length(L.w) + 2) <= 12
+statement ok
+CREATE TABLE duck_words (rn INT, w VARCHAR) AS VALUES
+  (1, 'cat'), (2, 'dog'), (3, 'bird'), (4, 'elephant'), (5, 'ant'), (6, 'fox');
+
+query IIT
+SELECT mn, cnt, line FROM duck_words
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES MATCH_NUMBER() AS mn, count(*) AS cnt, string_agg(w, ', ') AS line
+  ONE ROW PER MATCH
+  PATTERN (I L*)
+  DEFINE L AS length(I.w) + sum(length(L.w) + 2) <= 12
+)
+ORDER BY mn;
+----
+1 2 cat, dog
+2 1 bird
+3 1 elephant
+4 2 ant, fox
+
+# Supply depletion: DEFINE B AS rn <= A.rn + sum(days) - days
+statement ok
+CREATE TABLE duck_supply (rn INT, days INT) AS VALUES
+  (1, 2), (2, 1), (3, 0), (4, 0), (5, 1), (6, 0), (7, 0);
+
+query III
+SELECT mn, start_rn, end_rn FROM duck_supply
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES MATCH_NUMBER() AS mn, FIRST(rn) AS start_rn, LAST(rn) AS end_rn
+  ONE ROW PER MATCH
+  PATTERN (A B*)
+  DEFINE B AS rn <= A.rn + sum(days) - days
+)
+ORDER BY mn;
+----
+1 1 4
+2 5 6
+3 7 7
+
+# Non-contiguous variable reuse & backtracking across gaps ((A B){1,2} C)
+statement ok
+CREATE TABLE duck_gap (rn INT, v INT) AS VALUES
+  (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60);
+
+query IT
+SELECT rn, cls FROM duck_gap
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN ((A B){1,2} C)
+  DEFINE A AS count(A.v) <= 2, B AS true, C AS v = 30
+)
+ORDER BY rn;
+----
+1 A
+2 B
+3 C
+
+# -----------------------------------------------------------------------------
+# 3. Cross-variable navigation, forward references, and CLASSIFIER backtracking
+# -----------------------------------------------------------------------------
+
+# Cross-variable NEXT(P.tier) in DEFINE
+statement ok
+CREATE TABLE duck_tiers (id INT, tier VARCHAR) AS VALUES
+  (1, 'low'), (2, 'mid'), (3, 'high');
+
+query ITT
+SELECT id, cls, tier FROM duck_tiers
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN (P Q R)
+  DEFINE P AS tier = 'low', Q AS NEXT(P.tier) = 'mid', R AS true
+)
+ORDER BY id;
+----
+1 P low
+2 Q mid
+3 R high
+
+# Forward reference in DEFINE: B has not matched yet when A is tested, so LAST(B.amt) IS NULL is true
+statement ok
+CREATE TABLE duck_fwd (id INT, amt INT) AS VALUES
+  (1, 10), (2, 20);
+
+query I
+SELECT n FROM duck_fwd
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A B)
+  DEFINE A AS LAST(B.amt) IS NULL, B AS true
+);
+----
+2
+
+# Forward reference comparing a column of an unmatched later variable evaluates to NULL (falsy) -> 0 matches
+query I
+SELECT count(*) FROM duck_fwd
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A B)
+  DEFINE A AS B.amt > 0, B AS true
+);
+----
+0
+
+# Alternation backtracking where C reads PREV(CLASSIFIER()) = 'B':
+# A takes row 1 first and C fails; matcher must backtrack to B on row 1 so C succeeds!
+statement ok
+CREATE TABLE duck_cls_bt (rn INT, x INT) AS VALUES
+  (1, 1), (2, 2);
+
+query IT
+SELECT rn, c FROM duck_cls_bt
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES CLASSIFIER() AS c
+  ALL ROWS PER MATCH
+  PATTERN ((A | B) C)
+  DEFINE A AS true, B AS true, C AS PREV(CLASSIFIER()) = 'B'
+)
+ORDER BY rn;
+----
+1 B
+2 C
+
+# Backtracking on deep greedy prefix giving back multiple rows (from test_match_recognize_pattern.test)
+statement ok
+CREATE TABLE duck_five (i INT, v VARCHAR) AS VALUES
+  (0, 'a'), (1, 'a'), (2, 'a'), (3, 'a'), (4, 'a');
+
+query II
+SELECT count(*), max(len) FROM duck_five
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES count(*) AS len
+  ONE ROW PER MATCH
+  PATTERN (A+ B B B)
+  DEFINE A AS A.v = 'a', B AS B.v = 'a'
+);
+----
+1 5
+
+query II
+SELECT count(*), max(len) FROM duck_five
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES count(*) AS len
+  ONE ROW PER MATCH
+  PATTERN (A+ B+ C)
+  DEFINE A AS A.v = 'a', B AS B.v = 'a', C AS C.v = 'a'
+);
+----
+1 5
+
+# Anchor ($) followed by a symbol can never match past end of partition
+query I
+SELECT count(*) FROM duck_five
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES count(*) AS len
+  ONE ROW PER MATCH
+  PATTERN ($ A)
+  DEFINE A AS true
+);
+----
+0
+
+# Quoted PERMUTE may be used as a pattern variable name
+query I
+SELECT count(*) FROM duck_five
+MATCH_RECOGNIZE (
+  ORDER BY i
+  MEASURES count(*) AS n
+  PATTERN ("PERMUTE")
+  DEFINE "PERMUTE" AS v = 'a'
+);
+----
+5
+
+# -----------------------------------------------------------------------------
+# 4. Expression PARTITION BY / ORDER BY, column shapes, and NULLs
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE duck_scope (g VARCHAR, x INT) AS VALUES
+  ('a', 1), ('A', 2), ('b', 3);
+
+# Non-column expressions in PARTITION BY and ORDER BY
+query I
+SELECT n FROM duck_scope
+MATCH_RECOGNIZE (
+  PARTITION BY upper(g)
+  ORDER BY -x
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A+)
+  DEFINE A AS true
+)
+ORDER BY n;
+----
+1
+2
+
+# Selecting all columns including expression PARTITION BY column
+query TI
+SELECT * FROM duck_scope
+MATCH_RECOGNIZE (
+  PARTITION BY upper(g)
+  ORDER BY -x
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A+)
+  DEFINE A AS true
+)
+ORDER BY n;
+----
+B 1
+A 2
+
+# Same column appearing in both PARTITION BY and ORDER BY (no duplicate output column)
+query TII
+SELECT * FROM duck_scope
+MATCH_RECOGNIZE (
+  PARTITION BY g
+  ORDER BY g
+  MEASURES count(*) AS n
+  ALL ROWS PER MATCH
+  PATTERN (A+)
+  DEFINE A AS true
+)
+ORDER BY g, x;
+----
+A 1 2
+a 1 1
+b 1 3
+
+# Neither PARTITION BY nor ORDER BY with ALL ROWS PER MATCH
+query I
+SELECT count(*) FROM duck_scope
+MATCH_RECOGNIZE (
+  MEASURES count(*) AS n
+  ALL ROWS PER MATCH
+  PATTERN (A)
+  DEFINE A AS true
+);
+----
+3
+
+# Measure alias matching input column name under ONE ROW PER MATCH
+statement ok
+CREATE TABLE duck_same_name (x INT) AS VALUES (10), (20);
+
+query I
+SELECT x FROM duck_same_name
+MATCH_RECOGNIZE (
+  ORDER BY x
+  MEASURES sum(x) AS x
+  ONE ROW PER MATCH
+  PATTERN (A+)
+  DEFINE A AS true
+);
+----
+30
+
+# NULLs in DEFINE predicates and aggregates (from test_match_recognize_nulls.test)
+statement ok
+CREATE TABLE duck_nulls (rn INT, v INT) AS VALUES
+  (1, 10), (2, NULL), (3, 20);
+
+query I
+SELECT n FROM duck_nulls
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A+)
+  DEFINE A AS coalesce(sum(A.v), 0) < 25
+)
+ORDER BY n;
+----
+1
+2
+
+# Empty variable B in aggregate returns count=0 and sum=NULL
+query I
+WITH t(rn, v) AS (VALUES (1, 5), (2, 7), (3, 9))
+SELECT n FROM t
+MATCH_RECOGNIZE (
+  ORDER BY rn
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (B* A+)
+  DEFINE B AS v > 100, A AS count(B.v) = 0 AND sum(B.v) IS NULL
+);
+----
+3
+
+# -----------------------------------------------------------------------------
+# 5. SQL composition (from test_match_recognize_composition.test)
+# -----------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE duck_comp (p INT, i INT, v INT) AS VALUES
+  (1, 1, 10), (1, 2, 20), (1, 3, 5), (1, 4, 15),
+  (2, 1, 30), (2, 2, 40), (2, 3, 25);
+
+# Stacked MATCH_RECOGNIZE (output of one feeds into another via CTE)
+query II
+WITH runs AS (
+  SELECT p, mn, last_v FROM duck_comp
+  MATCH_RECOGNIZE (
+    PARTITION BY p
+    ORDER BY i
+    MEASURES MATCH_NUMBER() AS mn, LAST(v) AS last_v
+    ONE ROW PER MATCH
+    PATTERN (A B*)
+    DEFINE B AS v > PREV(v)
+  )
+)
+SELECT p, pairs FROM runs
+MATCH_RECOGNIZE (
+  PARTITION BY p
+  ORDER BY mn
+  MEASURES count(*) AS pairs
+  ONE ROW PER MATCH
+  PATTERN (X Y)
+  DEFINE X AS true, Y AS Y.last_v < X.last_v
+)
+ORDER BY p;
+----
+1 2
+2 2
+
+# GROUP BY feeding into MATCH_RECOGNIZE
+query II
+WITH daily AS (
+  SELECT p, i, sum(v) AS total_v
+  FROM duck_comp
+  GROUP BY p, i
+)
+SELECT p, n FROM daily
+MATCH_RECOGNIZE (
+  PARTITION BY p
+  ORDER BY i
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A B+)
+  DEFINE B AS total_v > PREV(total_v)
+)
+ORDER BY p, n;
+----
+1 2
+1 2
+2 2
+
+# Window function over MATCH_RECOGNIZE output
+query III
+SELECT p, n, sum(n) OVER () AS grand_total
+FROM duck_comp
+MATCH_RECOGNIZE (
+  PARTITION BY p
+  ORDER BY i
+  MEASURES count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A B+)
+  DEFINE B AS v > PREV(v)
+)
+ORDER BY p;
+----
+1 2 6
+1 2 6
+2 2 6
+
+# UNION ALL of two MATCH_RECOGNIZE queries
+query II
+SELECT 1 AS tag, count(*) AS c FROM duck_comp
+MATCH_RECOGNIZE (
+  PARTITION BY p ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+  PATTERN (A B+) DEFINE B AS v > PREV(v)
+)
+UNION ALL
+SELECT 2 AS tag, count(*) AS c FROM duck_comp
+MATCH_RECOGNIZE (
+  PARTITION BY p ORDER BY i MEASURES count(*) AS n ONE ROW PER MATCH
+  PATTERN (A B+) DEFINE B AS v < PREV(v)
+)
+ORDER BY tag;
+----
+1 3
+2 2
+
+# CREATE VIEW over MATCH_RECOGNIZE and querying the view
+statement ok
+CREATE VIEW duck_mr_view AS
+SELECT p, mn, n FROM duck_comp
+MATCH_RECOGNIZE (
+  PARTITION BY p
+  ORDER BY i
+  MEASURES MATCH_NUMBER() AS mn, count(*) AS n
+  ONE ROW PER MATCH
+  PATTERN (A B+)
+  DEFINE B AS v > PREV(v)
+);
+
+query III
+SELECT p, mn, n FROM duck_mr_view ORDER BY p, mn;
+----
+1 1 2
+1 2 2
+2 1 2

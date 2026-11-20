@@ -68,7 +68,26 @@ cargo run --example stock_vshape
 
 ## Benchmarks
 
-The tables below compare `datafusion-match-recognize` against Trino 484 on five 10,000,000-row Parquet workloads (200,000 partitions x 50 rows) running sequentially in identical Linux ARM64 Docker containers, plus Criterion microbenchmarks for adversarial backtracking patterns.
+The tables below compare `datafusion-match-recognize` against both DuckDB 2.1 (`duckdb>=2.0.1.dev0`, native C++ `MATCH_RECOGNIZE`) and Trino 484 on five 10,000,000-row Parquet workloads (200,000 partitions x 50 rows), plus Criterion microbenchmarks for adversarial backtracking patterns.
+
+### Single-node Parquet comparison against DuckDB 2.1 (10,000,000 rows)
+
+| Workload | Matched output rows | DataFusion p50 | DuckDB 2.1 p50 | Relative |
+| --- | ---: | ---: | ---: | ---: |
+| `1_funnel_3step_stateless` | 1,000,000 | **0.170 s** | 0.571 s | 3.4x faster |
+| `2_funnel_sparse_1pct_fast_skip` | 2,000 | **0.154 s** | 0.332 s | 2.2x faster |
+| `3_overlapping_skip_next_all_rows` | 15,092,674 | **0.205 s** | 0.920 s | 4.5x faster |
+| `4_stock_vshape_stateful_prev` | 3,043,902 | **0.198 s** | 0.812 s | 4.1x faster |
+| `5_time_window_funnel_stateful` | 880,000 | **0.182 s** | 0.648 s | 3.6x faster |
+| **Total (all 5 workloads)** | **20,018,576** | **0.909 s** | **3.283 s** | **3.6x faster** |
+
+**Conditions.** Both engines ran sequentially (never concurrently) natively on Apple Silicon ARM64 with 8 threads (`SET threads = 8` for DuckDB 2.1; `target_partitions = 8` and 8 Tokio worker threads for DataFusion), scanning the exact same 10,000,000-row Parquet files written by DuckDB (`PER_THREAD_OUTPUT true`). Each workload ran 2 warmup iterations followed by 5 measured runs (median p50 reported), wrapped in `SELECT COUNT(*), SUM(...)` with exact checksum parity verified across engines on every query. (On in-memory tables on the same host, DataFusion totaled 0.640 s vs DuckDB's 2.645 s, 4.1x faster.)
+
+Reproduce the DuckDB 2.1 Parquet comparison locally:
+
+```sh
+./scripts/bench_vs_duckdb.sh
+```
 
 ### Single-node Parquet comparison against Trino 484 (10,000,000 rows)
 
@@ -105,13 +124,16 @@ Measured with `cargo bench --bench funnel_bench -- --quick` on `(A+)+ B` against
 - Stay on DataFusion public extension APIs (`RelationPlanner`, `UserDefinedLogicalNodeCore`, `ExtensionPlanner`, `ExecutionPlan`, `OptimizerRule`, `LogicalExtensionCodec`, `PhysicalExtensionCodec`, and `UserDefinedLogicalNodeUnparser`) with zero core fork.
 - Keep simple row-local `DEFINE` patterns fast. Row-local predicates evaluate once per partition in vectorized Arrow into per-row `u64` bitmasks with O(1) start-symbol fast skipping and linear-time PikeVM thread deduplication. Stateful `DEFINE` predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, cross-symbol references) precompute inner expressions once per partition and evaluate lazily on candidate transitions.
 - Reuse DataFusion instead of rebuilding it. Partitioning and sorting go through `EnforceDistribution` and `EnforceSorting`, `MEASURES` outer expressions run as standard DataFusion `PhysicalExpr`s with native type coercion, custom aggregates bridge to DataFusion's `Accumulator` trait, and large partitions spill through `SpillManager`.
-- Verify against independent oracles, not just hand-written tests. Every commit runs a recursive backtracking reference oracle with `proptest`, multi-batch/multi-partition Arrow invariance tests, disk-spill and memory-pool tests, protobuf round-trips, and a live differential SQL oracle against Trino 484 in CI.
+- Verify against independent oracles, not just hand-written tests. Every commit runs a recursive backtracking reference oracle with `proptest`, multi-batch/multi-partition Arrow invariance tests, disk-spill and memory-pool tests, protobuf round-trips, and live differential SQL oracles against both Trino 484 and DuckDB 2.1 in CI.
 
 ## Verification
 
 ```sh
 # Offline suites: reference oracle + proptest, SLT suites, Arrow/proto/spill invariance, complexity
 cargo test
+
+# Live differential SQL oracle against DuckDB 2.1 (native C++ MATCH_RECOGNIZE, requires uv)
+cargo test --test duckdb_oracle -- --ignored --nocapture
 
 # Live differential SQL oracle against Trino in Docker
 docker run -d --name mr-trino-oracle -p 18080:8080 trinodb/trino:latest
@@ -134,11 +156,12 @@ Upstream SQL syntax PRs tracked for full SQL:2016 parsing in DataFusion:
 
 ## Acknowledgments
 
-This crate builds on work across the Apache DataFusion, Trino, Apache Calcite, and Apache Flink communities:
+This crate builds on work across the Apache DataFusion, Trino, DuckDB, Apache Calcite, Apache Flink, and RisingWave communities:
 
 - Geoffrey Claude (`geoffreyclaude`) for designing DataFusion's `RelationPlanner` extension API ([apache/datafusion#18078](https://github.com/apache/datafusion/issues/18078)) and exploring the earlier `MATCH_RECOGNIZE` prototype ([apache/datafusion#16685](https://github.com/apache/datafusion/pull/16685)).
 - Andrew Lamb (`alamb`) and the Apache DataFusion maintainers for steering SQL extensions toward modular `datafusion-contrib` crates.
 - Trino (`trinodb/trino`) for its SQL:2016 row pattern bytecode compiler (`IrRowPatternToProgramRewriter`), documentation, and `TestRowPatternMatching` / `TestAggregationsInRowPatternMatching` / `TestPatternMatchingMachine` test suites, which shaped our NFA compilation and live differential oracle.
+- DuckDB (`duckdb/duckdb`) for its native C++ `MATCH_RECOGNIZE` implementation, ISO/IEC 19075-5 `test/sql/match_recognize/*.test` suites, and microbenchmarks, which serve as our second live differential oracle and native benchmark baseline.
 - Apache Calcite (`apache/calcite`) for its `match.iq` SQL:2016 test cases.
 - Apache Flink (`apache/flink`) for its `MatchRecognizeITCase` batch and streaming SQL test cases.
 - RisingWave (`risingwavelabs/risingwave`) for its `e2e_test/streaming/match_recognize*.slt` SQL logic test suites.

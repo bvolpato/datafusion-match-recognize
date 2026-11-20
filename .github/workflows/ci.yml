@@ -93,3 +93,22 @@ jobs:
       - name: Live Trino Differential Oracle
         working-directory: datafusion-match-recognize
         run: cargo test --test trino_oracle -- --ignored --nocapture
+
+  duckdb-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: datafusion-match-recognize
+      - uses: actions/checkout@v4
+        with:
+          repository: apache/datafusion
+          path: datafusion
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Live DuckDB 2.1 Differential Oracle
+        working-directory: datafusion-match-recognize
+        run: cargo test --test duckdb_oracle -- --ignored --nocapture

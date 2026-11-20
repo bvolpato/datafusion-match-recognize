@@ -321,3 +321,105 @@ MATCH_RECOGNIZE (
   PATTERN (a b)
   DEFINE a AS a.price > 0, b AS b.price < prev(b.price, 1) IGNORE NULLS
 );
+
+# 12. DuckDB scope, alias, and navigation negative validation cases
+statement error duplicate unqualified field name
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n, sum(price) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'match_number'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY MATCH_NUMBER()
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'match_number'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  PARTITION BY MATCH_NUMBER()
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'classifier'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY CLASSIFIER()
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'first'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY FIRST(price)
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'prev'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY PREV(price)
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Invalid function 'next'
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  PARTITION BY NEXT(price)
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error must contain at least one column reference or CLASSIFIER
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES FIRST(MATCH_NUMBER()) AS x
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error must contain at least one column reference or CLASSIFIER
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES PREV(MATCH_NUMBER()) AS x
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error integer literal
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES FIRST(price, NULL) AS x
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error integer literal
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS FIRST(price, id) > 0
+);

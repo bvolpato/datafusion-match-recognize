@@ -1,10 +1,10 @@
 # SQL:2016 coverage, divergences, and upstream tracking
 
-This file records what the crate implements, where it intentionally goes beyond Trino 484, and which remaining syntax or extension-point gaps live upstream.
+This file records what the crate implements, where it intentionally goes beyond Trino 484 and DuckDB 2.1, and which remaining syntax or extension-point gaps live upstream.
 
 ## Implemented engine capabilities
 
-Verified against Trino 484 (and the Layer 1 recursive reference oracle):
+Verified against Trino 484, DuckDB 2.1 (`duckdb>=2.0.1.dev0`), and the Layer 1 recursive reference oracle:
 
 - Pattern engine supporting named primary variables, implicit-true variables omitted from `DEFINE`, `^` and `$` partition anchors, concatenation, ordered alternation (`|`), groups, greedy and reluctant quantifiers (`*`, `+`, `?`, `{n}`, `{n,}`, `{,m}`, `{n,m}`, `*?`, `+?`, `??`, `{n,m}?`), `{- exclude -}`, and `PERMUTE(...)`.
 - Hybrid two-tier `DEFINE` evaluation. Row-local predicates evaluate once per partition in vectorized Arrow into per-row `u64` bitmasks with O(1) `start_symbols_mask` fast skipping, while stateful predicates (`PREV`, `NEXT`, `FIRST`, `LAST`, running aggregates, `CLASSIFIER()`, `MATCH_NUMBER()`, cross-symbol references) precompute inner expressions once per partition and evaluate lazily on candidate transitions with configurable `max_active_threads` limits.
@@ -17,6 +17,16 @@ Verified against Trino 484 (and the Layer 1 recursive reference oracle):
 
 1. `DISTINCT` inside `MATCH_RECOGNIZE` aggregates. Trino 484 rejects `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` in pattern recognition context (`NOT_SUPPORTED`). This crate supports `DISTINCT` across `COUNT`, `SUM`, `AVG`, and single-argument UDAFs (verified in `tests/slt/stateful_and_distinct.slt` and `tests/invariance.rs`).
 2. Physical navigation inside aggregates (`SUM(PREV(b.price))`, `SUM(NEXT(b.price))`). Trino 484 rejects nesting `PREV` or `NEXT` inside aggregates (`INVALID_NAVIGATION_NESTING`). This crate supports shifting aggregate input rows by `PREV` or `NEXT` (verified in `tests/slt/edge_cases.slt` and `tests/invariance.rs`).
+
+## Differences from DuckDB 2.1
+
+Verified with `tests/duckdb_oracle.rs` against DuckDB 2.1 (`duckdb>=2.0.1.dev0`):
+
+1. `CLASSIFIER()` identifier casing. Following SQL:2016 and Trino 484, unquoted pattern variables fold to uppercase (`a` -> `'A'`) while double-quoted variables preserve exact case (`"b"` -> `'b'`). DuckDB 2.1 preserves the written spelling of unquoted variables (`a` -> `'a'`).
+2. `COUNT(var.*)` syntax. Following SQL:2016 and Trino 484, this crate supports `COUNT(var.*)` to count rows mapped to `var` regardless of NULL column values. DuckDB 2.1 currently rejects `COUNT(var.*)` and requires `COUNT(var.col)`.
+3. Nullable alternation inside unbounded quantifiers (`(C | C? | A)*` on input `[A]`). Following SQL:2016 and Trino 484 bytecode semantics, the higher-priority `C?` branch matches 0 rows on the first iteration and terminates the `*` loop with an empty match. DuckDB 2.1 backtracks past `C?`'s empty match into `A` and returns `[A]`.
+4. Stricter SQL:2016 validation in `MEASURES`. Following SQL:2016 and Trino 484, this crate rejects `FIRST(MATCH_NUMBER())`, `LAST(NEXT(v, 2))`, and window expressions (`max(v) OVER ()`) inside `MEASURES`, whereas DuckDB 2.1 currently accepts them.
+5. DuckDB-specific SQL extensions. DuckDB makes `DEFINE` optional (all variables implicit true), supports `DEFINE AUTO`, and allows referencing earlier measure aliases in subsequent `MEASURES` expressions. This crate follows SQL:2016 and Trino 484 by requiring `DEFINE` and resolving `MEASURES` against input columns and pattern variables.
 
 ## Upstream parser and extension-point blockers
 

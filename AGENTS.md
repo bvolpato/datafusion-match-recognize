@@ -21,11 +21,12 @@
 - `examples/`: Runnable usage examples (`funnel.rs`, `stock_vshape.rs`).
 - `tests/`: 4-layer verification suite.
   - `oracle.rs`: Layer 1 independent recursive backtracking oracle + `proptest` fuzzer (stateless and stateful).
-  - `sql_tests.rs` and `tests/slt/`: Layer 2a SQL Logic Tests (Trino, Calcite, funnel, stateful, edge cases).
+  - `sql_tests.rs` and `tests/slt/`: Layer 2a SQL Logic Tests (Trino, DuckDB, Calcite, Flink, RisingWave, Snowflake, funnel, stateful, edge cases, and negative validation).
   - `trino_oracle.rs`: Layer 2b live differential SQL oracle against Trino 484 in Docker (hand cases + combinatorial fuzz + PRNG random queries).
+  - `duckdb_oracle.rs`: Layer 2c live differential SQL oracle against DuckDB 2.1 (`duckdb>=2.0.1.dev0`) over a persistent Python NDJSON worker (hand cases + combinatorial fuzz + PRNG random queries).
   - `invariance.rs`: Layer 3 batch-size, partition-count, Arrow slicing/types, optimizer, memory-pool, disk-spill, protobuf round-trip, and unparser tests.
   - `complexity.rs`: Layer 4 adversarial anti-backtracking linear-time tests.
-  - `divergences.md`: Documented parity matrix, supersets over Trino, and upstream tracking PRs.
+  - `divergences.md`: Documented parity matrix, supersets over Trino, differences from DuckDB 2.1, and upstream tracking PRs.
 - `benches/funnel_bench.rs`: Criterion throughput and anti-backtracking benchmarks.
 
 ## Key invariants to preserve
@@ -34,4 +35,4 @@
 2. **Tier 1 linear time:** Stateless `DEFINE` matching must keep per-position `visited[pc]` deduplication and pass `tests/complexity.rs`.
 3. **Flat arena history:** Do not reintroduce recursive heap pointers (`Rc`/`Box` chains) for match history (50k-row matches will overflow the stack on `Drop`).
 4. **Proto parity:** Every new field in `MatchRecognizeNode` or `MatchRecognizeExec` must round-trip through `MatchRecognizeLogicalCodec` and `MatchRecognizePhysicalCodec`.
-5. **Oracle verification:** Any NFA or SQL semantic change must pass `cargo test` and `cargo test --test trino_oracle -- --ignored --nocapture` against Trino 484.
+5. **Oracle verification:** Any NFA or SQL semantic change must pass `cargo test`, `cargo test --test trino_oracle -- --ignored --nocapture` against Trino 484, and `cargo test --test duckdb_oracle -- --ignored --nocapture` against DuckDB 2.1.

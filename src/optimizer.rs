@@ -54,6 +54,12 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
                     && c.name == *out_field.name()
                     && seen.insert(c.name.clone())
                     && mr_node.schema.field_with_unqualified_name(&c.name).is_ok()
+                    && (mr_node.measures.iter().any(|m| m.alias == c.name)
+                        || mr_node
+                            .input
+                            .schema()
+                            .field_with_unqualified_name(&c.name)
+                            .is_ok())
                 {
                     col_names.push(c.name.clone());
                 } else {
