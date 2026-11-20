@@ -1172,3 +1172,136 @@ async fn test_aliased_filter_pushdown_and_quoted_unparser_roundtrip() {
     let actual3 = run_and_format(&ext_ctx, unparse_sql).await;
     assert_eq!(actual3, expected2);
 }
+
+#[tokio::test]
+async fn test_perf_paths_projection_proto_prefilter_and_boundary_clamping() {
+    // 1. ALL ROWS PER MATCH output projection pushdown + logical/physical proto round-trip
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new()
+            .with_batch_size(8192)
+            .with_target_partitions(1),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+
+    let proj_sql = r#"
+        WITH t(p, seq, ts, ev, price) AS (
+            VALUES
+                (1, 1, 10, 0, 100), (1, 2, 20, 1, 110), (1, 3, 30, 2, 120),
+                (2, 1, 10, 0, 200), (2, 2, 20, 1, 210), (2, 3, 30, 2, 220),
+                (3, 1, 10, 0, 300), (3, 2, 20, 1, 310), (3, 3, 30, 2, 320)
+        )
+        SELECT s_price FROM t
+        MATCH_RECOGNIZE (
+            PARTITION BY p
+            ORDER BY seq
+            MEASURES SUM(price) AS s_price
+            ALL ROWS PER MATCH OMIT EMPTY MATCHES
+            AFTER MATCH SKIP TO NEXT ROW
+            PATTERN (a b+ c)
+            DEFINE a AS price >= 100, b AS ev = 1, c AS ev = 2
+        )
+        ORDER BY s_price
+    "#;
+    let df = ctx.sql(proj_sql).await.unwrap();
+    let expected = pretty_format_batches(&df.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    let lplan = df.clone().into_optimized_plan().unwrap();
+    let lcodec = MatchRecognizeLogicalCodec::new();
+    let lbytes = logical_plan_to_bytes_with_extension_codec(&lplan, &lcodec).unwrap();
+    let ldecoded =
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec)
+            .unwrap();
+    let lout = pretty_format_batches(
+        &ctx.execute_logical_plan(ldecoded)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .to_string();
+    assert_eq!(lout, expected);
+
+    let pplan = df.create_physical_plan().await.unwrap();
+    let pcodec = MatchRecognizePhysicalCodec::new();
+    let pbytes = physical_plan_to_bytes_with_extension_codec(pplan, &pcodec).unwrap();
+    let pdecoded =
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec)
+            .unwrap();
+    let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
+        .unwrap()
+        .to_string();
+    assert_eq!(pout, expected);
+
+    // 2. RowLocalPrefilter with non-nullable MATCH_NUMBER() slot in DEFINE
+    let prefilter_sql = r#"
+        WITH t(p, id, v) AS (
+            VALUES
+                (1, 1, 2), (1, 2, 5), (1, 3, 6),
+                (2, 1, 8), (2, 2, 6), (2, 3, 1),
+                (3, 1, CAST(NULL AS INT)), (3, 2, 4), (3, 3, 5)
+        )
+        SELECT m.p, m.id, m.mn, m.cls FROM t
+        MATCH_RECOGNIZE (
+            PARTITION BY p
+            ORDER BY id
+            MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+            ALL ROWS PER MATCH OMIT EMPTY MATCHES
+            PATTERN (a{0,2} b+)
+            DEFINE a AS v <= 5 AND MATCH_NUMBER() <= 3, b AS v >= 4
+        ) AS m
+        ORDER BY m.p, m.mn, m.id
+    "#;
+    let pf_batches = ctx
+        .sql(prefilter_sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let pf_rows: usize = pf_batches.iter().map(RecordBatch::num_rows).sum();
+    assert!(pf_rows > 0, "expected matches from prefilter query");
+
+    // 3. Multi-partition single-batch PREV/NEXT boundary clamping:
+    //    Partition 1 ends at price=500; partition 2 starts at price=100.
+    //    `down` (price < PREV(price)) MUST NOT fire on partition 2 row 1 (100 < 500 must be clamped
+    //    to NULL at partition start), and NEXT(price) on partition 1's last row MUST be NULL.
+    let clamp_sql = r#"
+        WITH t(p, seq, price) AS (
+            VALUES
+                (1, 1, 100), (1, 2, 500),
+                (2, 1, 100), (2, 2, 90), (2, 3, 120),
+                (3, 1, 50),  (3, 2, 200)
+        )
+        SELECT p, seq, cls, prev_p, next_p FROM t
+        MATCH_RECOGNIZE (
+            PARTITION BY p
+            ORDER BY seq
+            MEASURES
+                CLASSIFIER() AS cls,
+                PREV(price) AS prev_p,
+                NEXT(price) AS next_p
+            ALL ROWS PER MATCH
+            PATTERN (s d* u+)
+            DEFINE
+                d AS d.price < PREV(d.price),
+                u AS u.price > PREV(u.price)
+        )
+        ORDER BY p, seq
+    "#;
+    let clamp_out = run_and_format(&ctx, clamp_sql).await;
+    // Partition 1 row 2 (seq=2) is the last row of partition 1 -> next_p must be empty (NULL), not 100.
+    assert!(
+        clamp_out.contains("| 1 | 2   | U   | 100    |        |"),
+        "expected NULL next_p at end of partition 1, got:\n{clamp_out}"
+    );
+    // Partition 2 row 1 (seq=1) is the first row of partition 2 -> prev_p must be empty (NULL), not 500.
+    assert!(
+        clamp_out.contains("| 2 | 1   | S   |        | 90     |"),
+        "expected NULL prev_p at start of partition 2, got:\n{clamp_out}"
+    );
+}
