@@ -146,6 +146,26 @@ pub trait StatefulPredicateEvaluator {
         tentative_steps: &[MatchStep],
         candidate_match_number: i64,
     ) -> Result<bool>;
+
+    /// Notification invoked at the start of each match attempt so evaluators maintaining
+    /// history-head-keyed prefix caches can invalidate them.
+    #[inline]
+    fn on_new_match_attempt(&mut self) {}
+
+    /// Evaluates the stateful `DEFINE` predicate with immutable arena history-head identifiers
+    /// for `tentative_steps[..len-1]` (`prefix_head` and its parent `prefix_prev_head`), enabling
+    /// O(1) incremental prefix-state maintenance across linear match growth.
+    #[inline]
+    fn eval_stateful_with_history(
+        &mut self,
+        sym: SymbolId,
+        tentative_steps: &[MatchStep],
+        candidate_match_number: i64,
+        _prefix_head: u32,
+        _prefix_prev_head: u32,
+    ) -> Result<bool> {
+        self.eval_stateful(sym, tentative_steps, candidate_match_number)
+    }
 }
 
 /// No-op evaluator used when all `DEFINE` symbols are stateless (Tier 1 fast path).
@@ -247,7 +267,13 @@ pub struct MatchStats {
     pub total_thread_steps: usize,
 }
 
-const NO_HISTORY: u32 = u32::MAX;
+/// Sentinel history head representing an empty match prefix.
+pub const NO_HISTORY: u32 = u32::MAX;
+
+/// Row walk threshold before activating lazy cross-attempt Tier 1 dead-state memoization.
+const DEAD_CACHE_TRIGGER_ROWS: usize = 64;
+/// Upper cap on lazy dead-state bitset size (64M bits = 8 MiB).
+const DEAD_CACHE_MAX_BITS: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct HistoryEntry {
@@ -270,8 +296,13 @@ pub struct MatcherBuffers {
     arena: Vec<HistoryEntry>,
     epsilon_stack: Vec<Thread>,
     scratch_steps: Vec<MatchStep>,
+    scratch_head: u32,
     current: Vec<Thread>,
     next: Vec<Thread>,
+    /// Lazy per-partition Tier 1 dead-state bitset indexed by `(pos - part_start) * num_match_labels + ord`.
+    dead_bits: Vec<u64>,
+    dead_active: bool,
+    attempt_visited_bits: Vec<usize>,
 }
 
 impl MatcherBuffers {
@@ -283,8 +314,12 @@ impl MatcherBuffers {
             arena: Vec::new(),
             epsilon_stack: Vec::new(),
             scratch_steps: Vec::new(),
+            scratch_head: NO_HISTORY,
             current: Vec::new(),
             next: Vec::new(),
+            dead_bits: Vec::new(),
+            dead_active: false,
+            attempt_visited_bits: Vec::new(),
         }
     }
 }
@@ -416,6 +451,28 @@ impl<'a> Matcher<'a> {
 
         let mut events = Vec::new();
         let mut stats = MatchStats::default();
+        self.buf.dead_active = false;
+
+        // O(N) whole-partition rejection when a mandatory symbol never appears in the partition.
+        if part_end.saturating_sub(part_start) >= DEAD_CACHE_TRIGGER_ROWS
+            && self.partition_missing_required_symbol(
+                symbols,
+                part_start,
+                part_end,
+                has_stateful,
+                evaluator,
+            )
+        {
+            stats.fast_skipped_rows += part_end - part_start;
+            if rows_per_match.include_unmatched_rows() {
+                events.reserve(part_end - part_start);
+                for row_idx in part_start..part_end {
+                    events.push(PartitionEvent::UnmatchedRow { row_idx });
+                }
+            }
+            return Ok((events, stats));
+        }
+
         let mut match_number: i64 = 0;
         let mut start_row: usize = part_start;
         let mut max_matched_end: usize = part_start;
@@ -561,6 +618,28 @@ impl<'a> Matcher<'a> {
         });
 
         let mut stats = MatchStats::default();
+        self.buf.dead_active = false;
+
+        // O(N) whole-partition rejection when a mandatory symbol never appears in the partition.
+        if part_end.saturating_sub(part_start) >= DEAD_CACHE_TRIGGER_ROWS
+            && self.partition_missing_required_symbol(
+                symbols,
+                part_start,
+                part_end,
+                has_stateful,
+                evaluator,
+            )
+        {
+            if rows_per_match.include_unmatched_rows() {
+                pool.events.reserve(part_end - part_start);
+                for row_idx in part_start..part_end {
+                    pool.events
+                        .push(FlatPartitionEvent::UnmatchedRow { row_idx });
+                }
+            }
+            return Ok(());
+        }
+
         let mut match_number: i64 = 0;
         let mut start_row: usize = part_start;
         let mut max_matched_end: usize = part_start;
@@ -691,6 +770,41 @@ impl<'a> Matcher<'a> {
             .map(|head| materialize_history(&self.buf.arena, head))
     }
 
+    fn partition_missing_required_symbol<E: StatefulPredicateEvaluator>(
+        &self,
+        symbols: &PartitionSymbols,
+        part_start: usize,
+        part_end: usize,
+        has_stateful: bool,
+        evaluator: &E,
+    ) -> bool {
+        let req = self.program.required_symbols_mask;
+        if req == 0 {
+            return false;
+        }
+        let PartitionSymbols::Bitmask64 { rows, .. } = symbols else {
+            return false;
+        };
+        if has_stateful {
+            for s in 0..self.program.num_symbols() {
+                if (req & (1u64 << s)) != 0 {
+                    let sym = s as SymbolId;
+                    if evaluator.is_stateful(sym) && !evaluator.has_prefilter(sym) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let mut present = 0u64;
+        for &bits in &rows[part_start..part_end] {
+            present |= bits;
+            if (present & req) == req {
+                return false;
+            }
+        }
+        (present & req) != req
+    }
+
     fn find_match_head_in_range(
         &mut self,
         symbols: &PartitionSymbols,
@@ -702,6 +816,7 @@ impl<'a> Matcher<'a> {
         self.buf.arena.clear();
         self.buf.current.clear();
         self.buf.next.clear();
+        self.buf.attempt_visited_bits.clear();
         let mut best_match: Option<u32> = None;
 
         self.bump_gen();
@@ -718,14 +833,50 @@ impl<'a> Matcher<'a> {
             stats,
         );
 
+        let num_ml = self.program.num_match_labels;
+        let can_dead_cache = num_ml > 0
+            && (part_end - part_start)
+                .checked_mul(num_ml)
+                .is_some_and(|total_bits| total_bits <= DEAD_CACHE_MAX_BITS);
+
         let mut pos = start_row;
         while !self.buf.current.is_empty() && pos < part_end {
+            if !self.buf.dead_active
+                && can_dead_cache
+                && best_match.is_none()
+                && pos - start_row >= DEAD_CACHE_TRIGGER_ROWS
+            {
+                let total_bits = (part_end - part_start) * num_ml;
+                let words = total_bits.div_ceil(64);
+                self.buf.dead_bits.clear();
+                self.buf.dead_bits.resize(words, 0);
+                self.buf.dead_active = true;
+            }
+
+            let record_dead = self.buf.dead_active && best_match.is_none();
+            let row_base = (pos - part_start) * num_ml;
+
             self.buf.next.clear();
             self.bump_gen();
 
             let cur_len = self.buf.current.len();
             for idx in 0..cur_len {
                 let thread = self.buf.current[idx];
+                if self.buf.dead_active {
+                    let ord = self.program.pc_to_match_ordinal[thread.pc];
+                    if ord != u16::MAX {
+                        let bit_idx = row_base + ord as usize;
+                        if (self.buf.dead_bits[bit_idx >> 6] & (1u64 << (bit_idx & 63)))
+                            != 0
+                        {
+                            continue;
+                        }
+                        if record_dead {
+                            self.buf.attempt_visited_bits.push(bit_idx);
+                        }
+                    }
+                }
+
                 stats.total_thread_steps += 1;
                 match self.program.instructions[thread.pc] {
                     Inst::MatchLabel { sym } => {
@@ -766,6 +917,12 @@ impl<'a> Matcher<'a> {
 
             std::mem::swap(&mut self.buf.current, &mut self.buf.next);
             pos += 1;
+        }
+
+        if best_match.is_none() && self.buf.dead_active {
+            for &bit_idx in &self.buf.attempt_visited_bits {
+                self.buf.dead_bits[bit_idx >> 6] |= 1u64 << (bit_idx & 63);
+            }
         }
 
         best_match
@@ -833,6 +990,9 @@ impl<'a> Matcher<'a> {
         self.buf.arena.clear();
         self.buf.current.clear();
         self.buf.next.clear();
+        self.buf.scratch_steps.clear();
+        self.buf.scratch_head = NO_HISTORY;
+        evaluator.on_new_match_attempt();
         let mut best_match: Option<u32> = None;
 
         self.bump_gen();
@@ -869,17 +1029,38 @@ impl<'a> Matcher<'a> {
                                     sym,
                                     excluded: thread.exclude_depth > 0,
                                 };
-                                fill_tentative_steps(
-                                    &self.buf.arena,
-                                    thread.history_head,
-                                    step,
-                                    &mut self.buf.scratch_steps,
-                                );
-                                evaluator.eval_stateful(
+                                let prefix_head = thread.history_head;
+                                let prefix_prev_head = if prefix_head == NO_HISTORY {
+                                    NO_HISTORY
+                                } else {
+                                    self.buf.arena[prefix_head as usize].prev
+                                };
+                                if prefix_head != self.buf.scratch_head {
+                                    if prefix_head != NO_HISTORY
+                                        && prefix_prev_head == self.buf.scratch_head
+                                    {
+                                        self.buf.scratch_steps.push(
+                                            self.buf.arena[prefix_head as usize].step,
+                                        );
+                                    } else {
+                                        rebuild_prefix_steps(
+                                            &self.buf.arena,
+                                            prefix_head,
+                                            &mut self.buf.scratch_steps,
+                                        );
+                                    }
+                                    self.buf.scratch_head = prefix_head;
+                                }
+                                self.buf.scratch_steps.push(step);
+                                let eval_res = evaluator.eval_stateful_with_history(
                                     sym,
                                     &self.buf.scratch_steps,
                                     candidate_match_number,
-                                )?
+                                    prefix_head,
+                                    prefix_prev_head,
+                                );
+                                self.buf.scratch_steps.pop();
+                                eval_res?
                             }
                         } else {
                             symbols.matches(pos, sym)
@@ -1102,14 +1283,8 @@ fn materialize_history_into(
     out[start..].reverse();
 }
 
-fn fill_tentative_steps(
-    arena: &[HistoryEntry],
-    mut head: u32,
-    candidate: MatchStep,
-    out: &mut Vec<MatchStep>,
-) {
+fn rebuild_prefix_steps(arena: &[HistoryEntry], mut head: u32, out: &mut Vec<MatchStep>) {
     out.clear();
-    out.push(candidate);
     while head != NO_HISTORY {
         let entry = arena[head as usize];
         out.push(entry.step);

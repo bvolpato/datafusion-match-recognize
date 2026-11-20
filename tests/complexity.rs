@@ -4,7 +4,9 @@
 //! deduplication executes in linear time O(N * |states|) even on classic catastrophic patterns.
 
 use datafusion_common::instant::Instant;
-use datafusion_match_recognize::ast::{MatchRecognizeConfig, Pattern, SymbolRef};
+use datafusion_match_recognize::ast::{
+    AfterMatchSkip, MatchRecognizeConfig, Pattern, RowsPerMatch, SymbolRef,
+};
 use datafusion_match_recognize::matcher::{MatchStats, Matcher, PartitionSymbols};
 use datafusion_match_recognize::pattern::Program;
 
@@ -122,4 +124,86 @@ fn test_catastrophic_backtracking_classic_a_opt_n() {
         Pattern::Symbol(SymbolRef::Named("b".into())),
     ]);
     assert_linear_no_match("(A?){25} A{25} B", &pattern, 20_000);
+}
+
+#[test]
+fn test_partition_cross_attempt_dead_state_cache_linear() {
+    // Full-partition scan of (A+)+ B where B appears ONLY at row 0 followed by 50,000 rows of A.
+    // Because B is present in the partition, required_symbols_mask does NOT skip the partition;
+    // lazy cross-attempt dead-state memoization must keep total partition work strictly linear.
+    let pattern = Pattern::Concat(vec![
+        Pattern::Repetition {
+            inner: Box::new(Pattern::Repetition {
+                inner: Box::new(Pattern::Symbol(SymbolRef::Named("a".into()))),
+                min: 1,
+                max: None,
+                reluctant: false,
+            }),
+            min: 1,
+            max: None,
+            reluctant: false,
+        },
+        Pattern::Symbol(SymbolRef::Named("b".into())),
+    ]);
+    let program = Program::compile(
+        &pattern,
+        &["a".into(), "b".into()],
+        MatchRecognizeConfig::default(),
+    )
+    .expect("compile");
+
+    let num_rows = 50_000;
+    let mut rows = vec![0b01u64; num_rows];
+    rows[0] = 0b10; // B at row 0 (cannot finish A+ B), followed by 49,999 A rows
+    let symbols = PartitionSymbols::from_bitmasks(rows, 2);
+    let mut matcher = Matcher::new(&program);
+
+    let start = Instant::now();
+    let (events, stats) = matcher
+        .match_partition(&symbols, &AfterMatchSkip::PastLastRow, RowsPerMatch::OneRow)
+        .expect("match_partition");
+    let elapsed = start.elapsed();
+
+    assert!(events.is_empty());
+    let max_expected_steps = num_rows * (program.instructions.len() * 16 + 128);
+    assert!(
+        stats.total_thread_steps <= max_expected_steps,
+        "cross-attempt dead-state cache failed: {} steps > linear bound {}",
+        stats.total_thread_steps,
+        max_expected_steps
+    );
+    assert!(
+        elapsed.as_secs_f64() < 2.0,
+        "full-partition scan took {elapsed:?} for {num_rows} rows"
+    );
+}
+
+#[test]
+fn test_partition_missing_required_symbol_skips_in_linear_time() {
+    let pattern = Pattern::Concat(vec![
+        Pattern::Repetition {
+            inner: Box::new(Pattern::Symbol(SymbolRef::Named("a".into()))),
+            min: 1,
+            max: None,
+            reluctant: false,
+        },
+        Pattern::Symbol(SymbolRef::Named("b".into())),
+    ]);
+    let program = Program::compile(
+        &pattern,
+        &["a".into(), "b".into()],
+        MatchRecognizeConfig::default(),
+    )
+    .expect("compile");
+    assert_eq!(program.required_symbols_mask, 0b11);
+
+    let num_rows = 100_000;
+    let symbols = PartitionSymbols::from_bitmasks(vec![0b01; num_rows], 2);
+    let mut matcher = Matcher::new(&program);
+    let (events, stats) = matcher
+        .match_partition(&symbols, &AfterMatchSkip::PastLastRow, RowsPerMatch::OneRow)
+        .expect("match_partition");
+    assert!(events.is_empty());
+    assert_eq!(stats.attempts, 0);
+    assert_eq!(stats.fast_skipped_rows, num_rows);
 }

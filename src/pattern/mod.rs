@@ -97,6 +97,14 @@ pub struct Program {
     /// unconditional `MatchLabel` and `pc = 1` cannot accept or hit an anchor without consuming
     /// a second row (e.g. `A B+ C` or `STRT DOWN+ UP+`). Enables O(1) two-row lookahead skip.
     pub second_symbols_mask: Option<u64>,
+    /// Bitmask of primary symbols (when `num_symbols <= 64`) that must appear at least once in
+    /// any valid match. Enables O(N) whole-partition rejection when a mandatory symbol is absent.
+    pub required_symbols_mask: u64,
+    /// Number of `Inst::MatchLabel` instructions in `instructions`.
+    pub num_match_labels: usize,
+    /// Maps each instruction `pc` to its dense `0..num_match_labels` ordinal (`u16::MAX` for
+    /// non-`MatchLabel` instructions). Used by lazy cross-attempt dead-state memoization.
+    pub pc_to_match_ordinal: Vec<u16>,
 }
 
 impl Program {
@@ -180,6 +188,21 @@ impl Program {
             } else {
                 None
             };
+        let required_symbols_mask = if id_to_symbol.len() <= 64 {
+            compute_required_symbols_mask(pattern, &symbol_to_id)
+        } else {
+            0
+        };
+        let mut pc_to_match_ordinal = vec![u16::MAX; compiler.instructions.len()];
+        let mut num_match_labels = 0usize;
+        for (pc, inst) in compiler.instructions.iter().enumerate() {
+            if matches!(inst, Inst::MatchLabel { .. }) {
+                if let Ok(ord) = u16::try_from(num_match_labels) {
+                    pc_to_match_ordinal[pc] = ord;
+                }
+                num_match_labels += 1;
+            }
+        }
 
         Ok(Program {
             instructions: compiler.instructions,
@@ -188,6 +211,9 @@ impl Program {
             subsets,
             start_symbols_mask,
             second_symbols_mask,
+            required_symbols_mask,
+            num_match_labels,
+            pc_to_match_ordinal,
         })
     }
 
@@ -247,6 +273,44 @@ fn compute_frontier_mask(
     }
 
     Some(mask)
+}
+
+/// Computes the bitmask of primary symbols that MUST appear at least once in any match of `pattern`.
+fn compute_required_symbols_mask(
+    pattern: &Pattern,
+    symbol_to_id: &HashMap<String, SymbolId>,
+) -> u64 {
+    match pattern {
+        Pattern::Symbol(SymbolRef::Named(name)) => symbol_to_id
+            .get(name)
+            .map_or(0, |&id| 1u64 << (id as usize)),
+        Pattern::Symbol(SymbolRef::Start | SymbolRef::End) => 0,
+        Pattern::Exclude(inner) => compute_required_symbols_mask(inner, symbol_to_id),
+        Pattern::Concat(items) | Pattern::Permute(items) => {
+            let mut mask = 0u64;
+            for item in items {
+                mask |= compute_required_symbols_mask(item, symbol_to_id);
+            }
+            mask
+        }
+        Pattern::Alternation(branches) => {
+            let Some((first, rest)) = branches.split_first() else {
+                return 0;
+            };
+            let mut mask = compute_required_symbols_mask(first, symbol_to_id);
+            for b in rest {
+                mask &= compute_required_symbols_mask(b, symbol_to_id);
+            }
+            mask
+        }
+        Pattern::Repetition { inner, min, .. } => {
+            if *min >= 1 {
+                compute_required_symbols_mask(inner, symbol_to_id)
+            } else {
+                0
+            }
+        }
+    }
 }
 
 fn register_symbol(

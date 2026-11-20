@@ -89,6 +89,36 @@ Reproduce the DuckDB 2.1 Parquet comparison locally:
 ./scripts/bench_vs_duckdb.sh
 ```
 
+### DuckDB's own `MATCH_RECOGNIZE` benchmark suite (3-way comparison)
+
+To test on an independent workload suite authored by another engine, we ported all 13 self-contained SQL:2016 benchmarks from DuckDB's `benchmark/micro/match_recognize/*.benchmark` directory (200k to 10M rows, covering sessionization, streaks, funnels, running aggregates in `DEFINE`, bin packing with exclusions, interval merging, 7-variable head-and-shoulders backtracking, cross-variable navigation, and adversarial non-matching patterns) and ran all three engines over the exact same Parquet files:
+
+| DuckDB Benchmark | Rows | DataFusion p50 | DuckDB 2.1 p50 | Trino 484 exec p50 | vs DuckDB | vs Trino |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `sessionize_10m` | 10,000,000 | **0.165 s** | 0.437 s | 7.280 s | 2.7x faster | 44.1x faster |
+| `streak_10m` | 10,000,000 | **0.169 s** | 0.547 s | 9.465 s | 3.2x faster | 55.9x faster |
+| `funnel_three_step_10m` | 10,000,000 | **0.151 s** | 0.281 s | 7.043 s | 1.9x faster | 46.7x faster |
+| `funnel_two_step_10m` | 10,000,000 | **0.134 s** | 0.276 s | 5.986 s | 2.1x faster | 44.6x faster |
+| `selectivity_mid_10m` | 10,000,000 | **0.257 s** | 0.264 s | 5.149 s | 1.0x | 20.0x faster |
+| `aggregate_define_1m` | 1,000,000 | **0.098 s** | 0.284 s | 1.132 s | 2.9x faster | 11.5x faster |
+| `bin_packing_1m` | 1,000,000 | **0.020 s** | 0.137 s | 0.634 s | 7.0x faster | 32.5x faster |
+| `merge_ranges_1m` | 1,000,000 | **0.108 s** | 0.199 s | 1.313 s | 1.8x faster | 12.1x faster |
+| `shoulders_1m` | 1,000,000 | **0.172 s** | 0.374 s | 4.508 s | 2.2x faster | 26.2x faster |
+| `navigation_200k` | 200,000 | **0.009 s** | 0.024 s | 0.524 s | 2.6x faster | 57.6x faster |
+| `quantifier_500k` | 500,000 | 0.025 s | **0.022 s** | 0.354 s | 0.9x | 14.3x faster |
+| `no_match_200k` | 200,000 | **0.004 s** | 0.012 s | >35.000 s (timeout) | 3.1x faster | >9,200x faster |
+| `nested_quantifier_2m` | 2,000,000 | **0.040 s** | 0.145 s | >35.000 s (timeout) | 3.6x faster | >868x faster |
+| **Total (11 completed by all 3)** | **54,500,000** | **1.309 s** | **2.844 s** | **43.388 s** | **2.2x faster** | **33.2x faster** |
+| **Total (all 13, DF vs DuckDB)** | **56,700,000** | **1.353 s** | **3.001 s** | -- | **2.2x faster** | -- |
+
+**Conditions.** DataFusion and DuckDB 2.1 ran sequentially natively on Apple Silicon ARM64 with 8 threads over the same Parquet tables (1 warmup + 3 measured runs, median p50). Trino 484 ran sequentially in an `--cpus=8 --memory=12g` Linux ARM64 Docker container on the same host scanning those exact Parquet tables (server-side `elapsedTimeMillis` p50). Exact 3-way result parity was verified on all 11 queries Trino completed within 35 s, and 2-way exact parity with DuckDB 2.1 on all 13 queries. Running DuckDB's suite directly uncovered and drove three general optimizations in our engine: `required_symbols_mask` whole-partition rejection, lazy Tier 1 cross-attempt dead-state memoization (keeping `no_match_200k` and `nested_quantifier_2m` linear), and `history_head`-keyed O(1) incremental prefix caching for Tier 2 stateful `DEFINE` predicates (driving a 24.5x speedup on `navigation_200k` and a 7.7x speedup on `bin_packing_1m`).
+
+Reproduce DuckDB's benchmark suite locally:
+
+```sh
+./scripts/bench_duckdb_suite.sh
+```
+
 ### Single-node Parquet comparison against Trino 484 (10,000,000 rows)
 
 | Workload | Matched output rows | DataFusion p50 | Trino server exec p50 | Trino CPU p50 | Relative (vs Trino exec) |

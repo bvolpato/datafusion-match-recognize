@@ -15,8 +15,7 @@ use arrow::array::{
 use arrow::compute::{self, kernels::zip};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::{
-    DataFusionError, HashMap, HashSet, Result, ScalarValue, exec_err,
-    internal_datafusion_err,
+    DataFusionError, HashSet, Result, ScalarValue, exec_err, internal_datafusion_err,
 };
 use datafusion_expr::Operator;
 use datafusion_expr::function::AccumulatorArgs;
@@ -28,7 +27,7 @@ use datafusion_physical_expr::expressions::{
 use crate::ast::{AggKind, EvalSemantics, LogicalNavKind, PhysicalNavKind, RowsPerMatch};
 use crate::logical::build_agg_metadata_arrow_schema;
 use crate::matcher::{
-    FlatMatchPool, FlatPartitionEvent, MatchStep, PartitionEvent,
+    FlatMatchPool, FlatPartitionEvent, MatchStep, NO_HISTORY, PartitionEvent,
     StatefulPredicateEvaluator,
 };
 use crate::pattern::{Program, SymbolId, SymbolSet};
@@ -1034,6 +1033,367 @@ pub struct StatefulDefineInput<'a> {
     pub has_prefilter: bool,
 }
 
+/// Incremental prefix accumulator for one fast-path aggregate slot in Tier 2 stateful `DEFINE`.
+#[derive(Debug, Clone, Copy)]
+enum PrefixAggAcc {
+    None,
+    CountStar(i64),
+    CountValid(i64),
+    SumI64(Option<i64>),
+    SumF64(Option<f64>),
+    AvgF64 { sum: f64, count: u64 },
+    MinI64(Option<i64>),
+    MaxI64(Option<i64>),
+    MinF64(Option<f64>),
+    MaxF64(Option<f64>),
+}
+
+impl PrefixAggAcc {
+    fn for_slot(slot: &PhysicalMeasureSlot, fast_args: &[FastPrecomputedArray]) -> Self {
+        let PhysicalMeasureSlotKind::Agg {
+            agg_kind,
+            distinct: false,
+            arg_physical_nav: None,
+            uses_match_metadata: false,
+            ..
+        } = &slot.kind
+        else {
+            return Self::None;
+        };
+        match agg_kind {
+            AggKind::CountStar | AggKind::CountSymbol => Self::CountStar(0),
+            AggKind::Count => Self::CountValid(0),
+            AggKind::Sum => match fast_args.first() {
+                Some(FastPrecomputedArray::Int64(_)) => Self::SumI64(None),
+                Some(FastPrecomputedArray::Float64(_)) => Self::SumF64(None),
+                _ => Self::None,
+            },
+            AggKind::Avg => match fast_args.first() {
+                Some(FastPrecomputedArray::Float64(_)) => {
+                    Self::AvgF64 { sum: 0.0, count: 0 }
+                }
+                _ => Self::None,
+            },
+            AggKind::Min => match fast_args.first() {
+                Some(FastPrecomputedArray::Int64(_) | FastPrecomputedArray::Int32(_)) => {
+                    Self::MinI64(None)
+                }
+                Some(FastPrecomputedArray::Float64(_)) => Self::MinF64(None),
+                _ => Self::None,
+            },
+            AggKind::Max => match fast_args.first() {
+                Some(FastPrecomputedArray::Int64(_) | FastPrecomputedArray::Int32(_)) => {
+                    Self::MaxI64(None)
+                }
+                Some(FastPrecomputedArray::Float64(_)) => Self::MaxF64(None),
+                _ => Self::None,
+            },
+            AggKind::Udaf(_) => Self::None,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        match self {
+            Self::None => {}
+            Self::CountStar(c) | Self::CountValid(c) => *c = 0,
+            Self::SumI64(v) | Self::MinI64(v) | Self::MaxI64(v) => *v = None,
+            Self::SumF64(v) | Self::MinF64(v) | Self::MaxF64(v) => *v = None,
+            Self::AvgF64 { sum, count } => {
+                *sum = 0.0;
+                *count = 0;
+            }
+        }
+    }
+
+    #[inline]
+    fn push_step(
+        &mut self,
+        step: MatchStep,
+        symbol_set: Option<&SymbolSet>,
+        fast_args: &[FastPrecomputedArray],
+    ) {
+        if matches!(self, Self::None) {
+            return;
+        }
+        if symbol_set.is_some_and(|set| !set.contains(step.sym)) {
+            return;
+        }
+        let idx = step.row_idx;
+        match self {
+            Self::None => {}
+            Self::CountStar(c) => *c += 1,
+            Self::CountValid(c) => {
+                if !matches!(fast_args[0].get_fast(idx), FastVal::Null) {
+                    *c += 1;
+                }
+            }
+            Self::SumI64(acc) => {
+                if let FastVal::Int64(v) = fast_args[0].get_fast(idx) {
+                    *acc = Some(acc.unwrap_or(0).wrapping_add(v));
+                }
+            }
+            Self::SumF64(acc) => {
+                if let FastVal::Float64(v) = fast_args[0].get_fast(idx) {
+                    *acc = Some(acc.unwrap_or(0.0) + v);
+                }
+            }
+            Self::AvgF64 { sum, count } => {
+                if let FastVal::Float64(v) = fast_args[0].get_fast(idx) {
+                    *sum += v;
+                    *count += 1;
+                }
+            }
+            Self::MinI64(best) => {
+                if let FastVal::Int64(v) = fast_args[0].get_fast(idx) {
+                    *best = Some(best.map_or(v, |c| c.min(v)));
+                }
+            }
+            Self::MaxI64(best) => {
+                if let FastVal::Int64(v) = fast_args[0].get_fast(idx) {
+                    *best = Some(best.map_or(v, |c| c.max(v)));
+                }
+            }
+            Self::MinF64(best) => {
+                if let FastVal::Float64(v) = fast_args[0].get_fast(idx) {
+                    *best = Some(best.map_or(v, |c| if v < c { v } else { c }));
+                }
+            }
+            Self::MaxF64(best) => {
+                if let FastVal::Float64(v) = fast_args[0].get_fast(idx) {
+                    *best = Some(best.map_or(v, |c| if v > c { v } else { c }));
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn eval_with_candidate(
+        &self,
+        cand: MatchStep,
+        symbol_set: Option<&SymbolSet>,
+        fast_args: &[FastPrecomputedArray],
+    ) -> Option<FastVal> {
+        if matches!(self, Self::None) {
+            return None;
+        }
+        let mut tmp = *self;
+        tmp.push_step(cand, symbol_set, fast_args);
+        let val = match tmp {
+            Self::None => return None,
+            Self::CountStar(c) | Self::CountValid(c) => FastVal::Int64(c),
+            Self::SumI64(v) | Self::MinI64(v) | Self::MaxI64(v) => {
+                v.map_or(FastVal::Null, FastVal::Int64)
+            }
+            Self::SumF64(v) | Self::MinF64(v) | Self::MaxF64(v) => {
+                v.map_or(FastVal::Null, FastVal::Float64)
+            }
+            Self::AvgF64 { sum, count } => {
+                if count == 0 {
+                    FastVal::Null
+                } else {
+                    FastVal::Float64(sum / count as f64)
+                }
+            }
+        };
+        Some(val)
+    }
+}
+
+struct SymbolPrefixCache {
+    attempt_gen: u64,
+    valid_head: u32,
+    first_row_by_sym: Vec<Option<usize>>,
+    last_row_by_sym: Vec<Option<usize>>,
+    slot_aggs: Vec<PrefixAggAcc>,
+    has_any_agg: bool,
+}
+
+impl SymbolPrefixCache {
+    fn new(
+        num_symbols: usize,
+        slots: &[PhysicalMeasureSlot],
+        fast_args: &[Vec<FastPrecomputedArray>],
+    ) -> Self {
+        let slot_aggs: Vec<PrefixAggAcc> = slots
+            .iter()
+            .zip(fast_args)
+            .map(|(s, fa)| PrefixAggAcc::for_slot(s, fa))
+            .collect();
+        let has_any_agg = slot_aggs.iter().any(|a| !matches!(a, PrefixAggAcc::None));
+        Self {
+            attempt_gen: 0,
+            valid_head: NO_HISTORY,
+            first_row_by_sym: vec![None; num_symbols],
+            last_row_by_sym: vec![None; num_symbols],
+            slot_aggs,
+            has_any_agg,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self, attempt_gen: u64) {
+        self.attempt_gen = attempt_gen;
+        self.valid_head = NO_HISTORY;
+        self.first_row_by_sym.fill(None);
+        self.last_row_by_sym.fill(None);
+        if self.has_any_agg {
+            for acc in &mut self.slot_aggs {
+                acc.reset();
+            }
+        }
+    }
+
+    #[inline]
+    fn push_committed_step(
+        &mut self,
+        step: MatchStep,
+        slots: &[PhysicalMeasureSlot],
+        fast_args: &[Vec<FastPrecomputedArray>],
+    ) {
+        let sym_idx = step.sym as usize;
+        if self.first_row_by_sym[sym_idx].is_none() {
+            self.first_row_by_sym[sym_idx] = Some(step.row_idx);
+        }
+        self.last_row_by_sym[sym_idx] = Some(step.row_idx);
+        if self.has_any_agg {
+            for ((acc, slot), fargs) in
+                self.slot_aggs.iter_mut().zip(slots).zip(fast_args)
+            {
+                if let PhysicalMeasureSlotKind::Agg { symbol_set, .. } = &slot.kind {
+                    acc.push_step(step, symbol_set.as_ref(), fargs);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn sync_to_prefix(
+        &mut self,
+        attempt_gen: u64,
+        prefix: &[MatchStep],
+        prefix_head: u32,
+        prefix_prev_head: u32,
+        slots: &[PhysicalMeasureSlot],
+        fast_args: &[Vec<FastPrecomputedArray>],
+    ) {
+        if self.attempt_gen != attempt_gen {
+            self.reset(attempt_gen);
+        }
+        if prefix_head == self.valid_head {
+            return;
+        }
+        if prefix_head != NO_HISTORY && prefix_prev_head == self.valid_head {
+            if let Some(&committed) = prefix.last() {
+                self.push_committed_step(committed, slots, fast_args);
+            }
+            self.valid_head = prefix_head;
+            return;
+        }
+        self.reset(attempt_gen);
+        for &step in prefix {
+            self.push_committed_step(step, slots, fast_args);
+        }
+        self.valid_head = prefix_head;
+    }
+}
+
+#[inline]
+#[expect(clippy::too_many_arguments)]
+fn eval_slot_fast_cached(
+    tentative_steps: &[MatchStep],
+    cand: MatchStep,
+    match_number: i64,
+    part_start: usize,
+    part_end: usize,
+    slot: &PhysicalMeasureSlot,
+    fast_args: &[FastPrecomputedArray],
+    cache: &SymbolPrefixCache,
+    slot_idx: usize,
+) -> FastVal {
+    match &slot.kind {
+        PhysicalMeasureSlotKind::MatchNumber => FastVal::Int64(match_number),
+        PhysicalMeasureSlotKind::CurrentRow { .. } => fast_args[0].get_fast(cand.row_idx),
+        PhysicalMeasureSlotKind::Nav {
+            logical_nav,
+            logical_offset,
+            physical_nav,
+            physical_offset,
+            symbol_set,
+            ..
+        } => {
+            let base_row = if *logical_offset == 0 {
+                match (logical_nav, symbol_set.as_ref()) {
+                    (None | Some(LogicalNavKind::Last), None) => Some(cand.row_idx),
+                    (Some(LogicalNavKind::First), None) => {
+                        tentative_steps.first().map(|s| s.row_idx)
+                    }
+                    (
+                        None | Some(LogicalNavKind::Last),
+                        Some(SymbolSet::Single(target_sym)),
+                    ) => {
+                        if cand.sym == *target_sym {
+                            Some(cand.row_idx)
+                        } else {
+                            cache.last_row_by_sym[*target_sym as usize]
+                        }
+                    }
+                    (
+                        Some(LogicalNavKind::First),
+                        Some(SymbolSet::Single(target_sym)),
+                    ) => cache.first_row_by_sym[*target_sym as usize]
+                        .or_else(|| (cand.sym == *target_sym).then_some(cand.row_idx)),
+                    _ => navigate_logical_row(
+                        tentative_steps,
+                        *logical_nav,
+                        0,
+                        symbol_set.as_ref(),
+                    ),
+                }
+            } else {
+                navigate_logical_row(
+                    tentative_steps,
+                    *logical_nav,
+                    *logical_offset as usize,
+                    symbol_set.as_ref(),
+                )
+            };
+            let Some(base_row) = base_row else {
+                return FastVal::Null;
+            };
+            let Some(final_row) = navigate_physical_in_range(
+                base_row,
+                *physical_nav,
+                *physical_offset as usize,
+                part_start,
+                part_end,
+            ) else {
+                return FastVal::Null;
+            };
+            fast_args[0].get_fast(final_row)
+        }
+        PhysicalMeasureSlotKind::Agg { symbol_set, .. } => {
+            if let Some(v) = cache.slot_aggs[slot_idx].eval_with_candidate(
+                cand,
+                symbol_set.as_ref(),
+                fast_args,
+            ) {
+                return v;
+            }
+            eval_slot_fast(
+                tentative_steps,
+                match_number,
+                cand.row_idx,
+                part_start,
+                part_end,
+                slot,
+                fast_args,
+            )
+        }
+        _ => FastVal::Null,
+    }
+}
+
 struct CompiledStatefulSymbol {
     outer_expr: Arc<dyn PhysicalExpr>,
     slot_schema: SchemaRef,
@@ -1044,6 +1404,8 @@ struct CompiledStatefulSymbol {
     fast_args: Vec<Vec<FastPrecomputedArray>>,
     /// Optional compiled scalar expression tree (bypasses 1-row `RecordBatch` creation).
     fast_expr: Option<FastScalarExpr>,
+    /// Incremental O(1) prefix-history cache keyed by arena `history_head`.
+    prefix_cache: SymbolPrefixCache,
     has_prefilter: bool,
 }
 
@@ -1054,7 +1416,9 @@ pub struct PartitionStatefulEvaluator<'a> {
     input_schema: SchemaRef,
     part_start: usize,
     part_end: usize,
-    by_symbol: HashMap<SymbolId, CompiledStatefulSymbol>,
+    by_symbol: Vec<Option<CompiledStatefulSymbol>>,
+    has_any: bool,
+    attempt_gen: u64,
     fast_slot_buf: Vec<FastVal>,
 }
 
@@ -1066,7 +1430,9 @@ impl<'a> PartitionStatefulEvaluator<'a> {
         stateful_defs: &[StatefulDefineInput<'_>],
     ) -> Result<Self> {
         let num_rows = partition_batch.num_rows();
-        let mut by_symbol = HashMap::with_capacity(stateful_defs.len());
+        let num_symbols = program.num_symbols();
+        let mut by_symbol: Vec<Option<CompiledStatefulSymbol>> =
+            (0..num_symbols).map(|_| None).collect();
         let mut max_slots = 0usize;
 
         for def in stateful_defs {
@@ -1140,18 +1506,19 @@ impl<'a> PartitionStatefulEvaluator<'a> {
             } else {
                 None
             };
-            by_symbol.insert(
-                def.sym_id,
-                CompiledStatefulSymbol {
-                    outer_expr: Arc::clone(def.outer_expr),
-                    slot_schema: Arc::clone(def.slot_schema),
-                    slots: def.slots.to_vec(),
-                    precomputed_args,
-                    fast_args,
-                    fast_expr,
-                    has_prefilter: def.has_prefilter,
-                },
-            );
+            let slots_vec = def.slots.to_vec();
+            let prefix_cache =
+                SymbolPrefixCache::new(num_symbols, &slots_vec, &fast_args);
+            by_symbol[def.sym_id as usize] = Some(CompiledStatefulSymbol {
+                outer_expr: Arc::clone(def.outer_expr),
+                slot_schema: Arc::clone(def.slot_schema),
+                slots: slots_vec,
+                precomputed_args,
+                fast_args,
+                fast_expr,
+                prefix_cache,
+                has_prefilter: def.has_prefilter,
+            });
         }
 
         Ok(Self {
@@ -1161,6 +1528,8 @@ impl<'a> PartitionStatefulEvaluator<'a> {
             part_start: 0,
             part_end: num_rows,
             by_symbol,
+            has_any: !stateful_defs.is_empty(),
+            attempt_gen: 1,
             fast_slot_buf: vec![FastVal::Null; max_slots],
         })
     }
@@ -1170,23 +1539,34 @@ impl<'a> PartitionStatefulEvaluator<'a> {
     pub fn set_partition_bounds(&mut self, part_start: usize, part_end: usize) {
         self.part_start = part_start;
         self.part_end = part_end;
+        self.attempt_gen = self.attempt_gen.wrapping_add(1).max(1);
     }
 }
 
 impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
     #[inline]
     fn is_stateful(&self, sym: SymbolId) -> bool {
-        self.by_symbol.contains_key(&sym)
+        self.by_symbol
+            .get(sym as usize)
+            .is_some_and(Option::is_some)
     }
 
     #[inline]
     fn has_any_stateful(&self) -> bool {
-        !self.by_symbol.is_empty()
+        self.has_any
     }
 
     #[inline]
     fn has_prefilter(&self, sym: SymbolId) -> bool {
-        self.by_symbol.get(&sym).is_some_and(|c| c.has_prefilter)
+        self.by_symbol
+            .get(sym as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|c| c.has_prefilter)
+    }
+
+    #[inline]
+    fn on_new_match_attempt(&mut self) {
+        self.attempt_gen = self.attempt_gen.wrapping_add(1).max(1);
     }
 
     fn eval_stateful(
@@ -1195,32 +1575,64 @@ impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
         tentative_steps: &[MatchStep],
         candidate_match_number: i64,
     ) -> Result<bool> {
-        let compiled = self.by_symbol.get(&sym).ok_or_else(|| {
-            internal_datafusion_err!(
-                "eval_stateful called for non-stateful symbol id {sym}"
-            )
-        })?;
-        let current_row = tentative_steps
-            .last()
+        // Without history-head tokens, force a clean prefix sync by bumping attempt_gen.
+        self.attempt_gen = self.attempt_gen.wrapping_add(1).max(1);
+        self.eval_stateful_with_history(
+            sym,
+            tentative_steps,
+            candidate_match_number,
+            NO_HISTORY,
+            NO_HISTORY,
+        )
+    }
+
+    fn eval_stateful_with_history(
+        &mut self,
+        sym: SymbolId,
+        tentative_steps: &[MatchStep],
+        candidate_match_number: i64,
+        prefix_head: u32,
+        prefix_prev_head: u32,
+    ) -> Result<bool> {
+        let compiled = self
+            .by_symbol
+            .get_mut(sym as usize)
+            .and_then(Option::as_mut)
             .ok_or_else(|| {
                 internal_datafusion_err!(
-                    "tentative_steps missing candidate row in eval_stateful"
+                    "eval_stateful called for non-stateful symbol id {sym}"
                 )
-            })?
-            .row_idx;
+            })?;
+        let cand = *tentative_steps.last().ok_or_else(|| {
+            internal_datafusion_err!(
+                "tentative_steps missing candidate row in eval_stateful"
+            )
+        })?;
+        let current_row = cand.row_idx;
 
         if let Some(fast_expr) = &compiled.fast_expr {
+            let prefix = &tentative_steps[..tentative_steps.len() - 1];
+            compiled.prefix_cache.sync_to_prefix(
+                self.attempt_gen,
+                prefix,
+                prefix_head,
+                prefix_prev_head,
+                &compiled.slots,
+                &compiled.fast_args,
+            );
             for (i, (slot, fargs)) in
                 compiled.slots.iter().zip(&compiled.fast_args).enumerate()
             {
-                self.fast_slot_buf[i] = eval_slot_fast(
+                self.fast_slot_buf[i] = eval_slot_fast_cached(
                     tentative_steps,
+                    cand,
                     candidate_match_number,
-                    current_row,
                     self.part_start,
                     self.part_end,
                     slot,
                     fargs,
+                    &compiled.prefix_cache,
+                    i,
                 );
             }
             return Ok(matches!(
