@@ -94,6 +94,7 @@ fn decode_logical_slots(
                     physical_offset: n.physical_offset,
                     symbol: n.symbol.clone(),
                     inner_expr: decode_expr(&n.inner_expr)?,
+                    uses_match_metadata: n.uses_match_metadata,
                 },
                 pb::measure_slot_proto::Kind::Agg(a) => MeasureSlotKind::Agg {
                     agg_kind: decode_agg_kind(a.agg_kind, &a.udaf_name, ctx)?,
@@ -150,6 +151,7 @@ fn encode_logical_slots(
                 physical_offset,
                 symbol,
                 inner_expr,
+                uses_match_metadata,
             } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
                 logical_nav: logical_nav.map(encode_logical_nav),
                 logical_offset: *logical_offset,
@@ -157,6 +159,7 @@ fn encode_logical_slots(
                 physical_offset: *physical_offset,
                 symbol: symbol.clone(),
                 inner_expr: encode_expr(inner_expr)?,
+                uses_match_metadata: *uses_match_metadata,
             }),
             MeasureSlotKind::Agg {
                 agg_kind,
@@ -499,8 +502,15 @@ fn decode_physical_slots(
                 true,
             ),
             pb::measure_slot_proto::Kind::Nav(n) => {
-                let inner_expr = decode_phys(&n.inner_expr, input_schema)?;
-                let dt = inner_expr.data_type(input_schema)?;
+                let meta_schema_owned;
+                let eval_schema: &Schema = if n.uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_arrow_schema(input_schema);
+                    &meta_schema_owned
+                } else {
+                    input_schema
+                };
+                let inner_expr = decode_phys(&n.inner_expr, eval_schema)?;
+                let dt = inner_expr.data_type(eval_schema)?;
                 (
                     PhysicalMeasureSlotKind::Nav {
                         logical_nav: n.logical_nav.map(decode_logical_nav),
@@ -513,6 +523,7 @@ fn decode_physical_slots(
                             .and_then(|sym| program.resolve_symbol_set(sym)),
                         symbol: n.symbol.clone(),
                         inner_expr,
+                        uses_match_metadata: n.uses_match_metadata,
                     },
                     dt,
                     true,
@@ -643,6 +654,7 @@ fn encode_physical_slots(
                 physical_offset,
                 symbol,
                 inner_expr,
+                uses_match_metadata,
                 ..
             } => pb::measure_slot_proto::Kind::Nav(pb::NavSlotProto {
                 logical_nav: logical_nav.map(encode_logical_nav),
@@ -651,6 +663,7 @@ fn encode_physical_slots(
                 physical_offset: *physical_offset,
                 symbol: symbol.clone(),
                 inner_expr: encode_phys(inner_expr)?,
+                uses_match_metadata: *uses_match_metadata,
             }),
             PhysicalMeasureSlotKind::Agg {
                 agg_kind,

@@ -1,0 +1,259 @@
+# SPDX-License-Identifier: Apache-2.0
+# Negative SQL:2016 semantic and runtime validation suite, ported from Trino's TestAnalyzer.java
+# and TestRowPatternMatching.java.
+
+statement ok
+CREATE TABLE neg_t (id INT, sym VARCHAR, price INT) AS VALUES
+  (1, 'A', 10),
+  (2, 'B', 20),
+  (3, 'C', 30);
+
+# 1. Invalid pattern quantifiers: zero upper bound and inverted range
+statement error upper bound must be greater than or equal to 1
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A{0}) DEFINE A AS true);
+
+statement error upper bound must be greater than or equal to 1
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A{0, 0}) DEFINE A AS true);
+
+statement error upper bound must be greater than or equal to 1
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A{,0}) DEFINE A AS true);
+
+statement error exceeds max
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A{5, 1}) DEFINE A AS true);
+
+# 1b. ONE ROW PER MATCH with neither PARTITION BY nor MEASURES has 0 output columns
+statement error output table has no columns
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id ONE ROW PER MATCH PATTERN (A) DEFINE A AS true);
+
+# 2. DEFINE validation: unused variable, duplicate variable
+statement error not a primary pattern variable
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A) DEFINE A AS true, UNUSED_V AS true);
+
+statement error Duplicate pattern variable
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A B) DEFINE A AS true, A AS price > 0);
+
+# 3. Exclusion with WITH UNMATCHED ROWS is disallowed by SQL:2016
+statement error not allowed with ALL ROWS PER MATCH WITH UNMATCHED ROWS
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  ALL ROWS PER MATCH WITH UNMATCHED ROWS
+  PATTERN (({- A -}) B+)
+  DEFINE B AS true
+);
+
+# 4. AFTER MATCH SKIP validation (unknown target, infinite loop, unmatched optional target)
+statement error undefined pattern variable
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  AFTER MATCH SKIP TO LAST X
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+statement error cannot skip to the first row of the current match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  AFTER MATCH SKIP TO FIRST A
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+statement error was not matched
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn
+  AFTER MATCH SKIP TO LAST D
+  PATTERN (A B+ D?)
+  DEFINE B AS true, D AS false
+);
+
+# 5. CLASSIFIER() and MATCH_NUMBER() argument validation
+statement error at most 1 argument
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER(A, B) AS c
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+statement error pattern variable identifier
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER(A.price) AS c
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+statement error unknown pattern variable
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER(Z) AS c
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+statement error takes no arguments
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER(A) AS mn
+  PATTERN (A B+)
+  DEFINE B AS true
+);
+
+# 6. Navigation offset and arity validation
+statement error expects 1 or 2 arguments
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV() AS p PATTERN (A B+) DEFINE B AS true);
+
+statement error expects 1 or 2 arguments
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(price, 1, 2) AS p PATTERN (A B+) DEFINE B AS true);
+
+statement error integer literal
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(price, 'text') AS p PATTERN (A B+) DEFINE B AS true);
+
+statement error non-negative integer literal
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(price, -5) AS p PATTERN (A B+) DEFINE B AS true);
+
+statement error must not exceed
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(price, 3000000000) AS p PATTERN (A B+) DEFINE B AS true);
+
+# 7. Invalid navigation nesting and constant-only navigation
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES LAST(NEXT(price, 2)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES FIRST(LAST(price)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(NEXT(price, 2)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(price, 2) + 5) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(price, 2) + LAST(price, 3)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(avg(price) + 5) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must contain at least one column reference or CLASSIFIER
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST('no_column')) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must contain at least one column reference or CLASSIFIER
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES FIRST(42) AS x PATTERN (A B+) DEFINE B AS true);
+
+# 8. Label consistency inside navigation functions
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(A.price + price)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(A.price + B.price)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(concat(CLASSIFIER(A), CLASSIFIER()))) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(concat(CLASSIFIER(A), CLASSIFIER(B)))) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(price + length(CLASSIFIER(B)))) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES PREV(LAST(A.price + length(CLASSIFIER()))) AS x PATTERN (A B+) DEFINE B AS true);
+
+# 9. Invalid aggregate nesting, illegal clauses (OVER / FILTER / ORDER BY), and non-COUNT label.*
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES max(1 + min(price)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES max(1 + LAST(price)) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest window function
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES max(price) OVER () AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error Cannot nest window function
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES true AS x PATTERN (A B+) DEFINE B AS max(price) OVER () > 0);
+
+statement error FILTER clause
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES max(price) FILTER (WHERE true) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error FILTER clause
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES true AS x PATTERN (A B+) DEFINE B AS max(price) FILTER (WHERE true) > 0);
+
+statement error ORDER BY or function clauses
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES max(price ORDER BY id) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error only supported as the argument of COUNT
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES lower(A.*) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error not valid
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES sum(*) AS x PATTERN (A B+) DEFINE B AS true);
+
+# 10. Label consistency inside aggregates
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(B.price < 5 OR price > 5) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(B.price < 5 OR A.price > 5) AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(CLASSIFIER(A) < 'X' OR CLASSIFIER(B) > 'Y') AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(price < 5 OR CLASSIFIER(B) > 'Y') AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(A.price < 5 OR CLASSIFIER(B) > 'Y') AS x PATTERN (A B+) DEFINE B AS true);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (ORDER BY id MEASURES count(A.price < 5 OR CLASSIFIER() > 'Y') AS x PATTERN (A B+) DEFINE B AS true);

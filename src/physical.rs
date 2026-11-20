@@ -167,9 +167,17 @@ fn compile_physical_slots(
                 physical_offset,
                 symbol,
                 inner_expr,
+                uses_match_metadata,
             } => {
+                let meta_schema_owned;
+                let eval_schema: &DFSchema = if *uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_dfschema(input_dfschema)?;
+                    &meta_schema_owned
+                } else {
+                    input_dfschema
+                };
                 let phys_inner =
-                    create_physical_expr(inner_expr, input_dfschema, exec_props, planning_ctx)?;
+                    create_physical_expr(inner_expr, eval_schema, exec_props, planning_ctx)?;
                 PhysicalMeasureSlotKind::Nav {
                     logical_nav: *logical_nav,
                     logical_offset: *logical_offset,
@@ -178,6 +186,7 @@ fn compile_physical_slots(
                     symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
                     symbol: symbol.clone(),
                     inner_expr: phys_inner,
+                    uses_match_metadata: *uses_match_metadata,
                 }
             }
             MeasureSlotKind::Agg {
@@ -523,8 +532,16 @@ fn apply_slot_exprs(
 ) -> Result<TreeNodeRecursion> {
     for slot in slots {
         match &slot.kind {
-            PhysicalMeasureSlotKind::Nav { inner_expr, .. }
-            | PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+            PhysicalMeasureSlotKind::Nav {
+                inner_expr,
+                uses_match_metadata,
+                ..
+            } => {
+                if !uses_match_metadata && f(inner_expr)? == TreeNodeRecursion::Stop {
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
                 if f(inner_expr)? == TreeNodeRecursion::Stop {
                     return Ok(TreeNodeRecursion::Stop);
                 }

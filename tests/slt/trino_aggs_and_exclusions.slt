@@ -515,3 +515,200 @@ B
 B
 B
 LAST
+
+# 11. Trino TestExpressionRewriteInRowPatternMatching: ARRAY[MATCH_NUMBER()] in aggs & bool_or(CLASSIFIER() LIKE ...)
+query ITTI
+WITH t(id) AS (VALUES (1), (2), (3))
+SELECT m.id, m.classy, m.arr, m.s FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() AS classy,
+    ARRAY['foo', CLASSIFIER()] AS arr,
+    sum(array_max(ARRAY[MATCH_NUMBER()])) AS s
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)* X)
+  DEFINE X AS array_agg(CLASSIFIER()) = ['B', 'A', 'X']
+    AND sum(array_max(ARRAY[MATCH_NUMBER()])) = 3
+) AS m
+ORDER BY m.id;
+----
+1 B [foo, B] 1
+2 A [foo, A] 2
+3 X [foo, X] 3
+
+query ITBB
+WITH t(id) AS (VALUES (1), (2), (3))
+SELECT m.id, m.classy, m.m1, m.m2 FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() AS classy,
+    CLASSIFIER() LIKE '%X' AS m1,
+    bool_or(CLASSIFIER() LIKE '%B') AS m2
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN ((A | B)* X)
+  DEFINE X AS PREV(CLASSIFIER()) LIKE '%B' AND bool_or(CLASSIFIER() LIKE '%A')
+) AS m
+ORDER BY m.id;
+----
+1 A false false
+2 B false true
+3 X true true
+
+# 12. Trino TestCopyAggregationStateInRowPatternMatching: Decimal128 AVG and SUM inside stateful DEFINE
+query IT
+WITH t(id) AS (VALUES (1), (2), (3))
+SELECT m.id, m.classy FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)* X)
+  DEFINE X AS avg(CAST(B.id AS DECIMAL(2, 1))) = 1.0
+) AS m
+ORDER BY m.id;
+----
+1 B
+2 A
+3 X
+
+query IT
+WITH t(id) AS (VALUES (1), (2), (3))
+SELECT m.id, m.classy FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES CLASSIFIER() AS classy
+  ALL ROWS PER MATCH
+  PATTERN ((A | B)* X)
+  DEFINE X AS sum(CAST(B.id AS DECIMAL(30, 20))) = 1.0
+) AS m
+ORDER BY m.id;
+----
+1 B
+2 A
+3 X
+
+# 13. Scalar expressions wrapping CLASSIFIER() inside navigation: PREV(LAST(lower(CLASSIFIER()))) & length(CLASSIFIER(A)) + A.id
+query ITTI
+WITH t(id, val) AS (VALUES (1, 10), (2, 20), (3, 30))
+SELECT m.id, m.cls, m.prev_lower_cls, m.a_len_plus_id FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES
+    CLASSIFIER() AS cls,
+    PREV(LAST(lower(CLASSIFIER()))) AS prev_lower_cls,
+    LAST(length(CLASSIFIER(A)) + A.id + 1) AS a_len_plus_id
+  ALL ROWS PER MATCH
+  PATTERN (A B+)
+  DEFINE A AS id = 1, B AS id > 1
+) AS m
+ORDER BY m.id;
+----
+1 A NULL 3
+2 B a 3
+3 B b 3
+
+# 14. Direct MATCH_NUMBER() and CLASSIFIER() in DEFINE (without aggregates)
+query IIT
+WITH t(id) AS (VALUES (1), (2), (3))
+SELECT m.id, m.mn, m.cls FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+  ALL ROWS PER MATCH
+  PATTERN (A | B)
+  DEFINE
+    A AS MATCH_NUMBER() = 1,
+    B AS MATCH_NUMBER() = 2
+) AS m
+ORDER BY m.id;
+----
+1 1 A
+2 2 B
+
+# 15. Aliased MATCH_RECOGNIZE (...) AS m with outer WHERE on partition key (MatchRecognizeFilterPushdown)
+query TII
+WITH t(part, id, tag) AS (
+  VALUES
+    ('p1', 1, 'A'), ('p1', 2, 'B'),
+    ('p2', 1, 'A'), ('p2', 2, 'B')
+)
+SELECT m.part, m.mn, m.cnt FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY part
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, COUNT(*) AS cnt
+  ONE ROW PER MATCH
+  PATTERN (A B+)
+  DEFINE A AS tag = 'A', B AS tag = 'B'
+) AS m
+WHERE m.part = 'p1' AND m.cnt >= 2;
+----
+p1 1 2
+
+# 16. NULLs in ORDER BY (ASC NULLS FIRST vs DESC NULLS LAST), constant-only MEASURES, and WINDOW/GROUP BY over MATCH_RECOGNIZE
+query TIII
+WITH t(p, id, v) AS (
+  VALUES
+    ('p1', CAST(NULL AS INT), 100),
+    ('p1', 1, 10),
+    ('p1', 2, 20),
+    (CAST(NULL AS VARCHAR), 1, 5),
+    (CAST(NULL AS VARCHAR), 2, 6)
+)
+SELECT m.p, m.mn, m.k, m.fv FROM t
+MATCH_RECOGNIZE (
+  PARTITION BY p
+  ORDER BY id ASC NULLS FIRST
+  MEASURES MATCH_NUMBER() AS mn, 42 AS k, FIRST(v) AS fv
+  ONE ROW PER MATCH
+  PATTERN (A B)
+  DEFINE A AS v >= 5, B AS v >= 6
+) AS m
+ORDER BY m.p NULLS FIRST, m.mn;
+----
+NULL 1 42 5
+p1 1 42 100
+
+query III
+WITH t(id, v) AS (VALUES (1, 10), (2, 20), (3, 30))
+SELECT m.id, m.mn, m.k FROM t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES MATCH_NUMBER() AS mn, 99 AS k
+  ALL ROWS PER MATCH WITH UNMATCHED ROWS
+  PATTERN (A B)
+  DEFINE A AS v = 10, B AS v = 20
+) AS m
+ORDER BY m.id;
+----
+1 1 99
+2 1 99
+3 NULL NULL
+
+query TII
+WITH t(p, id, v) AS (
+  VALUES ('p1', 1, 10), ('p1', 2, 20), ('p1', 3, 5), ('p1', 4, 15), ('p2', 1, 1), ('p2', 2, 2)
+),
+matched AS (
+  SELECT * FROM t
+  MATCH_RECOGNIZE (
+    PARTITION BY p
+    ORDER BY id
+    MEASURES MATCH_NUMBER() AS mn, SUM(v) AS s
+    ONE ROW PER MATCH
+    PATTERN (A B)
+    DEFINE A AS v < 15, B AS v > 1
+  )
+)
+SELECT p, COUNT(*) AS matches, SUM(s) AS total_s
+FROM matched
+GROUP BY p
+ORDER BY p;
+----
+p1 2 50
+p2 1 3
+

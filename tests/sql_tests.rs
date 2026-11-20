@@ -162,3 +162,8 @@ async fn test_slt_flink_ported_suite() {
         run_slt_file("tests/slt/flink_ported_suite.slt", bs, tp).await;
     }
 }
+
+#[tokio::test]
+async fn test_slt_negative_validation() {
+    run_slt_file("tests/slt/negative_validation.slt", 8192, 1).await;
+}

@@ -156,6 +156,7 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                     kind: SymbolDefKind::Stateful { outer_expr, slots },
                 });
             } else {
+                validate_no_illegal_function_clauses(&sym_def.definition)?;
                 let stripped = strip_self_qualifier(sym_def.definition, &name);
                 let predicate = ctx.sql_to_expr(stripped, input_schema.as_ref())?;
                 planned_definitions.push(SymbolDef {
@@ -714,6 +715,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
     fn rewrite_outer(&mut self, expr: SqlExpr) -> Result<SqlExpr> {
         match expr {
             SqlExpr::Function(func) => {
+                check_function_clauses(&func)?;
                 let fname = func.name.to_string().to_ascii_lowercase();
                 match fname.as_str() {
                     "match_number" => {
@@ -752,12 +754,22 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         let args = match func.args {
                             FunctionArguments::List(mut list) => {
                                 for arg in &mut list.args {
-                                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                                        let owned = std::mem::replace(
-                                            e,
-                                            SqlExpr::Value(ast::Value::Null.into()),
-                                        );
-                                        *e = self.rewrite_outer(owned)?;
+                                    match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                            let owned = std::mem::replace(
+                                                e,
+                                                SqlExpr::Value(ast::Value::Null.into()),
+                                            );
+                                            *e = self.rewrite_outer(owned)?;
+                                        }
+                                        FunctionArg::Unnamed(
+                                            FunctionArgExpr::QualifiedWildcard(obj),
+                                        ) => {
+                                            return plan_err!(
+                                                "{obj}.* is only supported as the argument of COUNT() in MATCH_RECOGNIZE"
+                                            );
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 FunctionArguments::List(list)
@@ -786,6 +798,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                             physical_offset: 0,
                             symbol: Some(prefix),
                             inner_expr,
+                            uses_match_metadata: false,
                         }));
                     }
                 }
@@ -1029,6 +1042,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 physical_offset: 0,
                 symbol: None,
                 inner_expr,
+                uses_match_metadata: false,
             })
         }
     }
@@ -1071,10 +1085,11 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 } else {
                     LogicalNavKind::Last
                 };
-                // Support FIRST(CLASSIFIER([sym]), n) / LAST(CLASSIFIER([sym]), n)
+                // Fast path for bare FIRST(CLASSIFIER([sym]), n) / LAST(CLASSIFIER([sym]), n)
                 if let SqlExpr::Function(inner_fn) = &target_sql
                     && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
                 {
+                    check_function_clauses(inner_fn)?;
                     let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
                     return Ok(MeasureSlotKind::Classifier {
                         symbol,
@@ -1084,16 +1099,32 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         physical_offset: 0,
                     });
                 }
-                let (symbol, stripped) =
-                    extract_single_symbol_qualifier(target_sql, self.known_symbols)?;
-                let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
+                let mut analyzer = PatternArgAnalyzer::new(self.known_symbols, self.ctx, fname);
+                let rewritten = analyzer.rewrite(target_sql)?;
+                analyzer.validate_consistent_labels()?;
+                if !analyzer.has_col_or_classifier {
+                    return plan_err!(
+                        "Pattern navigation function '{fname}' must contain at least one column reference or CLASSIFIER()"
+                    );
+                }
+                let (labeled_symbol, uses_match_metadata) =
+                    (analyzer.labeled_symbol, analyzer.uses_match_metadata);
+                let meta_schema_owned;
+                let eval_schema: &DFSchema = if uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_dfschema(self.input_schema)?;
+                    &meta_schema_owned
+                } else {
+                    self.input_schema
+                };
+                let inner_expr = self.ctx.sql_to_expr(rewritten, eval_schema)?;
                 Ok(MeasureSlotKind::Nav {
                     logical_nav: Some(logical_nav),
                     logical_offset: offset,
                     physical_nav: None,
                     physical_offset: 0,
-                    symbol,
+                    symbol: labeled_symbol,
                     inner_expr,
+                    uses_match_metadata,
                 })
             }
             "prev" | "next" => {
@@ -1102,10 +1133,11 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 } else {
                     PhysicalNavKind::Next
                 };
-                // Support PREV(CLASSIFIER([sym]), n) / NEXT(CLASSIFIER([sym]), n)
+                // Fast path for bare PREV(CLASSIFIER([sym]), n) / NEXT(CLASSIFIER([sym]), n)
                 if let SqlExpr::Function(inner_fn) = &target_sql
                     && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
                 {
+                    check_function_clauses(inner_fn)?;
                     let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
                     return Ok(MeasureSlotKind::Classifier {
                         symbol,
@@ -1116,11 +1148,16 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                     });
                 }
 
-                let (logical_nav, logical_offset, inner_target) =
+                let (logical_nav, logical_offset, inner_target, inner_nav_name) =
                     if let SqlExpr::Function(inner_func) = &target_sql {
                         let inner_name = inner_func.name.to_string().to_ascii_lowercase();
                         if matches!(inner_name.as_str(), "first" | "last") {
-                            let (inner_args, _) = extract_unnamed_args(&inner_func.args)?;
+                            check_function_clauses(inner_func)?;
+                            let (inner_args, inner_distinct) =
+                                extract_unnamed_args(&inner_func.args)?;
+                            if inner_distinct {
+                                return plan_err!("DISTINCT is not valid in {inner_name}()");
+                            }
                             if inner_args.is_empty() || inner_args.len() > 2 {
                                 return plan_err!("{inner_name}() expects 1 or 2 arguments");
                             }
@@ -1141,18 +1178,19 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                             } else {
                                 LogicalNavKind::Last
                             };
-                            (Some(kind), l_off, expr)
+                            (Some(kind), l_off, expr, inner_name)
                         } else {
-                            (Some(LogicalNavKind::Last), 0, target_sql)
+                            (Some(LogicalNavKind::Last), 0, target_sql, fname.to_string())
                         }
                     } else {
-                        (Some(LogicalNavKind::Last), 0, target_sql)
+                        (Some(LogicalNavKind::Last), 0, target_sql, fname.to_string())
                     };
 
-                // Support PREV(FIRST(CLASSIFIER()), n) / NEXT(LAST(CLASSIFIER()), n)
+                // Fast path for bare PREV(FIRST(CLASSIFIER()), n) / NEXT(LAST(CLASSIFIER()), n)
                 if let SqlExpr::Function(inner_fn) = &inner_target
                     && inner_fn.name.to_string().eq_ignore_ascii_case("classifier")
                 {
+                    check_function_clauses(inner_fn)?;
                     let symbol = self.parse_classifier_symbol(&inner_fn.args)?;
                     return Ok(MeasureSlotKind::Classifier {
                         symbol,
@@ -1163,16 +1201,33 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                     });
                 }
 
-                let (symbol, stripped) =
-                    extract_single_symbol_qualifier(inner_target, self.known_symbols)?;
-                let inner_expr = self.ctx.sql_to_expr(stripped, self.input_schema)?;
+                let mut analyzer =
+                    PatternArgAnalyzer::new(self.known_symbols, self.ctx, &inner_nav_name);
+                let rewritten = analyzer.rewrite(inner_target)?;
+                analyzer.validate_consistent_labels()?;
+                if !analyzer.has_col_or_classifier {
+                    return plan_err!(
+                        "Pattern navigation function '{inner_nav_name}' must contain at least one column reference or CLASSIFIER()"
+                    );
+                }
+                let (labeled_symbol, uses_match_metadata) =
+                    (analyzer.labeled_symbol, analyzer.uses_match_metadata);
+                let meta_schema_owned;
+                let eval_schema: &DFSchema = if uses_match_metadata {
+                    meta_schema_owned = build_agg_metadata_dfschema(self.input_schema)?;
+                    &meta_schema_owned
+                } else {
+                    self.input_schema
+                };
+                let inner_expr = self.ctx.sql_to_expr(rewritten, eval_schema)?;
                 Ok(MeasureSlotKind::Nav {
                     logical_nav,
                     logical_offset,
                     physical_nav: Some(physical_nav),
                     physical_offset: offset,
-                    symbol,
+                    symbol: labeled_symbol,
                     inner_expr,
+                    uses_match_metadata,
                 })
             }
             _ => unreachable!(),
@@ -1263,9 +1318,8 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
             },
         };
 
-        let mut shared_symbol: Option<String> = None;
         let mut arg_physical_nav: Option<(PhysicalNavKind, u32)> = None;
-        let mut uses_match_metadata = false;
+        let mut analyzer = PatternArgAnalyzer::new(self.known_symbols, self.ctx, fname);
         let mut rewritten_sql_args = Vec::with_capacity(arg_exprs.len());
 
         for (i, arg) in arg_exprs.into_iter().enumerate() {
@@ -1285,35 +1339,12 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 }
             }
 
-            let (sym, stripped) =
-                extract_single_symbol_qualifier(unwrapped_sql, self.known_symbols)?;
-            if let Some(s) = sym {
-                if let Some(existing) = &shared_symbol
-                    && existing != &s
-                {
-                    return plan_err!(
-                        "Aggregate {fname}() cannot reference multiple pattern variables ('{existing}' and '{s}')"
-                    );
-                }
-                shared_symbol = Some(s);
-            }
-            let (replaced, has_meta, meta_sym) =
-                rewrite_match_metadata_in_agg_arg(stripped, self.known_symbols)?;
-            if let Some(s) = meta_sym {
-                if let Some(existing) = &shared_symbol
-                    && existing != &s
-                {
-                    return plan_err!(
-                        "Aggregate {fname}() cannot reference multiple pattern variables ('{existing}' and '{s}')"
-                    );
-                }
-                shared_symbol = Some(s);
-            }
-            if has_meta {
-                uses_match_metadata = true;
-            }
-            rewritten_sql_args.push(replaced);
+            let rewritten = analyzer.rewrite(unwrapped_sql)?;
+            rewritten_sql_args.push(rewritten);
         }
+        analyzer.validate_consistent_labels()?;
+        let (labeled_symbol, uses_match_metadata) =
+            (analyzer.labeled_symbol, analyzer.uses_match_metadata);
 
         let meta_schema_owned;
         let eval_schema: &DFSchema = if uses_match_metadata {
@@ -1330,7 +1361,7 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
 
         Ok(MeasureSlotKind::Agg {
             agg_kind,
-            symbol: shared_symbol,
+            symbol: labeled_symbol,
             args: planned_args,
             distinct,
             arg_physical_nav,
@@ -1339,11 +1370,125 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
     }
 }
 
+fn check_function_clauses(func: &ast::Function) -> Result<()> {
+    let fname = func.name.to_string();
+    if func.over.is_some() {
+        return plan_err!(
+            "Cannot nest window function '{fname}() OVER (...)' inside MATCH_RECOGNIZE"
+        );
+    }
+    if func.filter.is_some() {
+        return plan_err!("Cannot use FILTER clause with '{fname}()' inside MATCH_RECOGNIZE");
+    }
+    if !func.within_group.is_empty() {
+        return plan_err!("Cannot use WITHIN GROUP with '{fname}()' inside MATCH_RECOGNIZE");
+    }
+    if let FunctionArguments::List(list) = &func.args
+        && !list.clauses.is_empty()
+    {
+        return plan_err!(
+            "Cannot use ORDER BY or function clauses with '{fname}()' inside MATCH_RECOGNIZE"
+        );
+    }
+    Ok(())
+}
+
+fn validate_no_illegal_function_clauses(expr: &SqlExpr) -> Result<()> {
+    match expr {
+        SqlExpr::Function(func) => {
+            check_function_clauses(func)?;
+            if let FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                        validate_no_illegal_function_clauses(e)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::BinaryOp { left, right, .. }
+        | SqlExpr::IsDistinctFrom(left, right)
+        | SqlExpr::IsNotDistinctFrom(left, right) => {
+            validate_no_illegal_function_clauses(left)?;
+            validate_no_illegal_function_clauses(right)
+        }
+        SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::Nested(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::IsTrue(expr)
+        | SqlExpr::IsFalse(expr)
+        | SqlExpr::IsNotTrue(expr)
+        | SqlExpr::IsNotFalse(expr)
+        | SqlExpr::IsUnknown(expr)
+        | SqlExpr::IsNotUnknown(expr)
+        | SqlExpr::Cast { expr, .. }
+        | SqlExpr::Extract { expr, .. }
+        | SqlExpr::Ceil { expr, .. }
+        | SqlExpr::Floor { expr, .. } => validate_no_illegal_function_clauses(expr),
+        SqlExpr::Like { expr, pattern, .. }
+        | SqlExpr::ILike { expr, pattern, .. }
+        | SqlExpr::SimilarTo { expr, pattern, .. } => {
+            validate_no_illegal_function_clauses(expr)?;
+            validate_no_illegal_function_clauses(pattern)
+        }
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
+            validate_no_illegal_function_clauses(expr)?;
+            validate_no_illegal_function_clauses(low)?;
+            validate_no_illegal_function_clauses(high)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            validate_no_illegal_function_clauses(expr)?;
+            for e in list {
+                validate_no_illegal_function_clauses(e)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                validate_no_illegal_function_clauses(op)?;
+            }
+            for c in conditions {
+                validate_no_illegal_function_clauses(&c.condition)?;
+                validate_no_illegal_function_clauses(&c.result)?;
+            }
+            if let Some(el) = else_result {
+                validate_no_illegal_function_clauses(el)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Array(arr) => {
+            for e in &arr.elem {
+                validate_no_illegal_function_clauses(e)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Tuple(elems) => {
+            for e in elems {
+                validate_no_illegal_function_clauses(e)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn unwrap_arg_physical_nav(expr: SqlExpr) -> Result<(Option<(PhysicalNavKind, u32)>, SqlExpr)> {
     if let SqlExpr::Function(ref func) = expr {
         let name = func.name.to_string().to_ascii_lowercase();
         if matches!(name.as_str(), "prev" | "next") {
-            let (args, _) = extract_unnamed_args(&func.args)?;
+            check_function_clauses(func)?;
+            let (args, distinct) = extract_unnamed_args(&func.args)?;
+            if distinct {
+                return plan_err!("DISTINCT is not valid in {name}()");
+            }
             if args.is_empty() || args.len() > 2 {
                 return plan_err!("{name}() expects 1 or 2 arguments");
             }
@@ -1397,9 +1542,17 @@ fn extract_unnamed_args(args: &FunctionArguments) -> Result<(Vec<FunctionArgExpr
 fn parse_non_negative_u32(expr: &SqlExpr) -> Result<u32> {
     match expr {
         SqlExpr::Value(v) => match &v.value {
-            ast::Value::Number(s, _) => s.parse::<u32>().map_err(|_| {
-                plan_datafusion_err!("Navigation offset must be a non-negative integer, got '{s}'")
-            }),
+            ast::Value::Number(s, _) => {
+                let n = s.parse::<u32>().map_err(|_| {
+                    plan_datafusion_err!(
+                        "Navigation offset must be a non-negative integer, got '{s}'"
+                    )
+                })?;
+                if n > i32::MAX as u32 {
+                    return plan_err!("Navigation offset must not exceed {} (got {n})", i32::MAX);
+                }
+                Ok(n)
+            }
             other => plan_err!("Navigation offset must be an integer literal, got {other}"),
         },
         SqlExpr::UnaryOp {
@@ -1410,468 +1563,365 @@ fn parse_non_negative_u32(expr: &SqlExpr) -> Result<u32> {
     }
 }
 
-/// Rewrites `CLASSIFIER([sym])` and `MATCH_NUMBER()` inside an aggregate argument expression to
-/// synthetic columns `__mr_agg_classifier` and `__mr_agg_match_number`, returning any pattern
-/// variable symbol referenced by `CLASSIFIER(sym)`.
-fn rewrite_match_metadata_in_agg_arg(
-    expr: SqlExpr,
-    known_symbols: &HashSet<String>,
-) -> Result<(SqlExpr, bool, Option<String>)> {
-    let mut found = false;
-    let mut classifier_sym: Option<String> = None;
-    let rewritten = rewrite_meta_inner(expr, known_symbols, &mut found, &mut classifier_sym)?;
-    Ok((rewritten, found, classifier_sym))
+/// Validates and rewrites expressions nested inside a pattern navigation (`FIRST`/`LAST`/`PREV`/`NEXT`)
+/// or pattern aggregate (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/UDAF):
+/// - Strips single pattern variable qualifiers (`A.col` -> `col`) and tracks `labeled_symbol` vs
+///   `has_unlabeled` to enforce SQL:2016 label consistency.
+/// - Rewrites `CLASSIFIER([sym])` and `MATCH_NUMBER()` to synthetic metadata columns.
+/// - Rejects illegal nesting (nested navigation or nested aggregates) and illegal function clauses.
+struct PatternArgAnalyzer<'a> {
+    known_symbols: &'a HashSet<String>,
+    ctx: &'a dyn RelationPlannerContext,
+    parent_fn: &'a str,
+    labeled_symbol: Option<String>,
+    has_unlabeled: bool,
+    has_col_or_classifier: bool,
+    uses_match_metadata: bool,
 }
 
-fn rewrite_meta_inner(
-    expr: SqlExpr,
-    known_symbols: &HashSet<String>,
-    found: &mut bool,
-    classifier_sym: &mut Option<String>,
-) -> Result<SqlExpr> {
-    match expr {
-        SqlExpr::Function(func) => {
-            let fname = func.name.to_string().to_ascii_lowercase();
-            if fname == "classifier" {
-                let (args, _) = extract_unnamed_args(&func.args)?;
-                match args.len() {
-                    0 => {}
-                    1 => match &args[0] {
-                        FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
-                            let sym = normalize_pattern_ident(id.clone());
-                            if !known_symbols.contains(&sym) {
-                                return plan_err!(
-                                    "CLASSIFIER({sym}) references unknown pattern variable"
-                                );
-                            }
-                            if let Some(existing) = classifier_sym.as_ref()
-                                && existing != &sym
-                            {
-                                return plan_err!(
-                                    "Aggregate argument cannot reference multiple pattern variables ('{existing}' and '{sym}')"
-                                );
-                            }
-                            *classifier_sym = Some(sym);
-                        }
-                        _ => {
-                            return plan_err!(
-                                "CLASSIFIER() argument must be a pattern variable identifier"
-                            );
-                        }
-                    },
-                    _ => return plan_err!("CLASSIFIER() takes at most 1 argument"),
-                }
-                *found = true;
-                return Ok(SqlExpr::Identifier(Ident::new(AGG_META_CLASSIFIER_COL)));
-            }
-            if fname == "match_number" {
-                let (args, _) = extract_unnamed_args(&func.args)?;
-                if !args.is_empty() {
-                    return plan_err!("MATCH_NUMBER() takes no arguments");
-                }
-                *found = true;
-                return Ok(SqlExpr::Identifier(Ident::new(AGG_META_MATCH_NUMBER_COL)));
-            }
-            let args = match func.args {
-                FunctionArguments::List(mut list) => {
-                    for arg in &mut list.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            let owned =
-                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
-                            *e = rewrite_meta_inner(owned, known_symbols, found, classifier_sym)?;
-                        }
-                    }
-                    FunctionArguments::List(list)
-                }
-                other => other,
-            };
-            Ok(SqlExpr::Function(ast::Function { args, ..func }))
+impl<'a> PatternArgAnalyzer<'a> {
+    fn new(
+        known_symbols: &'a HashSet<String>,
+        ctx: &'a dyn RelationPlannerContext,
+        parent_fn: &'a str,
+    ) -> Self {
+        Self {
+            known_symbols,
+            ctx,
+            parent_fn,
+            labeled_symbol: None,
+            has_unlabeled: false,
+            has_col_or_classifier: false,
+            uses_match_metadata: false,
         }
-        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
-            left: Box::new(rewrite_meta_inner(
-                *left,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            op,
-            right: Box::new(rewrite_meta_inner(
-                *right,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-        }),
-        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
-            op,
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-        }),
-        SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(rewrite_meta_inner(
-            *inner,
-            known_symbols,
-            found,
-            classifier_sym,
-        )?))),
-        SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(rewrite_meta_inner(
-            *inner,
-            known_symbols,
-            found,
-            classifier_sym,
-        )?))),
-        SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(rewrite_meta_inner(
-            *inner,
-            known_symbols,
-            found,
-            classifier_sym,
-        )?))),
-        SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
-            Box::new(rewrite_meta_inner(
-                *l,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            Box::new(rewrite_meta_inner(
-                *r,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-        )),
-        SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
-            Box::new(rewrite_meta_inner(
-                *l,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            Box::new(rewrite_meta_inner(
-                *r,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-        )),
-        SqlExpr::Like {
-            negated,
-            any,
-            expr,
-            pattern,
-            escape_char,
-        } => Ok(SqlExpr::Like {
-            negated,
-            any,
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            pattern: Box::new(rewrite_meta_inner(
-                *pattern,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            escape_char,
-        }),
-        SqlExpr::ILike {
-            negated,
-            any,
-            expr,
-            pattern,
-            escape_char,
-        } => Ok(SqlExpr::ILike {
-            negated,
-            any,
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            pattern: Box::new(rewrite_meta_inner(
-                *pattern,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            escape_char,
-        }),
-        SqlExpr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Ok(SqlExpr::Between {
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            negated,
-            low: Box::new(rewrite_meta_inner(
-                *low,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            high: Box::new(rewrite_meta_inner(
-                *high,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-        }),
-        SqlExpr::InList {
-            expr,
-            list,
-            negated,
-        } => Ok(SqlExpr::InList {
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            list: list
-                .into_iter()
-                .map(|e| rewrite_meta_inner(e, known_symbols, found, classifier_sym))
-                .collect::<Result<Vec<_>>>()?,
-            negated,
-        }),
-        SqlExpr::Cast {
-            kind,
-            expr,
-            data_type,
-            format,
-        } => Ok(SqlExpr::Cast {
-            kind,
-            expr: Box::new(rewrite_meta_inner(
-                *expr,
-                known_symbols,
-                found,
-                classifier_sym,
-            )?),
-            data_type,
-            format,
-        }),
-        SqlExpr::Case {
-            case_token,
-            end_token,
-            operand,
-            conditions,
-            else_result,
-        } => {
-            let operand = operand
-                .map(|e| rewrite_meta_inner(*e, known_symbols, found, classifier_sym))
-                .transpose()?
-                .map(Box::new);
-            let mut new_conditions = Vec::with_capacity(conditions.len());
-            for c in conditions {
-                new_conditions.push(ast::CaseWhen {
-                    condition: rewrite_meta_inner(
-                        c.condition,
-                        known_symbols,
-                        found,
-                        classifier_sym,
-                    )?,
-                    result: rewrite_meta_inner(c.result, known_symbols, found, classifier_sym)?,
-                });
-            }
-            let else_result = else_result
-                .map(|e| rewrite_meta_inner(*e, known_symbols, found, classifier_sym))
-                .transpose()?
-                .map(Box::new);
-            Ok(SqlExpr::Case {
-                case_token,
-                end_token,
-                operand,
-                conditions: new_conditions,
-                else_result,
-            })
-        }
-        other => Ok(other),
     }
-}
 
-fn extract_single_symbol_qualifier(
-    expr: SqlExpr,
-    known_symbols: &HashSet<String>,
-) -> Result<(Option<String>, SqlExpr)> {
-    let mut found: Option<String> = None;
-    let stripped = strip_symbol_inner(expr, known_symbols, &mut found)?;
-    Ok((found, stripped))
-}
-
-fn strip_symbol_inner(
-    expr: SqlExpr,
-    known_symbols: &HashSet<String>,
-    found: &mut Option<String>,
-) -> Result<SqlExpr> {
-    match expr {
-        SqlExpr::CompoundIdentifier(mut idents) => {
-            if idents.len() == 2 {
-                let prefix = normalize_pattern_ident(idents[0].clone());
-                if known_symbols.contains(&prefix) {
-                    if let Some(existing) = found
-                        && existing != &prefix
-                    {
-                        return plan_err!(
-                            "Navigation/aggregate expression cannot reference multiple pattern variables ('{existing}' and '{prefix}')"
-                        );
-                    }
-                    *found = Some(prefix);
-                    return Ok(SqlExpr::Identifier(idents.pop().expect("len 2")));
-                }
-            }
-            Ok(SqlExpr::CompoundIdentifier(idents))
+    fn record_label(&mut self, sym: String) -> Result<()> {
+        if let Some(existing) = &self.labeled_symbol
+            && existing != &sym
+        {
+            return plan_err!(
+                "All pattern variable labels and CLASSIFIER() calls inside '{}' must match (found '{}' and '{}')",
+                self.parent_fn,
+                existing,
+                sym
+            );
         }
-        SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
-            left: Box::new(strip_symbol_inner(*left, known_symbols, found)?),
-            op: op_clone(op),
-            right: Box::new(strip_symbol_inner(*right, known_symbols, found)?),
-        }),
-        SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
-            op,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-        }),
-        SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(strip_symbol_inner(
-            *inner,
-            known_symbols,
-            found,
-        )?))),
-        SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(strip_symbol_inner(
-            *inner,
-            known_symbols,
-            found,
-        )?))),
-        SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(strip_symbol_inner(
-            *inner,
-            known_symbols,
-            found,
-        )?))),
-        SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
-            Box::new(strip_symbol_inner(*l, known_symbols, found)?),
-            Box::new(strip_symbol_inner(*r, known_symbols, found)?),
-        )),
-        SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
-            Box::new(strip_symbol_inner(*l, known_symbols, found)?),
-            Box::new(strip_symbol_inner(*r, known_symbols, found)?),
-        )),
-        SqlExpr::Like {
-            negated,
-            any,
-            expr,
-            pattern,
-            escape_char,
-        } => Ok(SqlExpr::Like {
-            negated,
-            any,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-            pattern: Box::new(strip_symbol_inner(*pattern, known_symbols, found)?),
-            escape_char,
-        }),
-        SqlExpr::ILike {
-            negated,
-            any,
-            expr,
-            pattern,
-            escape_char,
-        } => Ok(SqlExpr::ILike {
-            negated,
-            any,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-            pattern: Box::new(strip_symbol_inner(*pattern, known_symbols, found)?),
-            escape_char,
-        }),
-        SqlExpr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Ok(SqlExpr::Between {
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-            negated,
-            low: Box::new(strip_symbol_inner(*low, known_symbols, found)?),
-            high: Box::new(strip_symbol_inner(*high, known_symbols, found)?),
-        }),
-        SqlExpr::InList {
-            expr,
-            list,
-            negated,
-        } => Ok(SqlExpr::InList {
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-            list: list
-                .into_iter()
-                .map(|e| strip_symbol_inner(e, known_symbols, found))
-                .collect::<Result<Vec<_>>>()?,
-            negated,
-        }),
-        SqlExpr::Cast {
-            kind,
-            expr,
-            data_type,
-            format,
-        } => Ok(SqlExpr::Cast {
-            kind,
-            expr: Box::new(strip_symbol_inner(*expr, known_symbols, found)?),
-            data_type,
-            format,
-        }),
-        SqlExpr::Function(func) => {
-            let args = match func.args {
-                FunctionArguments::List(mut list) => {
-                    for arg in &mut list.args {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            let owned =
-                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
-                            *e = strip_symbol_inner(owned, known_symbols, found)?;
+        self.labeled_symbol = Some(sym);
+        Ok(())
+    }
+
+    fn validate_consistent_labels(&self) -> Result<()> {
+        if let Some(sym) = &self.labeled_symbol
+            && self.has_unlabeled
+        {
+            return plan_err!(
+                "All pattern variable labels and CLASSIFIER() calls inside '{}' must match (mixed labeled '{sym}' with unlabeled reference)",
+                self.parent_fn
+            );
+        }
+        Ok(())
+    }
+
+    fn rewrite(&mut self, expr: SqlExpr) -> Result<SqlExpr> {
+        match expr {
+            SqlExpr::Identifier(id) => {
+                self.has_unlabeled = true;
+                self.has_col_or_classifier = true;
+                Ok(SqlExpr::Identifier(id))
+            }
+            SqlExpr::CompoundIdentifier(mut idents) => {
+                self.has_col_or_classifier = true;
+                if idents.len() == 2 {
+                    let prefix = normalize_pattern_ident(idents[0].clone());
+                    if self.known_symbols.contains(&prefix) {
+                        self.record_label(prefix)?;
+                        return Ok(SqlExpr::Identifier(idents.pop().expect("len 2")));
+                    }
+                }
+                self.has_unlabeled = true;
+                Ok(SqlExpr::CompoundIdentifier(idents))
+            }
+            SqlExpr::Function(func) => {
+                check_function_clauses(&func)?;
+                let fname = func.name.to_string().to_ascii_lowercase();
+                if matches!(fname.as_str(), "first" | "last" | "prev" | "next") {
+                    return plan_err!(
+                        "Cannot nest '{fname}()' pattern navigation function inside '{}()'",
+                        self.parent_fn
+                    );
+                }
+                if is_builtin_or_registered_agg(&fname, self.ctx) {
+                    return plan_err!(
+                        "Cannot nest '{fname}()' aggregate function inside '{}()'",
+                        self.parent_fn
+                    );
+                }
+                if fname == "classifier" {
+                    let (args, distinct) = extract_unnamed_args(&func.args)?;
+                    if distinct {
+                        return plan_err!("DISTINCT is not valid in CLASSIFIER()");
+                    }
+                    match args.len() {
+                        0 => {
+                            self.has_unlabeled = true;
                         }
+                        1 => match &args[0] {
+                            FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
+                                let sym = normalize_pattern_ident(id.clone());
+                                if !self.known_symbols.contains(&sym) {
+                                    return plan_err!(
+                                        "CLASSIFIER({sym}) references unknown pattern variable"
+                                    );
+                                }
+                                self.record_label(sym)?;
+                            }
+                            _ => {
+                                return plan_err!(
+                                    "CLASSIFIER() argument must be a pattern variable identifier"
+                                );
+                            }
+                        },
+                        _ => return plan_err!("CLASSIFIER() takes at most 1 argument"),
                     }
-                    FunctionArguments::List(list)
+                    self.has_col_or_classifier = true;
+                    self.uses_match_metadata = true;
+                    return Ok(SqlExpr::Identifier(Ident::new(AGG_META_CLASSIFIER_COL)));
                 }
-                other => other,
-            };
-            Ok(SqlExpr::Function(ast::Function { args, ..func }))
-        }
-        SqlExpr::Case {
-            case_token,
-            end_token,
-            operand,
-            conditions,
-            else_result,
-        } => {
-            let operand = operand
-                .map(|e| strip_symbol_inner(*e, known_symbols, found))
-                .transpose()?
-                .map(Box::new);
-            let mut new_conditions = Vec::with_capacity(conditions.len());
-            for c in conditions {
-                new_conditions.push(ast::CaseWhen {
-                    condition: strip_symbol_inner(c.condition, known_symbols, found)?,
-                    result: strip_symbol_inner(c.result, known_symbols, found)?,
-                });
+                if fname == "match_number" {
+                    let (args, _) = extract_unnamed_args(&func.args)?;
+                    if !args.is_empty() {
+                        return plan_err!("MATCH_NUMBER() takes no arguments");
+                    }
+                    self.uses_match_metadata = true;
+                    return Ok(SqlExpr::Identifier(Ident::new(AGG_META_MATCH_NUMBER_COL)));
+                }
+                let args = match func.args {
+                    FunctionArguments::List(mut list) => {
+                        for arg in &mut list.args {
+                            match arg {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                    let owned = std::mem::replace(
+                                        e,
+                                        SqlExpr::Value(ast::Value::Null.into()),
+                                    );
+                                    *e = self.rewrite(owned)?;
+                                }
+                                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(obj)) => {
+                                    return plan_err!(
+                                        "{obj}.* is only supported as the argument of COUNT() in MATCH_RECOGNIZE"
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        FunctionArguments::List(list)
+                    }
+                    other => other,
+                };
+                Ok(SqlExpr::Function(ast::Function { args, ..func }))
             }
-            let else_result = else_result
-                .map(|e| strip_symbol_inner(*e, known_symbols, found))
-                .transpose()?
-                .map(Box::new);
-            Ok(SqlExpr::Case {
+            SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+                left: Box::new(self.rewrite(*left)?),
+                op: op_clone(op),
+                right: Box::new(self.rewrite(*right)?),
+            }),
+            SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
+                op,
+                expr: Box::new(self.rewrite(*expr)?),
+            }),
+            SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsTrue(inner) => Ok(SqlExpr::IsTrue(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsFalse(inner) => Ok(SqlExpr::IsFalse(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsNotTrue(inner) => Ok(SqlExpr::IsNotTrue(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsNotFalse(inner) => Ok(SqlExpr::IsNotFalse(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsUnknown(inner) => Ok(SqlExpr::IsUnknown(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::IsNotUnknown(inner) => {
+                Ok(SqlExpr::IsNotUnknown(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsDistinctFrom(l, r) => Ok(SqlExpr::IsDistinctFrom(
+                Box::new(self.rewrite(*l)?),
+                Box::new(self.rewrite(*r)?),
+            )),
+            SqlExpr::IsNotDistinctFrom(l, r) => Ok(SqlExpr::IsNotDistinctFrom(
+                Box::new(self.rewrite(*l)?),
+                Box::new(self.rewrite(*r)?),
+            )),
+            SqlExpr::Like {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::Like {
+                negated,
+                any,
+                expr: Box::new(self.rewrite(*expr)?),
+                pattern: Box::new(self.rewrite(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::ILike {
+                negated,
+                any,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::ILike {
+                negated,
+                any,
+                expr: Box::new(self.rewrite(*expr)?),
+                pattern: Box::new(self.rewrite(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::SimilarTo {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(SqlExpr::SimilarTo {
+                negated,
+                expr: Box::new(self.rewrite(*expr)?),
+                pattern: Box::new(self.rewrite(*pattern)?),
+                escape_char,
+            }),
+            SqlExpr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                special,
+                shorthand,
+            } => Ok(SqlExpr::Substring {
+                expr: Box::new(self.rewrite(*expr)?),
+                substring_from: substring_from
+                    .map(|e| self.rewrite(*e))
+                    .transpose()?
+                    .map(Box::new),
+                substring_for: substring_for
+                    .map(|e| self.rewrite(*e))
+                    .transpose()?
+                    .map(Box::new),
+                special,
+                shorthand,
+            }),
+            SqlExpr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => Ok(SqlExpr::Trim {
+                expr: Box::new(self.rewrite(*expr)?),
+                trim_where,
+                trim_what: trim_what
+                    .map(|e| self.rewrite(*e))
+                    .transpose()?
+                    .map(Box::new),
+                trim_characters: trim_characters
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|e| self.rewrite(e))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?,
+            }),
+            SqlExpr::Position { expr, r#in } => Ok(SqlExpr::Position {
+                expr: Box::new(self.rewrite(*expr)?),
+                r#in: Box::new(self.rewrite(*r#in)?),
+            }),
+            SqlExpr::Extract {
+                field,
+                syntax,
+                expr,
+            } => Ok(SqlExpr::Extract {
+                field,
+                syntax,
+                expr: Box::new(self.rewrite(*expr)?),
+            }),
+            SqlExpr::Ceil { expr, field } => Ok(SqlExpr::Ceil {
+                expr: Box::new(self.rewrite(*expr)?),
+                field,
+            }),
+            SqlExpr::Floor { expr, field } => Ok(SqlExpr::Floor {
+                expr: Box::new(self.rewrite(*expr)?),
+                field,
+            }),
+            SqlExpr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Ok(SqlExpr::Between {
+                expr: Box::new(self.rewrite(*expr)?),
+                negated,
+                low: Box::new(self.rewrite(*low)?),
+                high: Box::new(self.rewrite(*high)?),
+            }),
+            SqlExpr::InList {
+                expr,
+                list,
+                negated,
+            } => Ok(SqlExpr::InList {
+                expr: Box::new(self.rewrite(*expr)?),
+                list: list
+                    .into_iter()
+                    .map(|e| self.rewrite(e))
+                    .collect::<Result<Vec<_>>>()?,
+                negated,
+            }),
+            SqlExpr::Cast {
+                kind,
+                expr,
+                data_type,
+                format,
+            } => Ok(SqlExpr::Cast {
+                kind,
+                expr: Box::new(self.rewrite(*expr)?),
+                data_type,
+                format,
+            }),
+            SqlExpr::Case {
                 case_token,
                 end_token,
                 operand,
-                conditions: new_conditions,
+                conditions,
                 else_result,
-            })
+            } => {
+                let operand = operand.map(|e| self.rewrite(*e)).transpose()?.map(Box::new);
+                let mut new_conditions = Vec::with_capacity(conditions.len());
+                for c in conditions {
+                    new_conditions.push(ast::CaseWhen {
+                        condition: self.rewrite(c.condition)?,
+                        result: self.rewrite(c.result)?,
+                    });
+                }
+                let else_result = else_result
+                    .map(|e| self.rewrite(*e))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(SqlExpr::Case {
+                    case_token,
+                    end_token,
+                    operand,
+                    conditions: new_conditions,
+                    else_result,
+                })
+            }
+            SqlExpr::Array(ast::Array { elem, named }) => Ok(SqlExpr::Array(ast::Array {
+                elem: elem
+                    .into_iter()
+                    .map(|e| self.rewrite(e))
+                    .collect::<Result<Vec<_>>>()?,
+                named,
+            })),
+            SqlExpr::Tuple(elems) => Ok(SqlExpr::Tuple(
+                elems
+                    .into_iter()
+                    .map(|e| self.rewrite(e))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            other => Ok(other),
         }
-        other => Ok(other),
     }
 }
 

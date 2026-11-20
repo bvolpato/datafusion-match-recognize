@@ -285,6 +285,9 @@ pub enum MeasureSlotKind {
         physical_offset: u32,
         symbol: Option<String>,
         inner_expr: Expr,
+        /// True when `inner_expr` references synthetic per-match metadata columns
+        /// (`__mr_agg_classifier` for `CLASSIFIER()` or `__mr_agg_match_number` for `MATCH_NUMBER()`).
+        uses_match_metadata: bool,
     },
     /// Aggregate over matched rows (built-in fast path or any DataFusion `AggregateUDF`),
     /// optionally scoped to a pattern variable/subset and optionally with `PREV`/`NEXT` shifted args.

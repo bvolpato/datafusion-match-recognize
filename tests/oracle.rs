@@ -1166,3 +1166,362 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Layer 1b: Independent Reference Measure Evaluator + Proptest
+// ============================================================================
+//
+// Cross-checks `build_partition_output_batch` (MEASURES, SUBSET union variables,
+// RUNNING vs FINAL semantics, CLASSIFIER() nav, value nav, DISTINCT aggregates,
+// SUM(PREV(...)), exclusions, empty matches, and WITH UNMATCHED ROWS) against a
+// completely independent scalar reference implementation over randomized patterns
+// (including reluctant quantifiers and SUBSETs not yet exposed via sqlparser 0.63).
+
+fn ref_eval_measures_oracle(
+    vals: &[Option<i64>],
+    events: &[PartitionEvent],
+    program: &Program,
+    rows_per_match: RowsPerMatch,
+) -> Vec<Vec<String>> {
+    use std::collections::HashSet;
+
+    let a_id = program.symbol_id("a").unwrap();
+    let u_set = program.resolve_symbol_set("u").unwrap();
+    let sym_name = |id: SymbolId| program.id_to_symbol[id as usize].as_str();
+    let fmt_opt_i64 = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".into());
+    let fmt_opt_str = |v: Option<&str>| v.map(str::to_string).unwrap_or_else(|| "NULL".into());
+
+    let mut out = Vec::new();
+    for event in events {
+        match event {
+            PartitionEvent::UnmatchedRow { row_idx } => {
+                // Output schema for ALL ROWS: id (ORDER BY), 15 measures (all NULL), val
+                let mut row = vec![(*row_idx as i64).to_string()];
+                for _ in 0..15 {
+                    row.push("NULL".into());
+                }
+                row.push(fmt_opt_i64(vals[*row_idx]));
+                out.push(row);
+            }
+            PartitionEvent::Match(found) => {
+                let emit_positions: Vec<(Option<usize>, usize, bool)> =
+                    if rows_per_match.is_one_row() {
+                        if found.steps.is_empty() {
+                            vec![(None, found.start_row, true)]
+                        } else {
+                            vec![(Some(found.steps.len() - 1), found.start_row, false)]
+                        }
+                    } else if found.steps.is_empty() {
+                        if rows_per_match.show_empty_matches() {
+                            vec![(None, found.start_row, true)]
+                        } else {
+                            vec![]
+                        }
+                    } else {
+                        found
+                            .steps
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| !s.excluded)
+                            .map(|(i, s)| (Some(i), s.row_idx, false))
+                            .collect()
+                    };
+
+                for (step_pos, source_row, is_empty) in emit_positions {
+                    let run_horizon: &[MatchStep] = if is_empty {
+                        &[]
+                    } else {
+                        match step_pos {
+                            Some(idx) => &found.steps[..=idx],
+                            None => &[],
+                        }
+                    };
+                    let fin_horizon: &[MatchStep] = if is_empty { &[] } else { &found.steps };
+
+                    let mn = found.match_number;
+                    let cls_run = run_horizon.last().map(|s| sym_name(s.sym));
+                    let cls_fin = fin_horizon.last().map(|s| sym_name(s.sym));
+                    let cls_u_run = run_horizon
+                        .iter()
+                        .rev()
+                        .find(|s| u_set.contains(s.sym))
+                        .map(|s| sym_name(s.sym));
+                    let next_cls_run = if run_horizon.is_empty() {
+                        None
+                    } else {
+                        found.steps.get(run_horizon.len()).map(|s| sym_name(s.sym))
+                    };
+                    let first_a_val = run_horizon
+                        .iter()
+                        .find(|s| s.sym == a_id)
+                        .and_then(|s| vals[s.row_idx]);
+                    let last_u_val_fin = fin_horizon
+                        .iter()
+                        .rev()
+                        .find(|s| u_set.contains(s.sym))
+                        .and_then(|s| vals[s.row_idx]);
+                    let prev_val = run_horizon
+                        .last()
+                        .and_then(|s| s.row_idx.checked_sub(1))
+                        .and_then(|r| vals[r]);
+                    let cnt_star = run_horizon.len() as i64;
+                    let cnt_u_fin =
+                        fin_horizon.iter().filter(|s| u_set.contains(s.sym)).count() as i64;
+                    let cnt_distinct = {
+                        let mut set = HashSet::new();
+                        for s in run_horizon {
+                            if let Some(v) = vals[s.row_idx] {
+                                set.insert(v);
+                            }
+                        }
+                        set.len() as i64
+                    };
+                    let sum_distinct = {
+                        let mut set = HashSet::new();
+                        let mut acc: Option<i64> = None;
+                        for s in run_horizon {
+                            if let Some(v) = vals[s.row_idx]
+                                && set.insert(v)
+                            {
+                                acc = Some(acc.unwrap_or(0) + v);
+                            }
+                        }
+                        acc
+                    };
+                    let sum_prev = {
+                        let mut acc: Option<i64> = None;
+                        for s in run_horizon {
+                            if let Some(prev_r) = s.row_idx.checked_sub(1)
+                                && let Some(v) = vals[prev_r]
+                            {
+                                acc = Some(acc.unwrap_or(0) + v);
+                            }
+                        }
+                        acc
+                    };
+                    let max_val = run_horizon.iter().filter_map(|s| vals[s.row_idx]).max();
+                    let min_val = run_horizon.iter().filter_map(|s| vals[s.row_idx]).min();
+
+                    let mut row = Vec::new();
+                    if !rows_per_match.is_one_row() {
+                        row.push((source_row as i64).to_string());
+                    }
+                    row.push(mn.to_string());
+                    row.push(fmt_opt_str(cls_run));
+                    row.push(fmt_opt_str(cls_fin));
+                    row.push(fmt_opt_str(cls_u_run));
+                    row.push(fmt_opt_str(next_cls_run));
+                    row.push(fmt_opt_i64(first_a_val));
+                    row.push(fmt_opt_i64(last_u_val_fin));
+                    row.push(fmt_opt_i64(prev_val));
+                    row.push(cnt_star.to_string());
+                    row.push(cnt_u_fin.to_string());
+                    row.push(cnt_distinct.to_string());
+                    row.push(fmt_opt_i64(sum_distinct));
+                    row.push(fmt_opt_i64(sum_prev));
+                    row.push(fmt_opt_i64(max_val));
+                    row.push(fmt_opt_i64(min_val));
+                    if !rows_per_match.is_one_row() {
+                        row.push(fmt_opt_i64(vals[source_row]));
+                    }
+                    out.push(row);
+                }
+            }
+        }
+    }
+    out
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 500,
+        max_shrink_iters: 1000,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn fuzz_measures_and_subset_against_reference_oracle(
+        pattern in arb_pattern(),
+        bitmasks in prop::collection::vec(0u64..8u64, 1..=8),
+        raw_vals in prop::collection::vec(prop::option::of(-5i64..=5i64), 1..=8),
+        skip in arb_skip(),
+        rpm in arb_rows_per_match(),
+    ) {
+        use std::sync::Arc;
+        use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
+        use arrow::util::display::{ArrayFormatter, FormatOptions};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion_match_recognize::ast::{
+            AggKind, EvalSemantics, LogicalNavKind, PhysicalNavKind, SubsetDef,
+        };
+        use datafusion_match_recognize::measures::{
+            PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind,
+            build_partition_output_batch, build_physical_slot_schema,
+        };
+        use datafusion_physical_expr::expressions::Column;
+
+        // Exclusions are forbidden with WITH UNMATCHED ROWS per SQL:2016.
+        if rpm.include_unmatched_rows() && pattern.has_exclusion() {
+            return Ok(());
+        }
+
+        let len = bitmasks.len().min(raw_vals.len());
+        let bitmasks = bitmasks[..len].to_vec();
+        let vals = raw_vals[..len].to_vec();
+
+        let declared = vec!["a".into(), "b".into(), "c".into()];
+        let subsets = vec![SubsetDef {
+            name: "u".into(),
+            members: vec!["a".into(), "b".into()],
+        }];
+        let program = Program::compile_with_subsets(
+            &pattern,
+            &declared,
+            &subsets,
+            MatchRecognizeConfig::default(),
+        )
+        .unwrap();
+        let symbols = PartitionSymbols::from_bitmasks(bitmasks, 3);
+        let mut matcher = Matcher::new(&program);
+        let Ok((events, _)) = matcher.match_partition(&symbols, &skip, rpm) else {
+            return Ok(());
+        };
+
+        let partition_batch = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from_iter_values(0..len as i64)) as ArrayRef),
+            ("v", Arc::new(Int64Array::from(vals.clone())) as ArrayRef),
+        ])
+        .unwrap();
+
+        let a_set = program.resolve_symbol_set("a");
+        let u_set = program.resolve_symbol_set("u");
+        let v_col: Arc<dyn datafusion_physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("v", 1));
+        let slot0_col: Arc<dyn datafusion_physical_expr::PhysicalExpr> =
+            Arc::new(Column::new("s0", 0));
+
+        let make_measure = |alias: &str, sem: EvalSemantics, dt: DataType, kind: PhysicalMeasureSlotKind| {
+            let slot = PhysicalMeasureSlot {
+                slot_name: "s0".into(),
+                semantics: sem,
+                data_type: dt,
+                nullable: true,
+                kind,
+            };
+            let slot_schema = build_physical_slot_schema(std::slice::from_ref(&slot));
+            PhysicalMeasure {
+                alias: alias.into(),
+                outer_expr: Arc::clone(&slot0_col),
+                slot_schema,
+                slots: vec![slot],
+            }
+        };
+
+        let measures = vec![
+            make_measure("mn", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::MatchNumber),
+            make_measure("cls_run", EvalSemantics::Running, DataType::Utf8, PhysicalMeasureSlotKind::Classifier {
+                symbol: None, symbol_set: None, logical_nav: None, logical_offset: 0, physical_nav: None, physical_offset: 0,
+            }),
+            make_measure("cls_fin", EvalSemantics::Final, DataType::Utf8, PhysicalMeasureSlotKind::Classifier {
+                symbol: None, symbol_set: None, logical_nav: None, logical_offset: 0, physical_nav: None, physical_offset: 0,
+            }),
+            make_measure("cls_u_run", EvalSemantics::Running, DataType::Utf8, PhysicalMeasureSlotKind::Classifier {
+                symbol: Some("u".into()), symbol_set: u_set.clone(), logical_nav: None, logical_offset: 0, physical_nav: None, physical_offset: 0,
+            }),
+            make_measure("next_cls_run", EvalSemantics::Running, DataType::Utf8, PhysicalMeasureSlotKind::Classifier {
+                symbol: None, symbol_set: None, logical_nav: Some(LogicalNavKind::Last), logical_offset: 0, physical_nav: Some(PhysicalNavKind::Next), physical_offset: 1,
+            }),
+            make_measure("first_a_v", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Nav {
+                logical_nav: Some(LogicalNavKind::First), logical_offset: 0, physical_nav: None, physical_offset: 0, symbol: Some("a".into()), symbol_set: a_set, inner_expr: Arc::clone(&v_col), uses_match_metadata: false,
+            }),
+            make_measure("last_u_v_fin", EvalSemantics::Final, DataType::Int64, PhysicalMeasureSlotKind::Nav {
+                logical_nav: Some(LogicalNavKind::Last), logical_offset: 0, physical_nav: None, physical_offset: 0, symbol: Some("u".into()), symbol_set: u_set.clone(), inner_expr: Arc::clone(&v_col), uses_match_metadata: false,
+            }),
+            make_measure("prev_v", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Nav {
+                logical_nav: Some(LogicalNavKind::Last), logical_offset: 0, physical_nav: Some(PhysicalNavKind::Prev), physical_offset: 1, symbol: None, symbol_set: None, inner_expr: Arc::clone(&v_col), uses_match_metadata: false,
+            }),
+            make_measure("cnt_star", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::CountStar, symbol: None, symbol_set: None, args: vec![], distinct: false, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+            make_measure("cnt_u_fin", EvalSemantics::Final, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::CountSymbol, symbol: Some("u".into()), symbol_set: u_set, args: vec![], distinct: false, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+            make_measure("cnt_dist", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::Count, symbol: None, symbol_set: None, args: vec![Arc::clone(&v_col)], distinct: true, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+            make_measure("sum_dist", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::Sum, symbol: None, symbol_set: None, args: vec![Arc::clone(&v_col)], distinct: true, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+            make_measure("sum_prev", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::Sum, symbol: None, symbol_set: None, args: vec![Arc::clone(&v_col)], distinct: false, arg_physical_nav: Some((PhysicalNavKind::Prev, 1)), uses_match_metadata: false,
+            }),
+            make_measure("max_v", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::Max, symbol: None, symbol_set: None, args: vec![Arc::clone(&v_col)], distinct: false, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+            make_measure("min_v", EvalSemantics::Running, DataType::Int64, PhysicalMeasureSlotKind::Agg {
+                agg_kind: AggKind::Min, symbol: None, symbol_set: None, args: vec![Arc::clone(&v_col)], distinct: false, arg_physical_nav: None, uses_match_metadata: false,
+            }),
+        ];
+
+        let mut out_fields = Vec::new();
+        if !rpm.is_one_row() {
+            out_fields.push(Field::new("id", DataType::Int64, true));
+        }
+        for m in &measures {
+            out_fields.push(Field::new(&m.alias, m.slots[0].data_type.clone(), true));
+        }
+        if !rpm.is_one_row() {
+            out_fields.push(Field::new("v", DataType::Int64, true));
+        }
+        let out_schema = Arc::new(Schema::new(out_fields));
+
+        let actual_batch = build_partition_output_batch(
+            &partition_batch,
+            &events,
+            &program,
+            &[],
+            &[],
+            &[Some(0)],
+            &measures,
+            rpm,
+            &out_schema,
+        )
+        .unwrap();
+
+        let expected = ref_eval_measures_oracle(&vals, &events, &program, rpm);
+        let actual: Vec<Vec<String>> = match actual_batch {
+            None => vec![],
+            Some(b) => {
+                let opts = FormatOptions::default().with_null("NULL");
+                let fmts: Vec<ArrayFormatter<'_>> = b
+                    .columns()
+                    .iter()
+                    .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts).unwrap())
+                    .collect();
+                (0..b.num_rows())
+                    .map(|r| {
+                        (0..b.num_columns())
+                            .map(|c| {
+                                if b.column(c).is_null(r) {
+                                    "NULL".to_string()
+                                } else {
+                                    fmts[c].value(r).to_string()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+        };
+
+        prop_assert_eq!(
+            actual,
+            expected,
+            "Measure oracle mismatch for pattern={}, skip={}, rpm={}, vals={:?}",
+            pattern,
+            skip,
+            rpm,
+            vals
+        );
+    }
+}

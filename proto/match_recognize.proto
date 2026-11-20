@@ -103,6 +103,7 @@ message NavSlotProto {
   uint32 physical_offset = 4;
   optional string symbol = 5;
   bytes inner_expr = 6;
+  bool uses_match_metadata = 7;
 }
 
 message AggSlotProto {

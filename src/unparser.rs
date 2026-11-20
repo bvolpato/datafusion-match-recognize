@@ -147,8 +147,8 @@ pub fn match_recognize_to_table_factor(
     let after_match_skip = Some(match &mr.after_match_skip {
         AfterMatchSkip::PastLastRow => SqlSkip::PastLastRow,
         AfterMatchSkip::ToNextRow => SqlSkip::ToNextRow,
-        AfterMatchSkip::ToFirst(s) => SqlSkip::ToFirst(Ident::new(s)),
-        AfterMatchSkip::ToLast(s) => SqlSkip::ToLast(Ident::new(s)),
+        AfterMatchSkip::ToFirst(s) => SqlSkip::ToFirst(pattern_ident(s)),
+        AfterMatchSkip::ToLast(s) => SqlSkip::ToLast(pattern_ident(s)),
     });
 
     let pattern = unparse_pattern(&mr.pattern)?;
@@ -162,7 +162,7 @@ pub fn match_recognize_to_table_factor(
             }
         };
         symbols.push(SqlSymDef {
-            symbol: Ident::new(&def.name),
+            symbol: pattern_ident(&def.name),
             definition,
         });
     }
@@ -245,7 +245,7 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
                 .as_ref()
                 .map(|s| {
                     vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                        SqlExpr::Identifier(Ident::new(s)),
+                        SqlExpr::Identifier(pattern_ident(s)),
                     ))]
                 })
                 .unwrap_or_default();
@@ -266,8 +266,13 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
             physical_offset,
             symbol,
             inner_expr,
+            uses_match_metadata,
         } => {
             let mut expr = unparser.expr_to_sql(inner_expr)?;
+            if *uses_match_metadata {
+                let meta_map = build_unparse_meta_map(symbol.as_deref());
+                expr = substitute_slots(expr, &meta_map);
+            }
             if let Some(sym) = symbol {
                 expr = qualify_identifiers(expr, sym);
             }
@@ -297,7 +302,7 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
                 Ok(make_func(
                     "COUNT",
                     vec![FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(
-                        ObjectName(vec![ObjectNamePart::Identifier(Ident::new(sym))]),
+                        ObjectName(vec![ObjectNamePart::Identifier(pattern_ident(sym))]),
                     ))],
                     false,
                 ))
@@ -312,17 +317,11 @@ fn unparse_slot(unparser: &Unparser, slot: &MeasureSlot) -> Result<SqlExpr> {
                     AggKind::Udaf(u) => u.name(),
                     AggKind::CountStar | AggKind::CountSymbol => unreachable!(),
                 };
-                let mut meta_map = HashMap::new();
-                if *uses_match_metadata {
-                    meta_map.insert(
-                        crate::logical::AGG_META_CLASSIFIER_COL.to_string(),
-                        make_func("CLASSIFIER", vec![], false),
-                    );
-                    meta_map.insert(
-                        crate::logical::AGG_META_MATCH_NUMBER_COL.to_string(),
-                        make_func("MATCH_NUMBER", vec![], false),
-                    );
-                }
+                let meta_map = if *uses_match_metadata {
+                    build_unparse_meta_map(symbol.as_deref())
+                } else {
+                    HashMap::new()
+                };
                 let mut fn_args = Vec::with_capacity(args.len());
                 for a in args {
                     let mut sql_a = unparser.expr_to_sql(a)?;
@@ -392,12 +391,45 @@ fn make_func(name: &str, args: Vec<FunctionArg>, distinct: bool) -> SqlExpr {
     })
 }
 
+fn pattern_ident(s: &str) -> Ident {
+    let mut chars = s.chars();
+    let simple_upper = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if simple_upper {
+        Ident::new(s)
+    } else {
+        Ident::with_quote('"', s)
+    }
+}
+
+fn build_unparse_meta_map(symbol: Option<&str>) -> HashMap<String, SqlExpr> {
+    let mut meta_map = HashMap::new();
+    let cls_args = symbol
+        .map(|s| {
+            vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                SqlExpr::Identifier(pattern_ident(s)),
+            ))]
+        })
+        .unwrap_or_default();
+    meta_map.insert(
+        crate::logical::AGG_META_CLASSIFIER_COL.to_string(),
+        make_func("CLASSIFIER", cls_args, false),
+    );
+    meta_map.insert(
+        crate::logical::AGG_META_MATCH_NUMBER_COL.to_string(),
+        make_func("MATCH_NUMBER", vec![], false),
+    );
+    meta_map
+}
+
 fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
     match expr {
-        SqlExpr::Identifier(id) => SqlExpr::CompoundIdentifier(vec![Ident::new(sym), id]),
+        SqlExpr::Identifier(id) => SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), id]),
         SqlExpr::CompoundIdentifier(mut ids) => {
             let col = ids.pop().expect("non-empty compound identifier");
-            SqlExpr::CompoundIdentifier(vec![Ident::new(sym), col])
+            SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), col])
         }
         SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
             left: Box::new(qualify_identifiers(*left, sym)),
@@ -409,6 +441,128 @@ fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
             expr: Box::new(qualify_identifiers(*expr, sym)),
         },
         SqlExpr::Nested(inner) => SqlExpr::Nested(Box::new(qualify_identifiers(*inner, sym))),
+        SqlExpr::IsNull(inner) => SqlExpr::IsNull(Box::new(qualify_identifiers(*inner, sym))),
+        SqlExpr::IsNotNull(inner) => SqlExpr::IsNotNull(Box::new(qualify_identifiers(*inner, sym))),
+        SqlExpr::IsDistinctFrom(l, r) => SqlExpr::IsDistinctFrom(
+            Box::new(qualify_identifiers(*l, sym)),
+            Box::new(qualify_identifiers(*r, sym)),
+        ),
+        SqlExpr::IsNotDistinctFrom(l, r) => SqlExpr::IsNotDistinctFrom(
+            Box::new(qualify_identifiers(*l, sym)),
+            Box::new(qualify_identifiers(*r, sym)),
+        ),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::Like {
+            negated,
+            any,
+            expr: Box::new(qualify_identifiers(*expr, sym)),
+            pattern: Box::new(qualify_identifiers(*pattern, sym)),
+            escape_char,
+        },
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::ILike {
+            negated,
+            any,
+            expr: Box::new(qualify_identifiers(*expr, sym)),
+            pattern: Box::new(qualify_identifiers(*pattern, sym)),
+            escape_char,
+        },
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => SqlExpr::Between {
+            expr: Box::new(qualify_identifiers(*expr, sym)),
+            negated,
+            low: Box::new(qualify_identifiers(*low, sym)),
+            high: Box::new(qualify_identifiers(*high, sym)),
+        },
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => SqlExpr::InList {
+            expr: Box::new(qualify_identifiers(*expr, sym)),
+            list: list
+                .into_iter()
+                .map(|e| qualify_identifiers(e, sym))
+                .collect(),
+            negated,
+        },
+        SqlExpr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => SqlExpr::Cast {
+            kind,
+            expr: Box::new(qualify_identifiers(*expr, sym)),
+            data_type,
+            format,
+        },
+        SqlExpr::Function(func) => {
+            let fname = func.name.to_string().to_ascii_lowercase();
+            if matches!(fname.as_str(), "classifier" | "match_number") {
+                return SqlExpr::Function(func);
+            }
+            let args = match func.args {
+                FunctionArguments::List(mut list) => {
+                    for arg in &mut list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            let owned =
+                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
+                            *e = qualify_identifiers(owned, sym);
+                        }
+                    }
+                    FunctionArguments::List(list)
+                }
+                other => other,
+            };
+            SqlExpr::Function(Function { args, ..func })
+        }
+        SqlExpr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => SqlExpr::Case {
+            case_token,
+            end_token,
+            operand: operand.map(|e| Box::new(qualify_identifiers(*e, sym))),
+            conditions: conditions
+                .into_iter()
+                .map(|c| ast::CaseWhen {
+                    condition: qualify_identifiers(c.condition, sym),
+                    result: qualify_identifiers(c.result, sym),
+                })
+                .collect(),
+            else_result: else_result.map(|e| Box::new(qualify_identifiers(*e, sym))),
+        },
+        SqlExpr::Array(ast::Array { elem, named }) => SqlExpr::Array(ast::Array {
+            elem: elem
+                .into_iter()
+                .map(|e| qualify_identifiers(e, sym))
+                .collect(),
+            named,
+        }),
+        SqlExpr::Tuple(elems) => SqlExpr::Tuple(
+            elems
+                .into_iter()
+                .map(|e| qualify_identifiers(e, sym))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -433,6 +587,60 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
         SqlExpr::Nested(inner) => SqlExpr::Nested(Box::new(substitute_slots(*inner, map))),
         SqlExpr::IsNull(inner) => SqlExpr::IsNull(Box::new(substitute_slots(*inner, map))),
         SqlExpr::IsNotNull(inner) => SqlExpr::IsNotNull(Box::new(substitute_slots(*inner, map))),
+        SqlExpr::IsDistinctFrom(l, r) => SqlExpr::IsDistinctFrom(
+            Box::new(substitute_slots(*l, map)),
+            Box::new(substitute_slots(*r, map)),
+        ),
+        SqlExpr::IsNotDistinctFrom(l, r) => SqlExpr::IsNotDistinctFrom(
+            Box::new(substitute_slots(*l, map)),
+            Box::new(substitute_slots(*r, map)),
+        ),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::Like {
+            negated,
+            any,
+            expr: Box::new(substitute_slots(*expr, map)),
+            pattern: Box::new(substitute_slots(*pattern, map)),
+            escape_char,
+        },
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => SqlExpr::ILike {
+            negated,
+            any,
+            expr: Box::new(substitute_slots(*expr, map)),
+            pattern: Box::new(substitute_slots(*pattern, map)),
+            escape_char,
+        },
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => SqlExpr::Between {
+            expr: Box::new(substitute_slots(*expr, map)),
+            negated,
+            low: Box::new(substitute_slots(*low, map)),
+            high: Box::new(substitute_slots(*high, map)),
+        },
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => SqlExpr::InList {
+            expr: Box::new(substitute_slots(*expr, map)),
+            list: list.into_iter().map(|e| substitute_slots(e, map)).collect(),
+            negated,
+        },
         SqlExpr::Cast {
             kind,
             expr,
@@ -479,6 +687,16 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
                 .collect(),
             else_result: else_result.map(|e| Box::new(substitute_slots(*e, map))),
         },
+        SqlExpr::Array(ast::Array { elem, named }) => SqlExpr::Array(ast::Array {
+            elem: elem.into_iter().map(|e| substitute_slots(e, map)).collect(),
+            named,
+        }),
+        SqlExpr::Tuple(elems) => SqlExpr::Tuple(
+            elems
+                .into_iter()
+                .map(|e| substitute_slots(e, map))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -486,14 +704,14 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
 fn unparse_pattern(p: &Pattern) -> Result<SqlPattern> {
     match p {
         Pattern::Symbol(sym) => Ok(SqlPattern::Symbol(match sym {
-            SymbolRef::Named(s) => SqlSymbol::Named(Ident::new(s)),
+            SymbolRef::Named(s) => SqlSymbol::Named(pattern_ident(s)),
             SymbolRef::Start => SqlSymbol::Start,
             SymbolRef::End => SqlSymbol::End,
         })),
         Pattern::Exclude(inner) => match inner.as_ref() {
             Pattern::Symbol(sym) => Ok(SqlPattern::Group(Box::new(SqlPattern::Exclude(
                 match sym {
-                    SymbolRef::Named(s) => SqlSymbol::Named(Ident::new(s)),
+                    SymbolRef::Named(s) => SqlSymbol::Named(pattern_ident(s)),
                     SymbolRef::Start => SqlSymbol::Start,
                     SymbolRef::End => SqlSymbol::End,
                 },
@@ -505,7 +723,7 @@ fn unparse_pattern(p: &Pattern) -> Result<SqlPattern> {
             for item in items {
                 match item {
                     Pattern::Symbol(SymbolRef::Named(s)) => {
-                        syms.push(SqlSymbol::Named(Ident::new(s)))
+                        syms.push(SqlSymbol::Named(pattern_ident(s)))
                     }
                     _ => return plan_err!("sqlparser 0.63.0 PERMUTE expects named symbols"),
                 }

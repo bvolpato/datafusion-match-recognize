@@ -89,6 +89,27 @@ impl MatchRecognizeNode {
             let mut out = Vec::with_capacity(slots.len());
             for slot in slots {
                 let kind = match slot.kind {
+                    MeasureSlotKind::Nav {
+                        logical_nav,
+                        logical_offset,
+                        physical_nav,
+                        physical_offset,
+                        symbol,
+                        inner_expr,
+                        uses_match_metadata: true,
+                    } => {
+                        let mut rewriter = TypeCoercionRewriter::new(&meta_schema);
+                        let coerced_inner = inner_expr.rewrite(&mut rewriter)?.data;
+                        MeasureSlotKind::Nav {
+                            logical_nav,
+                            logical_offset,
+                            physical_nav,
+                            physical_offset,
+                            symbol,
+                            inner_expr: coerced_inner,
+                            uses_match_metadata: true,
+                        }
+                    }
                     MeasureSlotKind::Agg {
                         agg_kind,
                         symbol,
@@ -237,8 +258,19 @@ pub fn slot_data_type_and_nullability(
     match &slot.kind {
         MeasureSlotKind::MatchNumber => Ok((DataType::Int64, unmatched)),
         MeasureSlotKind::Classifier { .. } => Ok((DataType::Utf8, true)),
-        MeasureSlotKind::Nav { inner_expr, .. } => {
-            let dt = inner_expr.get_type(input_schema)?;
+        MeasureSlotKind::Nav {
+            inner_expr,
+            uses_match_metadata,
+            ..
+        } => {
+            let meta_schema_owned;
+            let eval_schema: &DFSchema = if *uses_match_metadata {
+                meta_schema_owned = build_agg_metadata_dfschema(input_schema)?;
+                &meta_schema_owned
+            } else {
+                input_schema
+            };
+            let dt = inner_expr.get_type(eval_schema)?;
             Ok((dt, true))
         }
         MeasureSlotKind::CurrentRow { inner_expr } => {
@@ -358,6 +390,10 @@ pub fn compute_output_schema(
         }
     }
 
+    if fields.is_empty() {
+        return plan_err!("MATCH_RECOGNIZE output table has no columns");
+    }
+
     let arrow_schema = Schema::new(fields);
     Ok(Arc::new(DFSchema::try_from(arrow_schema)?))
 }
@@ -377,8 +413,16 @@ fn sum_result_type(dt: &DataType) -> Result<DataType> {
 fn push_slot_exprs(slots: &[MeasureSlot], exprs: &mut Vec<Expr>) {
     for slot in slots {
         match &slot.kind {
-            MeasureSlotKind::Nav { inner_expr, .. }
-            | MeasureSlotKind::CurrentRow { inner_expr } => {
+            MeasureSlotKind::Nav {
+                inner_expr,
+                uses_match_metadata,
+                ..
+            } => {
+                if !uses_match_metadata {
+                    exprs.push(inner_expr.clone());
+                }
+            }
+            MeasureSlotKind::CurrentRow { inner_expr } => {
                 exprs.push(inner_expr.clone());
             }
             MeasureSlotKind::Agg {
@@ -410,17 +454,26 @@ fn rebuild_slots_from_iter(
                 physical_nav,
                 physical_offset,
                 symbol,
-                ..
-            } => MeasureSlotKind::Nav {
-                logical_nav: *logical_nav,
-                logical_offset: *logical_offset,
-                physical_nav: *physical_nav,
-                physical_offset: *physical_offset,
-                symbol: symbol.clone(),
-                inner_expr: iter.next().ok_or_else(|| {
-                    plan_datafusion_err!("MatchRecognize: missing nav slot expression")
-                })?,
-            },
+                inner_expr,
+                uses_match_metadata,
+            } => {
+                let new_inner = if *uses_match_metadata {
+                    inner_expr.clone()
+                } else {
+                    iter.next().ok_or_else(|| {
+                        plan_datafusion_err!("MatchRecognize: missing nav slot expression")
+                    })?
+                };
+                MeasureSlotKind::Nav {
+                    logical_nav: *logical_nav,
+                    logical_offset: *logical_offset,
+                    physical_nav: *physical_nav,
+                    physical_offset: *physical_offset,
+                    symbol: symbol.clone(),
+                    inner_expr: new_inner,
+                    uses_match_metadata: *uses_match_metadata,
+                }
+            }
             MeasureSlotKind::CurrentRow { .. } => MeasureSlotKind::CurrentRow {
                 inner_expr: iter.next().ok_or_else(|| {
                     plan_datafusion_err!("MatchRecognize: missing current_row slot expression")
@@ -640,26 +693,36 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         for def in &self.definitions {
             if let SymbolDefKind::Stateful { slots, .. } = &def.kind {
                 for slot in slots {
-                    if let MeasureSlotKind::Agg {
-                        args,
-                        uses_match_metadata: true,
-                        ..
-                    } = &slot.kind
-                    {
-                        all_exprs.extend(args.iter().cloned());
+                    match &slot.kind {
+                        MeasureSlotKind::Agg {
+                            args,
+                            uses_match_metadata: true,
+                            ..
+                        } => all_exprs.extend(args.iter().cloned()),
+                        MeasureSlotKind::Nav {
+                            inner_expr,
+                            uses_match_metadata: true,
+                            ..
+                        } => all_exprs.push(inner_expr.clone()),
+                        _ => {}
                     }
                 }
             }
         }
         for m in &self.measures {
             for slot in &m.slots {
-                if let MeasureSlotKind::Agg {
-                    args,
-                    uses_match_metadata: true,
-                    ..
-                } = &slot.kind
-                {
-                    all_exprs.extend(args.iter().cloned());
+                match &slot.kind {
+                    MeasureSlotKind::Agg {
+                        args,
+                        uses_match_metadata: true,
+                        ..
+                    } => all_exprs.extend(args.iter().cloned()),
+                    MeasureSlotKind::Nav {
+                        inner_expr,
+                        uses_match_metadata: true,
+                        ..
+                    } => all_exprs.push(inner_expr.clone()),
+                    _ => {}
                 }
             }
         }

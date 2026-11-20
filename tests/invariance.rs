@@ -709,6 +709,7 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
                     physical_offset: 0,
                     symbol: Some("u".into()),
                     inner_expr: col("val"),
+                    uses_match_metadata: false,
                 },
             }],
         },
@@ -725,6 +726,7 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
                     physical_offset: 0,
                     symbol: Some("u".into()),
                     inner_expr: col("val"),
+                    uses_match_metadata: false,
                 },
             }],
         },
@@ -1029,4 +1031,90 @@ async fn test_sql_unparser_roundtrip() {
         roundtrip, expected,
         "Unparsed SQL roundtrip mismatch!\nUnparsed SQL:\n{unparsed_sql}"
     );
+}
+
+#[tokio::test]
+async fn test_aliased_filter_pushdown_and_quoted_unparser_roundtrip() {
+    use datafusion_expr::logical_plan::LogicalPlan;
+    use datafusion_match_recognize::MatchRecognizeUnparser;
+    use datafusion_sql::unparser::Unparser;
+
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new().with_batch_size(2),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
+    ctx.register_batch("events", make_multi_partition_events())
+        .unwrap();
+
+    // 1. Aliased MATCH_RECOGNIZE (...) AS m with WHERE m.user_id = 'u1' AND m.total_amt > 10
+    let aliased_sql = r#"
+        SELECT m.user_id, m.mn, m.total_amt FROM events
+        MATCH_RECOGNIZE (
+            PARTITION BY user_id
+            ORDER BY ts
+            MEASURES MATCH_NUMBER() AS mn, SUM(amount) AS total_amt
+            ONE ROW PER MATCH
+            PATTERN (a b* c)
+            DEFINE a AS event = 'view', b AS event = 'click', c AS event = 'buy'
+        ) AS m
+        WHERE m.user_id = 'u1' AND m.total_amt > 10
+        ORDER BY m.mn
+    "#;
+    let df = ctx.sql(aliased_sql).await.unwrap();
+    let explain = df
+        .clone()
+        .into_optimized_plan()
+        .unwrap()
+        .display_indent()
+        .to_string();
+    let mr_pos = explain.find("MatchRecognize:").expect("MatchRecognize");
+    assert!(
+        explain[mr_pos..].contains("Filter:"),
+        "Expected partition filter pushed below aliased MatchRecognize:\n{explain}"
+    );
+    let out = pretty_format_batches(&df.collect().await.unwrap())
+        .unwrap()
+        .to_string();
+    assert!(out.contains("u1") && out.contains("60") && out.contains("22"));
+
+    // 2. Unparser round-trip with quoted lowercase label "b", metadata agg, and LIKE
+    let unparse_sql = r#"
+        SELECT * FROM events
+        MATCH_RECOGNIZE (
+            PARTITION BY user_id
+            ORDER BY ts
+            MEASURES
+                MATCH_NUMBER() AS mn,
+                ARRAY_AGG(CLASSIFIER("b")) AS b_cls,
+                CLASSIFIER() LIKE 'b%' AS is_b
+            ALL ROWS PER MATCH
+            PATTERN (a "b"+ c)
+            DEFINE
+                a AS event LIKE 'vi%',
+                "b" AS event = 'click',
+                c AS event = 'buy'
+        )
+    "#;
+    let df2 = ctx.sql(unparse_sql).await.unwrap();
+    let expected2 = pretty_format_batches(&df2.clone().collect().await.unwrap())
+        .unwrap()
+        .to_string();
+
+    fn find_ext(plan: &LogicalPlan) -> Option<LogicalPlan> {
+        if matches!(plan, LogicalPlan::Extension(_)) {
+            return Some(plan.clone());
+        }
+        plan.inputs().into_iter().find_map(find_ext)
+    }
+    let mr_ext = find_ext(&df2.into_unoptimized_plan()).expect("MatchRecognize Extension");
+    let unparser =
+        Unparser::default().with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
+    let roundtrip_sql = unparser.plan_to_sql(&mr_ext).unwrap().to_string();
+    assert!(
+        roundtrip_sql.contains("\"b\""),
+        "Expected quoted lowercase label in unparsed SQL:\n{roundtrip_sql}"
+    );
+    let actual2 = run_and_format(&ctx, &roundtrip_sql).await;
+    assert_eq!(actual2, expected2, "Unparsed SQL:\n{roundtrip_sql}");
 }

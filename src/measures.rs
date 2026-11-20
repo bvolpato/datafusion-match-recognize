@@ -43,6 +43,7 @@ pub enum PhysicalMeasureSlotKind {
         symbol: Option<String>,
         symbol_set: Option<SymbolSet>,
         inner_expr: Arc<dyn PhysicalExpr>,
+        uses_match_metadata: bool,
     },
     Agg {
         agg_kind: AggKind,
@@ -116,8 +117,22 @@ impl<'a> PartitionStatefulEvaluator<'a> {
             let mut precomputed_args = Vec::with_capacity(def.slots.len());
             for slot in def.slots {
                 let arrs = match &slot.kind {
-                    PhysicalMeasureSlotKind::Nav { inner_expr, .. }
-                    | PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
+                    PhysicalMeasureSlotKind::Nav {
+                        inner_expr,
+                        uses_match_metadata,
+                        ..
+                    } => {
+                        if *uses_match_metadata {
+                            vec![]
+                        } else {
+                            vec![
+                                inner_expr
+                                    .evaluate(partition_batch)?
+                                    .into_array(num_part_rows)?,
+                            ]
+                        }
+                    }
+                    PhysicalMeasureSlotKind::CurrentRow { inner_expr } => {
                         vec![
                             inner_expr
                                 .evaluate(partition_batch)?
@@ -287,16 +302,17 @@ fn eval_single_slot_scalar(
             physical_nav,
             physical_offset,
             symbol_set,
+            inner_expr,
+            uses_match_metadata,
             ..
         } => {
-            let arr = &precomputed_args[0];
             let Some(base_row) = navigate_logical_row(
                 horizon,
                 *logical_nav,
                 *logical_offset as usize,
                 symbol_set.as_ref(),
             ) else {
-                return ScalarValue::try_from(arr.data_type());
+                return ScalarValue::try_from(&slot.data_type);
             };
             let Some(final_row) = navigate_physical(
                 base_row,
@@ -304,9 +320,21 @@ fn eval_single_slot_scalar(
                 *physical_offset as usize,
                 num_part_rows,
             ) else {
-                return ScalarValue::try_from(arr.data_type());
+                return ScalarValue::try_from(&slot.data_type);
             };
-            ScalarValue::try_from_array(arr.as_ref(), final_row)
+            if *uses_match_metadata {
+                let cls = classifier_at_partition_row(full_steps, final_row, program);
+                eval_metadata_nav_scalar(
+                    partition_batch,
+                    final_row,
+                    cls.as_deref(),
+                    match_number,
+                    inner_expr,
+                )
+            } else {
+                let arr = &precomputed_args[0];
+                ScalarValue::try_from_array(arr.as_ref(), final_row)
+            }
         }
         PhysicalMeasureSlotKind::Agg {
             agg_kind,
@@ -410,6 +438,55 @@ fn eval_classifier_on_horizon(
 
     let step = full_steps.get(final_idx)?;
     Some(program.id_to_symbol[step.sym as usize].clone())
+}
+
+/// Returns the classifier label mapped to `partition_row` within `full_steps`, or `None` if
+/// `partition_row` lies outside the match.
+fn classifier_at_partition_row(
+    full_steps: &[MatchStep],
+    partition_row: usize,
+    program: &Program,
+) -> Option<String> {
+    let first_row = full_steps.first()?.row_idx;
+    let rel = partition_row.checked_sub(first_row)?;
+    let step = full_steps.get(rel)?;
+    Some(program.id_to_symbol[step.sym as usize].clone())
+}
+
+/// Evaluates a navigation expression referencing `CLASSIFIER([sym])` or `MATCH_NUMBER()` on a
+/// single navigated partition row.
+fn eval_metadata_nav_scalar(
+    partition_batch: &RecordBatch,
+    row_idx: usize,
+    classifier: Option<&str>,
+    match_number: i64,
+    inner_expr: &Arc<dyn PhysicalExpr>,
+) -> Result<ScalarValue> {
+    let ext_schema = Arc::new(build_agg_metadata_arrow_schema(
+        partition_batch.schema().as_ref(),
+    ));
+    let take_idx = UInt32Array::from(vec![row_idx as u32]);
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(ext_schema.fields().len());
+    for col in partition_batch.columns() {
+        cols.push(compute::take(col.as_ref(), &take_idx, None)?);
+    }
+    let mut cls_builder = StringBuilder::with_capacity(1, 16);
+    match classifier {
+        Some(s) => cls_builder.append_value(s),
+        None => cls_builder.append_null(),
+    }
+    let mut mn_builder = Int64Builder::with_capacity(1);
+    mn_builder.append_value(match_number);
+    cols.push(Arc::new(cls_builder.finish()));
+    cols.push(Arc::new(mn_builder.finish()));
+
+    let row_batch = RecordBatch::try_new_with_options(
+        ext_schema,
+        cols,
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )?;
+    let arr = inner_expr.evaluate(&row_batch)?.into_array(1)?;
+    ScalarValue::try_from_array(arr.as_ref(), 0)
 }
 
 /// Evaluates an aggregate whose arguments reference runtime match metadata (`CLASSIFIER()` or
@@ -975,39 +1052,95 @@ fn evaluate_slot(
             physical_offset,
             symbol_set,
             inner_expr,
+            uses_match_metadata,
             ..
         } => {
-            let evaluated = inner_expr
-                .evaluate(partition_batch)?
-                .into_array(num_part_rows)?;
-            let indices = UInt32Array::from_iter(emitted.iter().map(|row| match row {
-                EmitRow::Unmatched { .. } => None,
-                EmitRow::Matched {
-                    found,
-                    step_pos,
-                    is_empty_match,
-                    ..
-                } => {
-                    if *is_empty_match {
-                        return None;
+            if *uses_match_metadata {
+                let mut scalars = Vec::with_capacity(out_len);
+                for row in emitted {
+                    match row {
+                        EmitRow::Unmatched { .. } => {
+                            scalars.push(ScalarValue::try_from(&slot.data_type)?);
+                        }
+                        EmitRow::Matched {
+                            found,
+                            step_pos,
+                            is_empty_match,
+                            ..
+                        } => {
+                            if *is_empty_match {
+                                scalars.push(ScalarValue::try_from(&slot.data_type)?);
+                            } else {
+                                let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                                let target = navigate_logical_row(
+                                    horizon,
+                                    *logical_nav,
+                                    *logical_offset as usize,
+                                    symbol_set.as_ref(),
+                                )
+                                .and_then(|base| {
+                                    navigate_physical(
+                                        base,
+                                        *physical_nav,
+                                        *physical_offset as usize,
+                                        num_part_rows,
+                                    )
+                                });
+                                match target {
+                                    None => scalars.push(ScalarValue::try_from(&slot.data_type)?),
+                                    Some(final_row) => {
+                                        let cls = classifier_at_partition_row(
+                                            &found.steps,
+                                            final_row,
+                                            program,
+                                        );
+                                        scalars.push(eval_metadata_nav_scalar(
+                                            partition_batch,
+                                            final_row,
+                                            cls.as_deref(),
+                                            found.match_number,
+                                            inner_expr,
+                                        )?);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    let horizon = horizon_steps(found, *step_pos, slot.semantics);
-                    let base_row = navigate_logical_row(
-                        horizon,
-                        *logical_nav,
-                        *logical_offset as usize,
-                        symbol_set.as_ref(),
-                    )?;
-                    let final_row = navigate_physical(
-                        base_row,
-                        *physical_nav,
-                        *physical_offset as usize,
-                        num_part_rows,
-                    )?;
-                    Some(final_row as u32)
                 }
-            }));
-            Ok(compute::take(evaluated.as_ref(), &indices, None)?)
+                ScalarValue::iter_to_array(scalars)
+            } else {
+                let evaluated = inner_expr
+                    .evaluate(partition_batch)?
+                    .into_array(num_part_rows)?;
+                let indices = UInt32Array::from_iter(emitted.iter().map(|row| match row {
+                    EmitRow::Unmatched { .. } => None,
+                    EmitRow::Matched {
+                        found,
+                        step_pos,
+                        is_empty_match,
+                        ..
+                    } => {
+                        if *is_empty_match {
+                            return None;
+                        }
+                        let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                        let base_row = navigate_logical_row(
+                            horizon,
+                            *logical_nav,
+                            *logical_offset as usize,
+                            symbol_set.as_ref(),
+                        )?;
+                        let final_row = navigate_physical(
+                            base_row,
+                            *physical_nav,
+                            *physical_offset as usize,
+                            num_part_rows,
+                        )?;
+                        Some(final_row as u32)
+                    }
+                }));
+                Ok(compute::take(evaluated.as_ref(), &indices, None)?)
+            }
         }
         PhysicalMeasureSlotKind::Agg {
             agg_kind,
@@ -1034,6 +1167,19 @@ fn evaluate_slot(
                             if *is_empty_match {
                                 if matches!(agg_kind, AggKind::Count) {
                                     scalars.push(ScalarValue::Int64(Some(0)));
+                                } else if matches!(agg_kind, AggKind::Udaf(_)) {
+                                    scalars.push(eval_metadata_agg_scalar(
+                                        partition_batch,
+                                        &[],
+                                        found.match_number,
+                                        program,
+                                        agg_kind,
+                                        symbol_set.as_ref(),
+                                        args,
+                                        *distinct,
+                                        *arg_physical_nav,
+                                        &slot.data_type,
+                                    )?);
                                 } else {
                                     scalars.push(ScalarValue::try_from(&slot.data_type)?);
                                 }
@@ -1304,6 +1450,19 @@ fn evaluate_agg_slot(
                 if *is_empty_match {
                     if matches!(agg_kind, AggKind::Count) {
                         scalars.push(ScalarValue::Int64(Some(0)));
+                    } else if matches!(agg_kind, AggKind::Udaf(_)) {
+                        scalars.push(eval_single_agg_scalar(
+                            &[],
+                            num_part_rows,
+                            input_schema.as_ref(),
+                            agg_kind,
+                            symbol_set,
+                            arg_exprs,
+                            distinct,
+                            arg_physical_nav,
+                            &prepared_args,
+                            result_type,
+                        )?);
                     } else {
                         scalars.push(ScalarValue::try_from(scalar_dt)?);
                     }

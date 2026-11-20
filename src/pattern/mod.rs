@@ -371,6 +371,11 @@ impl<'a> Compiler<'a> {
         reluctant: bool,
     ) -> Result<()> {
         if let Some(max_val) = max {
+            if max_val == 0 {
+                return plan_err!(
+                    "Pattern quantifier upper bound must be greater than or equal to 1"
+                );
+            }
             if min > max_val {
                 return plan_err!("Invalid quantifier bounds: min ({min}) exceeds max ({max_val})");
             }

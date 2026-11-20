@@ -1326,13 +1326,210 @@ async fn test_live_trino_differential_oracle() {
             ) AS T
             "#,
         ),
+        (
+            "trino_desugar_like_in_aggs",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3))
+            SELECT m.id, m.classy, m.m1, m.m2 FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    CLASSIFIER() AS classy,
+                    CLASSIFIER() LIKE '%X' AS m1,
+                    bool_or(CLASSIFIER() LIKE '%B') AS m2
+                ALL ROWS PER MATCH
+                AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((A | B)* X)
+                DEFINE X AS PREV(CLASSIFIER()) LIKE '%B' AND bool_or(CLASSIFIER() LIKE '%A')
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_decimal_sum_in_define",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3))
+            SELECT m.id, m.classy FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES CLASSIFIER() AS classy
+                ALL ROWS PER MATCH
+                PATTERN ((A | B)* X)
+                DEFINE X AS sum(CAST(B.id AS DECIMAL(10, 2))) = 1.0
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_classifier_inside_nav_scalar_expr",
+            r#"
+            WITH t(id, val) AS (VALUES (1, 10), (2, 20), (3, 30))
+            SELECT m.id, m.cls, m.prev_lower_cls, m.a_len_plus_id FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES
+                    CLASSIFIER() AS cls,
+                    PREV(LAST(lower(CLASSIFIER()))) AS prev_lower_cls,
+                    LAST(length(CLASSIFIER(A)) + A.id + 1) AS a_len_plus_id
+                ALL ROWS PER MATCH
+                PATTERN (A B+)
+                DEFINE A AS id = 1, B AS id > 1
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_direct_match_number_in_define",
+            r#"
+            WITH t(id) AS (VALUES (1), (2), (3))
+            SELECT m.id, m.mn, m.cls FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES MATCH_NUMBER() AS mn, CLASSIFIER() AS cls
+                ALL ROWS PER MATCH
+                PATTERN (A | B)
+                DEFINE A AS MATCH_NUMBER() = 1, B AS MATCH_NUMBER() = 2
+            ) AS m
+            ORDER BY m.id
+            "#,
+        ),
+        (
+            "trino_aliased_filter_pushdown_and_null_order_by",
+            r#"
+            WITH t(p, id, v) AS (
+                VALUES
+                    ('p1', CAST(NULL AS INTEGER), 100),
+                    ('p1', 1, 10),
+                    ('p1', 2, 20),
+                    ('p2', 1, 5),
+                    ('p2', 2, 6)
+            )
+            SELECT m.p, m.mn, m.k, m.fv FROM t
+            MATCH_RECOGNIZE (
+                PARTITION BY p
+                ORDER BY id ASC NULLS FIRST
+                MEASURES MATCH_NUMBER() AS mn, 42 AS k, FIRST(v) AS fv
+                ONE ROW PER MATCH
+                PATTERN (A B)
+                DEFINE A AS v >= 5, B AS v >= 6
+            ) AS m
+            WHERE m.p = 'p1' AND m.fv >= 50
+            "#,
+        ),
+        // Negative semantic & runtime error parity checks from Trino TestAnalyzer.java
+        (
+            "err_parity_zero_quantifier",
+            r#"
+            WITH t(id) AS (VALUES (1))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES MATCH_NUMBER() AS mn PATTERN (A{0}) DEFINE A AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_no_output_columns",
+            r#"
+            WITH t(id) AS (VALUES (1))
+            SELECT * FROM t MATCH_RECOGNIZE (ORDER BY id ONE ROW PER MATCH PATTERN (A) DEFINE A AS true)
+            "#,
+        ),
+        (
+            "err_parity_mixed_labeled_unlabeled_nav",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES PREV(LAST(A.v + v)) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_mixed_labeled_unlabeled_agg",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES count(B.v < 5 OR v > 5) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_nested_nav_last_next",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES LAST(NEXT(v, 2)) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_non_immediate_nav_nesting",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES PREV(LAST(v, 2) + 5) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_nested_agg",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES max(1 + min(v)) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_logical_nav_in_agg",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES max(1 + LAST(v)) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_window_in_measures",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES max(v) OVER () AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_filter_in_agg",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES max(v) FILTER (WHERE true) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_const_only_nav",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES PREV(LAST('no_column')) AS x PATTERN (A B+) DEFINE B AS true
+            )
+            "#,
+        ),
+        (
+            "err_parity_skip_unmatched_optional",
+            r#"
+            WITH t(id, v) AS (VALUES (1, 10), (2, 20))
+            SELECT * FROM t MATCH_RECOGNIZE (
+                ORDER BY id MEASURES MATCH_NUMBER() AS mn AFTER MATCH SKIP TO LAST D PATTERN (A B+ D?) DEFINE B AS true, D AS false
+            )
+            "#,
+        ),
     ];
 
     for (name, sql) in &edge_cases {
         assert_matches_trino(&client, &base_url, name, sql).await;
     }
 
-    // 6. Seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (100 queries)
+    // 6. Augmented seeded PRNG randomized SQL + randomized table fuzzer vs live Trino 484 (150 queries)
     let mut rng_state: u64 = 0x5EED_CAFE_1234_ABCD;
     let mut next_u64 = || -> u64 {
         rng_state ^= rng_state << 13;
@@ -1363,15 +1560,30 @@ async fn test_live_trino_differential_oracle() {
         ("a*", "a AS v >= 2 AND v <= 6", false),
         ("({- a -}) b+", "a AS v <= 4, b AS v >= 3", true),
         ("({- a -}) | b", "a AS v <= 3, b AS v >= 5", true),
+        (
+            "a{0,2} b+",
+            "a AS v <= 5 AND MATCH_NUMBER() <= 3, b AS v >= 4",
+            false,
+        ),
+        ("^ a+ b*", "a AS v >= 2, b AS b.v >= PREV(b.v)", false),
+        (
+            "a+ b $",
+            "a AS v <= 6, b AS PREV(CLASSIFIER()) = 'A' AND b.v >= 2",
+            false,
+        ),
     ];
-    let rand_orders = ["ORDER BY id ASC", "ORDER BY id DESC NULLS FIRST"];
+    let rand_orders = [
+        "ORDER BY id ASC NULLS LAST",
+        "ORDER BY id DESC NULLS FIRST",
+        "ORDER BY id ASC NULLS FIRST",
+    ];
     let rand_skips = [
         "AFTER MATCH SKIP PAST LAST ROW",
         "AFTER MATCH SKIP TO NEXT ROW",
     ];
 
     let mut random_checked = 0usize;
-    for q in 0..100usize {
+    for q in 0..150usize {
         let num_parts = (next_u64() % 3 + 1) as usize;
         let mut value_rows = Vec::new();
         for p in 1..=num_parts {
@@ -1392,23 +1604,28 @@ async fn test_live_trino_differential_oracle() {
         let skip = rand_skips[(next_u64() as usize) % rand_skips.len()];
         let mode_choice = (next_u64() % 4) as usize;
         let (mode, outer_ord) = match mode_choice {
-            0 => ("ONE ROW PER MATCH", "ORDER BY p, mn"),
+            0 => ("ONE ROW PER MATCH", "ORDER BY m.p, m.mn"),
             1 => (
                 "ALL ROWS PER MATCH OMIT EMPTY MATCHES",
-                "ORDER BY p, mn, id",
+                "ORDER BY m.p, m.mn, m.id",
             ),
             2 => (
                 "ALL ROWS PER MATCH SHOW EMPTY MATCHES",
-                "ORDER BY p, mn, id NULLS FIRST",
+                "ORDER BY m.p, m.mn, m.id NULLS FIRST",
             ),
             _ if !has_excl => (
                 "ALL ROWS PER MATCH WITH UNMATCHED ROWS",
-                "ORDER BY p, id, mn NULLS FIRST",
+                "ORDER BY m.p, m.id, m.mn NULLS FIRST",
             ),
             _ => (
                 "ALL ROWS PER MATCH SHOW EMPTY MATCHES",
-                "ORDER BY p, mn, id NULLS FIRST",
+                "ORDER BY m.p, m.mn, m.id NULLS FIRST",
             ),
+        };
+        let where_clause = if (next_u64() % 4) == 0 {
+            "WHERE m.p >= 1"
+        } else {
+            ""
         };
 
         let sql = format!(
@@ -1423,6 +1640,7 @@ async fn test_live_trino_differential_oracle() {
                     FIRST(CLASSIFIER()) AS f_cls,
                     LAST(CLASSIFIER()) AS l_cls,
                     NEXT(CLASSIFIER()) AS n_cls,
+                    PREV(LAST(lower(CLASSIFIER()))) AS p_lcls,
                     ARRAY_AGG(CLASSIFIER()) AS cls_arr,
                     FIRST(v) AS fv,
                     LAST(v) AS lv,
@@ -1432,7 +1650,8 @@ async fn test_live_trino_differential_oracle() {
                 {skip}
                 PATTERN ({pat})
                 DEFINE {defs}
-            )
+            ) AS m
+            {where_clause}
             {outer_ord}
             "#
         );

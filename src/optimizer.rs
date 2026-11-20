@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::optimizer::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion_common::tree_node::Transformed;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, Result};
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{Extension, Filter, LogicalPlan};
@@ -72,17 +72,34 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             let mut cols: HashSet<Column> = HashSet::new();
             expr_to_columns(pred, &mut cols)?;
             if !cols.is_empty() && cols.iter().all(|c| partition_col_names.contains(&c.name)) {
-                // Rewrite column qualifiers to match input schema.
-                let mut valid_on_input = true;
+                // Rewrite column qualifiers to match input schema (dropping any MATCH_RECOGNIZE alias).
                 let input_schema = mr_node.input.schema();
+                let mut valid_on_input = true;
                 for c in &cols {
-                    if input_schema.field_with_unqualified_name(&c.name).is_err() {
+                    if input_schema
+                        .qualified_field_with_unqualified_name(&c.name)
+                        .is_err()
+                    {
                         valid_on_input = false;
                         break;
                     }
                 }
                 if valid_on_input {
-                    pushable.push(pred.clone());
+                    let rewritten = pred
+                        .clone()
+                        .transform(|e| match e {
+                            Expr::Column(c) => {
+                                let (qual, field) =
+                                    input_schema.qualified_field_with_unqualified_name(&c.name)?;
+                                Ok(Transformed::yes(Expr::Column(Column::new(
+                                    qual.cloned(),
+                                    field.name(),
+                                ))))
+                            }
+                            other => Ok(Transformed::no(other)),
+                        })?
+                        .data;
+                    pushable.push(rewritten);
                     continue;
                 }
             }
