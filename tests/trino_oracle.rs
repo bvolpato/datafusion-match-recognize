@@ -1651,24 +1651,24 @@ async fn test_live_trino_differential_oracle() {
             "#,
         ),
         (
-            "audit_define_null_and_table_qualifier_with_classifier_trino",
+            "audit_define_null_and_case_agg_with_classifier_trino",
             r#"
             WITH ev(i, v) AS (VALUES (1, 10), (2, 20), (3, 30))
-            SELECT tags, fa, sa, b_hi, b_zero FROM ev AS t
+            SELECT tags, fa, sa, b_hi, b_zero FROM ev
             MATCH_RECOGNIZE (
                 ORDER BY i
                 MEASURES
-                    array_agg(CAST(t.i AS VARCHAR) || ':' || CLASSIFIER()) AS tags,
-                    FIRST(abs(t.v)) AS fa,
-                    SUM(CASE WHEN CLASSIFIER() = 'A' THEN t.v END) AS sa,
+                    array_agg(CAST(i AS VARCHAR) || ':' || CLASSIFIER()) AS tags,
+                    FIRST(abs(v)) AS fa,
+                    SUM(CASE WHEN CLASSIFIER() = 'A' THEN v END) AS sa,
                     COUNT(CASE WHEN B.v >= 30 THEN 1 END) AS b_hi,
                     COUNT(CASE WHEN C.v > 0 THEN 1 END) AS b_zero
                 ONE ROW PER MATCH
                 PATTERN (A B+ C*)
                 DEFINE
-                    A AS t.v = 10 AND CLASSIFIER() = 'A' AND LAST(CLASSIFIER()) = 'A',
-                    B AS t.v > 10 AND CLASSIFIER() = 'B',
-                    C AS NULL
+                    A AS v = 10 AND CLASSIFIER() = 'A' AND LAST(CLASSIFIER()) = 'A',
+                    B AS v > 10 AND CLASSIFIER() = 'B',
+                    C AS CAST(NULL AS BOOLEAN)
             )
             "#,
         ),
