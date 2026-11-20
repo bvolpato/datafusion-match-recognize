@@ -184,6 +184,13 @@ async fn test_slt_duckdb_ported_suite() {
 }
 
 #[tokio::test]
+async fn test_slt_oracle_and_ecosystem_suite() {
+    for &(bs, tp) in &[(8192, 1), (2, 4)] {
+        run_slt_file("tests/slt/oracle_and_ecosystem_suite.slt", bs, tp).await;
+    }
+}
+
+#[tokio::test]
 async fn test_slt_negative_validation() {
     run_slt_file("tests/slt/negative_validation.slt", 8192, 1).await;
 }

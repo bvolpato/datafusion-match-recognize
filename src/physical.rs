@@ -1469,6 +1469,9 @@ fn evaluate_batch_symbols(
                 }
                 CompiledSymbolEval::Stateless(predicate) => {
                     let evaluated = predicate.evaluate(batch)?.into_array(num_rows)?;
+                    if evaluated.data_type() == &DataType::Null {
+                        continue;
+                    }
                     let bool_arr = evaluated
                         .as_any()
                         .downcast_ref::<BooleanArray>()
@@ -1517,6 +1520,10 @@ fn evaluate_batch_symbols(
             CompiledSymbolEval::ImplicitTrue => columns.push(vec![true; num_rows]),
             CompiledSymbolEval::Stateless(predicate) => {
                 let evaluated = predicate.evaluate(batch)?.into_array(num_rows)?;
+                if evaluated.data_type() == &DataType::Null {
+                    columns.push(vec![false; num_rows]);
+                    continue;
+                }
                 let bool_arr = evaluated
                     .as_any()
                     .downcast_ref::<BooleanArray>()

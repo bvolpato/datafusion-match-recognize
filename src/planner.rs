@@ -155,6 +155,7 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                     RowsPerMatch::OneRow,
                 )?;
                 let outer_expr = ctx.sql_to_expr(rewritten_sql, &slot_schema)?;
+                validate_define_expr_type(&name, &outer_expr, &slot_schema)?;
                 planned_definitions.push(SymbolDef {
                     name,
                     kind: SymbolDefKind::Stateful { outer_expr, slots },
@@ -163,6 +164,7 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                 validate_no_illegal_function_clauses(&sym_def.definition)?;
                 let stripped = strip_self_qualifier(sym_def.definition, &name);
                 let predicate = ctx.sql_to_expr(stripped, input_schema.as_ref())?;
+                validate_define_expr_type(&name, &predicate, input_schema.as_ref())?;
                 planned_definitions.push(SymbolDef {
                     name,
                     kind: SymbolDefKind::Stateless { predicate },
@@ -329,7 +331,7 @@ fn is_stateful_define(
 ) -> bool {
     match expr {
         SqlExpr::CompoundIdentifier(idents) => {
-            if idents.len() == 2 {
+            if idents.len() >= 2 {
                 let prefix = normalize_pattern_ident(idents[0].clone());
                 if prefix != current_symbol && known_symbols.contains(&prefix) {
                     return true;
@@ -422,11 +424,17 @@ fn is_stateful_define(
             .iter()
             .any(|e| is_stateful_define(e, current_symbol, known_symbols, ctx)),
         SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            if let SqlExpr::Identifier(id) = root.as_ref()
+                && matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)))
+            {
+                let prefix = normalize_pattern_ident(id.clone());
+                if prefix != current_symbol && known_symbols.contains(&prefix) {
+                    return true;
+                }
+            }
             is_stateful_define(root, current_symbol, known_symbols, ctx)
                 || access_chain.iter().any(|a| match a {
-                    ast::AccessExpr::Dot(e) => {
-                        is_stateful_define(e, current_symbol, known_symbols, ctx)
-                    }
+                    ast::AccessExpr::Dot(_) => false,
                     ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
                         is_stateful_define(index, current_symbol, known_symbols, ctx)
                     }
@@ -480,11 +488,14 @@ fn is_stateful_define(
 fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
     match expr {
         SqlExpr::CompoundIdentifier(mut idents) => {
-            if idents.len() == 2
+            if idents.len() >= 2
                 && normalize_pattern_ident(idents[0].clone()) == current_symbol
-                && let Some(col) = idents.pop()
             {
-                return SqlExpr::Identifier(col);
+                idents.remove(0);
+                if idents.len() == 1 {
+                    return SqlExpr::Identifier(idents.remove(0));
+                }
+                return SqlExpr::CompoundIdentifier(idents);
             }
             SqlExpr::CompoundIdentifier(idents)
         }
@@ -652,34 +663,50 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
                 .map(|e| strip_self_qualifier(e, current_symbol))
                 .collect(),
         ),
-        SqlExpr::CompoundFieldAccess { root, access_chain } => {
-            SqlExpr::CompoundFieldAccess {
-                root: Box::new(strip_self_qualifier(*root, current_symbol)),
-                access_chain: access_chain
-                    .into_iter()
-                    .map(|a| match a {
-                        ast::AccessExpr::Dot(e) => {
-                            ast::AccessExpr::Dot(strip_self_qualifier(e, current_symbol))
-                        }
-                        ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
-                            ast::AccessExpr::Subscript(ast::Subscript::Index {
-                                index: strip_self_qualifier(index, current_symbol),
-                            })
-                        }
-                        ast::AccessExpr::Subscript(ast::Subscript::Slice {
-                            lower_bound,
-                            upper_bound,
-                            stride,
-                        }) => ast::AccessExpr::Subscript(ast::Subscript::Slice {
-                            lower_bound: lower_bound
-                                .map(|e| strip_self_qualifier(e, current_symbol)),
-                            upper_bound: upper_bound
-                                .map(|e| strip_self_qualifier(e, current_symbol)),
-                            stride: stride
-                                .map(|e| strip_self_qualifier(e, current_symbol)),
-                        }),
-                    })
-                    .collect(),
+        SqlExpr::CompoundFieldAccess {
+            root,
+            mut access_chain,
+        } => {
+            let new_root = if let SqlExpr::Identifier(id) = root.as_ref()
+                && normalize_pattern_ident(id.clone()) == current_symbol
+                && matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)))
+            {
+                let ast::AccessExpr::Dot(first_field) = access_chain.remove(0) else {
+                    unreachable!()
+                };
+                first_field
+            } else {
+                strip_self_qualifier(*root, current_symbol)
+            };
+            let new_chain: Vec<ast::AccessExpr> = access_chain
+                .into_iter()
+                .map(|a| match a {
+                    ast::AccessExpr::Dot(e) => ast::AccessExpr::Dot(e),
+                    ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
+                        ast::AccessExpr::Subscript(ast::Subscript::Index {
+                            index: strip_self_qualifier(index, current_symbol),
+                        })
+                    }
+                    ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                        lower_bound,
+                        upper_bound,
+                        stride,
+                    }) => ast::AccessExpr::Subscript(ast::Subscript::Slice {
+                        lower_bound: lower_bound
+                            .map(|e| strip_self_qualifier(e, current_symbol)),
+                        upper_bound: upper_bound
+                            .map(|e| strip_self_qualifier(e, current_symbol)),
+                        stride: stride.map(|e| strip_self_qualifier(e, current_symbol)),
+                    }),
+                })
+                .collect();
+            if new_chain.is_empty() {
+                new_root
+            } else {
+                SqlExpr::CompoundFieldAccess {
+                    root: Box::new(new_root),
+                    access_chain: new_chain,
+                }
             }
         }
         SqlExpr::Between {
@@ -863,15 +890,18 @@ impl SlotExtractor<'_, '_> {
                     }
                 }
             }
-            SqlExpr::CompoundIdentifier(idents) => {
-                if idents.len() == 2 {
+            SqlExpr::CompoundIdentifier(mut idents) => {
+                if idents.len() >= 2 {
                     let prefix = normalize_pattern_ident(idents[0].clone());
                     if self.known_symbols.contains(&prefix) {
-                        let col_ident = idents[1].clone();
-                        let inner_expr = self.ctx.sql_to_expr(
-                            SqlExpr::Identifier(col_ident),
-                            self.input_schema,
-                        )?;
+                        idents.remove(0);
+                        let stripped = if idents.len() == 1 {
+                            SqlExpr::Identifier(idents.remove(0))
+                        } else {
+                            SqlExpr::CompoundIdentifier(idents)
+                        };
+                        let inner_expr =
+                            self.ctx.sql_to_expr(stripped, self.input_schema)?;
                         if self.current_define_symbol == Some(prefix.as_str()) {
                             return Ok(self
                                 .push_slot(MeasureSlotKind::CurrentRow { inner_expr }));
@@ -892,6 +922,13 @@ impl SlotExtractor<'_, '_> {
                     self.input_schema,
                 )?;
                 Ok(self.push_bare_column_slot(inner_expr))
+            }
+            SqlExpr::Subquery(_)
+            | SqlExpr::Exists { .. }
+            | SqlExpr::InSubquery { .. } => {
+                plan_err!(
+                    "Subqueries are not supported in MATCH_RECOGNIZE DEFINE/MEASURES"
+                )
             }
             SqlExpr::Identifier(ident) => {
                 let inner_expr = self
@@ -1055,14 +1092,49 @@ impl SlotExtractor<'_, '_> {
                     .map(|e| self.rewrite_outer(e))
                     .collect::<Result<Vec<_>>>()?,
             )),
-            SqlExpr::CompoundFieldAccess { root, access_chain } => {
+            SqlExpr::CompoundFieldAccess {
+                root,
+                mut access_chain,
+            } => {
+                if let SqlExpr::Identifier(id) = root.as_ref()
+                    && matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)))
+                {
+                    let prefix = normalize_pattern_ident(id.clone());
+                    if self.known_symbols.contains(&prefix) {
+                        let ast::AccessExpr::Dot(first_field) = access_chain.remove(0)
+                        else {
+                            unreachable!()
+                        };
+                        let stripped = if access_chain.is_empty() {
+                            first_field
+                        } else {
+                            SqlExpr::CompoundFieldAccess {
+                                root: Box::new(first_field),
+                                access_chain,
+                            }
+                        };
+                        let inner_expr =
+                            self.ctx.sql_to_expr(stripped, self.input_schema)?;
+                        if self.current_define_symbol == Some(prefix.as_str()) {
+                            return Ok(self
+                                .push_slot(MeasureSlotKind::CurrentRow { inner_expr }));
+                        }
+                        return Ok(self.push_slot(MeasureSlotKind::Nav {
+                            logical_nav: Some(LogicalNavKind::Last),
+                            logical_offset: 0,
+                            physical_nav: None,
+                            physical_offset: 0,
+                            symbol: Some(prefix),
+                            inner_expr,
+                            uses_match_metadata: false,
+                        }));
+                    }
+                }
                 let root = Box::new(self.rewrite_outer(*root)?);
                 let access_chain = access_chain
                     .into_iter()
                     .map(|a| match a {
-                        ast::AccessExpr::Dot(e) => {
-                            Ok(ast::AccessExpr::Dot(self.rewrite_outer(e)?))
-                        }
+                        ast::AccessExpr::Dot(e) => Ok(ast::AccessExpr::Dot(e)),
                         ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
                             Ok(ast::AccessExpr::Subscript(ast::Subscript::Index {
                                 index: self.rewrite_outer(index)?,
@@ -1428,9 +1500,14 @@ impl SlotExtractor<'_, '_> {
                             "{fname}({obj_name}.*) is not valid in MATCH_RECOGNIZE"
                         );
                     }
+                    if obj_name.0.len() != 1 {
+                        return plan_err!(
+                            "COUNT({obj_name}.*) must qualify a single pattern variable"
+                        );
+                    }
                     let ident = obj_name
                         .0
-                        .last()
+                        .first()
                         .and_then(|part| part.as_ident())
                         .ok_or_else(|| {
                             plan_datafusion_err!("Invalid qualified wildcard in COUNT")
@@ -1632,8 +1709,29 @@ fn validate_no_illegal_function_clauses(expr: &SqlExpr) -> Result<()> {
             }
             Ok(())
         }
+        SqlExpr::Subquery(_) | SqlExpr::Exists { .. } | SqlExpr::InSubquery { .. } => {
+            plan_err!("Subqueries are not supported in MATCH_RECOGNIZE DEFINE/MEASURES")
+        }
         _ => Ok(()),
     }
+}
+
+fn validate_define_expr_type(
+    symbol: &str,
+    expr: &datafusion_expr::Expr,
+    schema: &DFSchema,
+) -> Result<()> {
+    use datafusion_expr::ExprSchemable;
+    let dt = expr.get_type(schema)?;
+    if !matches!(
+        dt,
+        arrow_schema::DataType::Boolean | arrow_schema::DataType::Null
+    ) {
+        return plan_err!(
+            "DEFINE predicate for '{symbol}' must evaluate to Boolean, got {dt}"
+        );
+    }
+    Ok(())
 }
 
 fn unwrap_arg_physical_nav(
@@ -1800,17 +1898,26 @@ impl<'a> PatternArgAnalyzer<'a> {
             }
             SqlExpr::CompoundIdentifier(mut idents) => {
                 self.has_col_or_classifier = true;
-                if idents.len() == 2 {
+                if idents.len() >= 2 {
                     let prefix = normalize_pattern_ident(idents[0].clone());
-                    if self.known_symbols.contains(&prefix)
-                        && let Some(col) = idents.pop()
-                    {
+                    if self.known_symbols.contains(&prefix) {
                         self.record_label(prefix)?;
-                        return Ok(SqlExpr::Identifier(col));
+                        idents.remove(0);
+                        if idents.len() == 1 {
+                            return Ok(SqlExpr::Identifier(idents.remove(0)));
+                        }
+                        return Ok(SqlExpr::CompoundIdentifier(idents));
                     }
                 }
                 self.has_unlabeled = true;
                 Ok(SqlExpr::CompoundIdentifier(idents))
+            }
+            SqlExpr::Subquery(_)
+            | SqlExpr::Exists { .. }
+            | SqlExpr::InSubquery { .. } => {
+                plan_err!(
+                    "Subqueries are not supported in MATCH_RECOGNIZE DEFINE/MEASURES"
+                )
             }
             SqlExpr::Function(func) => {
                 check_function_clauses(&func)?;
@@ -2113,14 +2220,30 @@ impl<'a> PatternArgAnalyzer<'a> {
                     .map(|e| self.rewrite(e))
                     .collect::<Result<Vec<_>>>()?,
             )),
-            SqlExpr::CompoundFieldAccess { root, access_chain } => {
-                let root = Box::new(self.rewrite(*root)?);
-                let access_chain = access_chain
+            SqlExpr::CompoundFieldAccess {
+                root,
+                mut access_chain,
+            } => {
+                let new_root = if let SqlExpr::Identifier(id) = root.as_ref()
+                    && matches!(access_chain.first(), Some(ast::AccessExpr::Dot(_)))
+                    && self
+                        .known_symbols
+                        .contains(&normalize_pattern_ident(id.clone()))
+                {
+                    let prefix = normalize_pattern_ident(id.clone());
+                    self.record_label(prefix)?;
+                    self.has_col_or_classifier = true;
+                    let ast::AccessExpr::Dot(first_field) = access_chain.remove(0) else {
+                        unreachable!()
+                    };
+                    first_field
+                } else {
+                    self.rewrite(*root)?
+                };
+                let new_chain = access_chain
                     .into_iter()
                     .map(|a| match a {
-                        ast::AccessExpr::Dot(e) => {
-                            Ok(ast::AccessExpr::Dot(self.rewrite(e)?))
-                        }
+                        ast::AccessExpr::Dot(e) => Ok(ast::AccessExpr::Dot(e)),
                         ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
                             Ok(ast::AccessExpr::Subscript(ast::Subscript::Index {
                                 index: self.rewrite(index)?,
@@ -2141,7 +2264,14 @@ impl<'a> PatternArgAnalyzer<'a> {
                         })),
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(SqlExpr::CompoundFieldAccess { root, access_chain })
+                if new_chain.is_empty() {
+                    Ok(new_root)
+                } else {
+                    Ok(SqlExpr::CompoundFieldAccess {
+                        root: Box::new(new_root),
+                        access_chain: new_chain,
+                    })
+                }
             }
             other => Ok(other),
         }

@@ -271,15 +271,24 @@ pub const AGG_META_MATCH_NUMBER_COL: &str = "__mr_agg_match_number";
 
 /// Builds the extended `DFSchema` (`input_schema` + `__mr_agg_classifier` + `__mr_agg_match_number`)
 /// used to plan and type-check aggregate arguments referencing `CLASSIFIER()` or `MATCH_NUMBER()`.
+///
+/// Preserves existing table qualifiers on `input_schema` so table-qualified references such as
+/// `t.x` continue to resolve alongside `CLASSIFIER()` / `MATCH_NUMBER()`.
 pub fn build_agg_metadata_dfschema(input_schema: &DFSchema) -> Result<DFSchema> {
-    let mut fields: Vec<Field> = input_schema
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    fields.push(Field::new(AGG_META_CLASSIFIER_COL, DataType::Utf8, true));
-    fields.push(Field::new(AGG_META_MATCH_NUMBER_COL, DataType::Int64, true));
-    DFSchema::try_from(Schema::new(fields))
+    let mut qualified_fields: Vec<(Option<datafusion_common::TableReference>, FieldRef)> =
+        input_schema
+            .iter()
+            .map(|(qual, field)| (qual.cloned(), Arc::clone(field)))
+            .collect();
+    qualified_fields.push((
+        None,
+        Arc::new(Field::new(AGG_META_CLASSIFIER_COL, DataType::Utf8, true)),
+    ));
+    qualified_fields.push((
+        None,
+        Arc::new(Field::new(AGG_META_MATCH_NUMBER_COL, DataType::Int64, true)),
+    ));
+    DFSchema::new_with_metadata(qualified_fields, input_schema.metadata().clone())
 }
 
 /// Builds the extended Arrow `Schema` matching [`build_agg_metadata_dfschema`].

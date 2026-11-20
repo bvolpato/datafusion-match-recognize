@@ -990,6 +990,206 @@ async fn test_live_duckdb_differential_oracle() {
             ORDER BY company, match_number
             "#,
         ),
+        // Oracle Database (12c/19c/23ai), Calcite match.iq, Nexmark CEP, and deep edge cases
+        (
+            "oracle_w_shape_timestamp_decimal",
+            r#"
+            WITH tape(ticker, observed_at, quote) AS (
+                VALUES
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:05:00', CAST(60.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:06:00', CAST(54.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:07:00', CAST(48.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:08:00', CAST(57.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:09:00', CAST(63.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:10:00', CAST(51.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:11:00', CAST(44.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:12:00', CAST(58.00 AS DECIMAL(8, 2))),
+                    ('ZPHR', TIMESTAMP '2031-03-04 14:13:00', CAST(66.00 AS DECIMAL(8, 2)))
+            )
+            SELECT ticker, CAST(EXTRACT(MINUTE FROM run_start) AS INT) AS s_min,
+                   CAST(EXTRACT(MINUTE FROM run_end) AS INT) AS e_min, shape_no
+            FROM tape
+            MATCH_RECOGNIZE (
+                PARTITION BY ticker ORDER BY observed_at
+                MEASURES FIRST(observed_at) AS run_start, LAST(observed_at) AS run_end, MATCH_NUMBER() AS shape_no
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (ANCHOR DROP_ONE+ RISE_ONE+ DROP_TWO+ RISE_TWO+)
+                DEFINE
+                    DROP_ONE AS DROP_ONE.quote < PREV(DROP_ONE.quote),
+                    RISE_ONE AS RISE_ONE.quote > PREV(RISE_ONE.quote),
+                    DROP_TWO AS DROP_TWO.quote < PREV(DROP_TWO.quote),
+                    RISE_TWO AS RISE_TWO.quote > PREV(RISE_TWO.quote)
+            )
+            ORDER BY s_min
+            "#,
+        ),
+        (
+            "oracle_sessionization_timestamp_interval",
+            r#"
+            WITH visits(visitor, hit_at) AS (
+                VALUES
+                    (7, TIMESTAMP '2031-03-04 08:05:00'),
+                    (7, TIMESTAMP '2031-03-04 08:22:00'),
+                    (7, TIMESTAMP '2031-03-04 09:40:00'),
+                    (7, TIMESTAMP '2031-03-04 09:47:00'),
+                    (7, TIMESTAMP '2031-03-04 11:00:00')
+            )
+            SELECT visitor, session_no, hits FROM visits
+            MATCH_RECOGNIZE (
+                PARTITION BY visitor ORDER BY hit_at
+                MEASURES MATCH_NUMBER() AS session_no, COUNT(*) AS hits
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (ANCHOR WITHIN_GAP*)
+                DEFINE WITHIN_GAP AS WITHIN_GAP.hit_at <= PREV(WITHIN_GAP.hit_at) + INTERVAL '30' MINUTE
+            )
+            ORDER BY session_no
+            "#,
+        ),
+        (
+            "oracle_money_laundering_fraud",
+            r#"
+            WITH transfers(user_id, tx_day, amount) AS (
+                VALUES
+                    ('u1', 1, 500), ('u1', 3, 700), ('u1', 5, 900), ('u1', 12, 1500000),
+                    ('u2', 1, 500), ('u2', 3, 700), ('u2', 5, 900), ('u2', 25, 1500000),
+                    ('u3', 1, 500), ('u3', 4, 500), ('u3', 8, 500), ('u3', 9, 500), ('u3', 15, 2000000)
+            )
+            SELECT user_id, first_small, big_day, total_small FROM transfers
+            MATCH_RECOGNIZE (
+                PARTITION BY user_id ORDER BY tx_day
+                MEASURES FIRST(X.tx_day) AS first_small, Y.tx_day AS big_day, SUM(X.amount) AS total_small
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (X{3,} Y)
+                DEFINE
+                    X AS X.amount < 2000 AND X.tx_day - FIRST(X.tx_day) <= 30,
+                    Y AS Y.amount >= 1000000 AND Y.tx_day - LAST(X.tx_day) <= 10 AND SUM(X.amount) < 20000
+            )
+            ORDER BY user_id
+            "#,
+        ),
+        (
+            "oracle_pro_sql_ch19_decline_streak",
+            r#"
+            WITH launches(yr, cnt) AS (
+                VALUES (2015, 50), (2016, 40), (2017, 30), (2018, 45), (2019, 40), (2020, 42), (2021, 35), (2022, 20), (2023, 10)
+            )
+            SELECT decline_start, decline_end FROM launches
+            MATCH_RECOGNIZE (
+                ORDER BY yr
+                MEASURES FIRST(DOWN.yr) AS decline_start, LAST(DOWN.yr) AS decline_end
+                ONE ROW PER MATCH AFTER MATCH SKIP TO LAST DOWN
+                PATTERN (DOWN DOWN+)
+                DEFINE DOWN AS DOWN.cnt < PREV(DOWN.cnt)
+            )
+            ORDER BY decline_start
+            "#,
+        ),
+        (
+            "calcite_length_budget_and_alias_precedence",
+            r#"
+            WITH emp(deptno, empno, ename) AS (
+                VALUES
+                    (10, 7782, 'CLARK'), (10, 7839, 'KING'), (10, 7934, 'MILLER'),
+                    (20, 7369, 'SMITH'), (20, 7566, 'JONES'), (20, 7788, 'SCOTT'), (20, 7876, 'ADAMS'), (20, 7902, 'FORD')
+            )
+            SELECT deptno, empno, mno, cls, ename FROM emp
+            MATCH_RECOGNIZE (
+                PARTITION BY deptno ORDER BY empno
+                MEASURES MATCH_NUMBER() AS mno, CLASSIFIER() AS cls
+                ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (S B+)
+                DEFINE B AS LENGTH(S.ename) + SUM(LENGTH(B.ename || ';')) + LENGTH(';') <= 15
+            )
+            ORDER BY deptno, empno
+            "#,
+        ),
+        (
+            "nexmark_cep_q1_avg_price",
+            r#"
+            WITH bid(auction, bidder, ts, price) AS (
+                VALUES (1, 10, 1, 5000), (1, 10, 2, 12000), (1, 10, 3, 12000), (1, 10, 4, 20000), (1, 10, 5, 4000), (1, 10, 6, 15000)
+            )
+            SELECT auction, bidder, start_ts, end_ts, ROUND(avg_price, 2) AS avg_p FROM bid
+            MATCH_RECOGNIZE (
+                PARTITION BY auction, bidder ORDER BY ts
+                MEASURES FIRST(A.ts) AS start_ts, LAST(A.ts) AS end_ts, AVG(A.price) AS avg_price
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (A+ B)
+                DEFINE A AS AVG(A.price) < 10000
+            )
+            ORDER BY start_ts
+            "#,
+        ),
+        (
+            "audit_define_null_and_table_qualifier_with_classifier",
+            r#"
+            WITH ev(i, v) AS (VALUES (1, 10), (2, 20), (3, 30))
+            SELECT tags, fa, sa, b_hi, b_zero FROM ev AS t
+            MATCH_RECOGNIZE (
+                ORDER BY i
+                MEASURES
+                    string_agg(CAST(t.i AS VARCHAR) || ':' || CLASSIFIER(), ',') AS tags,
+                    FIRST(abs(t.v)) AS fa,
+                    SUM(CASE WHEN CLASSIFIER() = 'A' THEN t.v END) AS sa,
+                    COUNT(CASE WHEN B.v >= 30 THEN 1 END) AS b_hi,
+                    COUNT(CASE WHEN C.v > 0 THEN 1 END) AS b_zero
+                ONE ROW PER MATCH
+                PATTERN (A B+ C*)
+                DEFINE
+                    A AS t.v = 10 AND CLASSIFIER() = 'A' AND LAST(CLASSIFIER()) = 'A',
+                    B AS t.v > 10 AND CLASSIFIER() = 'B',
+                    C AS NULL
+            )
+            "#,
+        ),
+        (
+            "audit_nested_nullable_quantifier_and_excl_empty",
+            r#"
+            WITH shapes(g, seq, c) AS (
+                VALUES (1, 1, 'a'), (1, 2, 'a'), (1, 3, 'b'), (1, 4, 'a'), (1, 5, 'c'),
+                       (2, 1, 'b'), (2, 2, 'b'), (2, 3, 'b'),
+                       (3, 1, 'a')
+            )
+            SELECT g, mno, first_seq, len FROM shapes
+            MATCH_RECOGNIZE (
+                PARTITION BY g ORDER BY seq
+                MEASURES MATCH_NUMBER() AS mno, FIRST(seq) AS first_seq, COUNT(*) AS len
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((((A | B)+)?){1,2})
+                DEFINE A AS c = 'a', B AS c = 'b'
+            )
+            ORDER BY g, mno
+            "#,
+        ),
+        (
+            "audit_excl_star_with_show_empty_and_compound_define_nav",
+            r#"
+            WITH pstep(rn, price) AS (VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50))
+            SELECT rn, c FROM pstep
+            MATCH_RECOGNIZE (
+                ORDER BY rn
+                MEASURES CLASSIFIER() AS c
+                ALL ROWS PER MATCH
+                PATTERN (B{3} C)
+                DEFINE B AS true, C AS PREV(LAST(B.price, 1), 1) = 10
+            )
+            ORDER BY rn
+            "#,
+        ),
+        (
+            "audit_define_negated_nav_expr_and_div_match_number",
+            r#"
+            WITH nav_define(i, v) AS (VALUES (1, -5), (2, 3), (3, 10))
+            SELECT n, s FROM nav_define
+            MATCH_RECOGNIZE (
+                ORDER BY i
+                MEASURES count(*) AS n, FIRST(i) AS s
+                ONE ROW PER MATCH
+                PATTERN (A B+)
+                DEFINE A AS CAST(1.0 / MATCH_NUMBER() AS INT) = 1, B AS v > FIRST(-A.v)
+            )
+            "#,
+        ),
         // Negative error-parity checks against DuckDB 2.1
         (
             "err_parity_skip_infinite_loop",

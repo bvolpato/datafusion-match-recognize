@@ -1629,6 +1629,69 @@ async fn test_live_trino_differential_oracle() {
             "#,
         ),
         (
+            "oracle_w_shape_and_fraud_and_calcite_parity",
+            r#"
+            WITH transfers(user_id, tx_day, amount) AS (
+                VALUES
+                    ('u1', 1, 500), ('u1', 3, 700), ('u1', 5, 900), ('u1', 12, 1500000),
+                    ('u2', 1, 500), ('u2', 3, 700), ('u2', 5, 900), ('u2', 25, 1500000),
+                    ('u3', 1, 500), ('u3', 4, 500), ('u3', 8, 500), ('u3', 9, 500), ('u3', 15, 2000000)
+            )
+            SELECT user_id, first_small, big_day, total_small FROM transfers
+            MATCH_RECOGNIZE (
+                PARTITION BY user_id ORDER BY tx_day
+                MEASURES FIRST(X.tx_day) AS first_small, Y.tx_day AS big_day, SUM(X.amount) AS total_small
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN (X{3,} Y)
+                DEFINE
+                    X AS X.amount < 2000 AND X.tx_day - FIRST(X.tx_day) <= 30,
+                    Y AS Y.amount >= 1000000 AND Y.tx_day - LAST(X.tx_day) <= 10 AND SUM(X.amount) < 20000
+            )
+            ORDER BY user_id
+            "#,
+        ),
+        (
+            "audit_define_null_and_table_qualifier_with_classifier_trino",
+            r#"
+            WITH ev(i, v) AS (VALUES (1, 10), (2, 20), (3, 30))
+            SELECT tags, fa, sa, b_hi, b_zero FROM ev AS t
+            MATCH_RECOGNIZE (
+                ORDER BY i
+                MEASURES
+                    array_agg(CAST(t.i AS VARCHAR) || ':' || CLASSIFIER()) AS tags,
+                    FIRST(abs(t.v)) AS fa,
+                    SUM(CASE WHEN CLASSIFIER() = 'A' THEN t.v END) AS sa,
+                    COUNT(CASE WHEN B.v >= 30 THEN 1 END) AS b_hi,
+                    COUNT(CASE WHEN C.v > 0 THEN 1 END) AS b_zero
+                ONE ROW PER MATCH
+                PATTERN (A B+ C*)
+                DEFINE
+                    A AS t.v = 10 AND CLASSIFIER() = 'A' AND LAST(CLASSIFIER()) = 'A',
+                    B AS t.v > 10 AND CLASSIFIER() = 'B',
+                    C AS NULL
+            )
+            "#,
+        ),
+        (
+            "audit_nested_nullable_quantifier_trino",
+            r#"
+            WITH shapes(g, seq, c) AS (
+                VALUES (1, 1, 'a'), (1, 2, 'a'), (1, 3, 'b'), (1, 4, 'a'), (1, 5, 'c'),
+                       (2, 1, 'b'), (2, 2, 'b'), (2, 3, 'b'),
+                       (3, 1, 'a')
+            )
+            SELECT g, mno, first_seq, len FROM shapes
+            MATCH_RECOGNIZE (
+                PARTITION BY g ORDER BY seq
+                MEASURES MATCH_NUMBER() AS mno, FIRST(seq) AS first_seq, COUNT(*) AS len
+                ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+                PATTERN ((((A | B)+)?){1,2})
+                DEFINE A AS c = 'a', B AS c = 'b'
+            )
+            ORDER BY g, mno
+            "#,
+        ),
+        (
             "err_parity_last_distinct_in_define",
             r#"
             WITH t(id, v) AS (VALUES (1, 10), (2, 20))

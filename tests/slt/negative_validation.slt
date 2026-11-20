@@ -423,3 +423,113 @@ MATCH_RECOGNIZE (
   PATTERN (A+)
   DEFINE A AS FIRST(price, id) > 0
 );
+
+# 13. Non-boolean DEFINE, subqueries in DEFINE/MEASURES, nested nav/agg in DEFINE, multi-part COUNT(.*)
+statement error must evaluate to Boolean
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A)
+  DEFINE A AS 'nope'
+);
+
+statement error must evaluate to Boolean
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A)
+  DEFINE A AS price
+);
+
+statement error Subqueries are not supported
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS price > (SELECT 1)
+);
+
+statement error Subqueries are not supported
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES (SELECT 1) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A)
+  DEFINE A AS FIRST(sum(price)) > 0
+);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS FIRST(abs(LAST(price))) > 0
+);
+
+statement error Cannot nest
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A+)
+  DEFINE A AS NEXT(PREV(price)) > 0
+);
+
+statement error must match
+SELECT * FROM neg_t AS nt
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES sum(nt.price + A.price) AS s
+  PATTERN (A B+)
+  DEFINE A AS id = 1
+);
+
+statement error must match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  PATTERN (A B+)
+  DEFINE A AS id = 1, B AS B.price > LAST(A.price + price)
+);
+
+statement error non-negative integer
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES FIRST(price, 18446744073709551615) AS s
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error must qualify a single pattern variable
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(t.A.*) AS n
+  PATTERN (A+)
+  DEFINE A AS true
+);
+
+statement error cannot skip to the first row of the current match
+SELECT * FROM neg_t
+MATCH_RECOGNIZE (
+  ORDER BY id
+  MEASURES count(*) AS n
+  AFTER MATCH SKIP TO LAST A
+  PATTERN (A B)
+  DEFINE A AS true, B AS true
+);

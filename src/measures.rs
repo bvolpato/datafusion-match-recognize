@@ -584,7 +584,6 @@ fn try_compile_fast_scalar_expr(expr: &Arc<dyn PhysicalExpr>) -> Option<FastScal
                 | Operator::Plus
                 | Operator::Minus
                 | Operator::Multiply
-                | Operator::Divide
         ) {
             return None;
         }
@@ -1665,6 +1664,9 @@ impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
             &RecordBatchOptions::new().with_row_count(Some(1)),
         )?;
         let evaluated = compiled.outer_expr.evaluate(&slot_batch)?.into_array(1)?;
+        if evaluated.data_type() == &DataType::Null {
+            return Ok(false);
+        }
         let bool_arr = evaluated
             .as_any()
             .downcast_ref::<BooleanArray>()
