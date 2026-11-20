@@ -2,22 +2,23 @@
 
 //! Custom [`UserDefinedLogicalNodeCore`] for `MATCH_RECOGNIZE`.
 
-use std::collections::HashSet;
 use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{DFSchema, DFSchemaRef, Result, plan_datafusion_err, plan_err};
+use datafusion_common::{
+    DFSchema, DFSchemaRef, HashSet, Result, plan_datafusion_err, plan_err,
+};
 use datafusion_expr::expr_rewriter::strip_outer_reference;
 use datafusion_expr::logical_plan::{Extension, LogicalPlan};
 use datafusion_expr::utils::expr_to_columns;
 use datafusion_expr::{Expr, ExprSchemable, UserDefinedLogicalNodeCore};
 
 use crate::ast::{
-    AfterMatchSkip, AggKind, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, MeasureSpec,
-    OrderBySpec, Pattern, RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind,
+    AfterMatchSkip, AggKind, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind,
+    MeasureSpec, OrderBySpec, Pattern, RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind,
 };
 
 /// Logical plan node representing a SQL `MATCH_RECOGNIZE` relation.
@@ -45,7 +46,7 @@ impl PartialOrd for MatchRecognizeNode {
 }
 
 impl MatchRecognizeNode {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         input: LogicalPlan,
         partition_by: Vec<Expr>,
@@ -71,7 +72,7 @@ impl MatchRecognizeNode {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new_with_subsets(
         input: LogicalPlan,
         partition_by: Vec<Expr>,
@@ -159,7 +160,9 @@ impl MatchRecognizeNode {
         let mut coerced_defs = Vec::with_capacity(definitions.len());
         for def in definitions {
             let kind = match def.kind {
-                SymbolDefKind::Stateless { predicate } => SymbolDefKind::Stateless { predicate },
+                SymbolDefKind::Stateless { predicate } => {
+                    SymbolDefKind::Stateless { predicate }
+                }
                 SymbolDefKind::Stateful { outer_expr, slots } => {
                     let slots = coerce_meta_slots(slots)?;
                     let slot_schema =
@@ -212,7 +215,8 @@ pub fn build_slot_schema(
 ) -> Result<DFSchema> {
     let mut fields = Vec::with_capacity(slots.len());
     for slot in slots {
-        let (dt, nullable) = slot_data_type_and_nullability(input_schema, slot, rows_per_match)?;
+        let (dt, nullable) =
+            slot_data_type_and_nullability(input_schema, slot, rows_per_match)?;
         fields.push(Field::new(&slot.slot_name, dt, nullable));
     }
     DFSchema::try_from(Schema::new(fields))
@@ -296,7 +300,9 @@ pub fn slot_data_type_and_nullability(
                 }
                 AggKind::Sum => {
                     let expr = args.first().ok_or_else(|| {
-                        plan_datafusion_err!("SUM in MEASURES/DEFINE requires an input expression")
+                        plan_datafusion_err!(
+                            "SUM in MEASURES/DEFINE requires an input expression"
+                        )
                     })?;
                     let inner_dt = expr.get_type(eval_schema)?;
                     Ok((sum_result_type(&inner_dt)?, true))
@@ -400,11 +406,15 @@ pub fn compute_output_schema(
 
 fn sum_result_type(dt: &DataType) -> Result<DataType> {
     match dt {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(DataType::Int64),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            Ok(DataType::Int64)
+        }
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             Ok(DataType::UInt64)
         }
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => Ok(DataType::Float64),
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+            Ok(DataType::Float64)
+        }
         DataType::Decimal128(p, s) => Ok(DataType::Decimal128((*p + 10).min(38), *s)),
         other => plan_err!("SUM in MATCH_RECOGNIZE does not support type {other}"),
     }
@@ -461,7 +471,9 @@ fn rebuild_slots_from_iter(
                     inner_expr.clone()
                 } else {
                     iter.next().ok_or_else(|| {
-                        plan_datafusion_err!("MatchRecognize: missing nav slot expression")
+                        plan_datafusion_err!(
+                            "MatchRecognize: missing nav slot expression"
+                        )
                     })?
                 };
                 MeasureSlotKind::Nav {
@@ -476,7 +488,9 @@ fn rebuild_slots_from_iter(
             }
             MeasureSlotKind::CurrentRow { .. } => MeasureSlotKind::CurrentRow {
                 inner_expr: iter.next().ok_or_else(|| {
-                    plan_datafusion_err!("MatchRecognize: missing current_row slot expression")
+                    plan_datafusion_err!(
+                        "MatchRecognize: missing current_row slot expression"
+                    )
                 })?,
             },
             MeasureSlotKind::Agg {
@@ -493,7 +507,9 @@ fn rebuild_slots_from_iter(
                     let mut v = Vec::with_capacity(args.len());
                     for _ in 0..args.len() {
                         v.push(iter.next().ok_or_else(|| {
-                            plan_datafusion_err!("MatchRecognize: missing agg slot expression")
+                            plan_datafusion_err!(
+                                "MatchRecognize: missing agg slot expression"
+                            )
                         })?);
                     }
                     v
@@ -538,7 +554,9 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         for def in &self.definitions {
             match &def.kind {
                 SymbolDefKind::Stateless { predicate } => exprs.push(predicate.clone()),
-                SymbolDefKind::Stateful { slots, .. } => push_slot_exprs(slots, &mut exprs),
+                SymbolDefKind::Stateful { slots, .. } => {
+                    push_slot_exprs(slots, &mut exprs)
+                }
             }
         }
         for m in &self.measures {
@@ -634,7 +652,9 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
             let kind = match &orig.kind {
                 SymbolDefKind::Stateless { .. } => {
                     let predicate = iter.next().ok_or_else(|| {
-                        plan_datafusion_err!("MatchRecognize: missing stateless define expression")
+                        plan_datafusion_err!(
+                            "MatchRecognize: missing stateless define expression"
+                        )
                     })?;
                     SymbolDefKind::Stateless { predicate }
                 }
@@ -680,7 +700,10 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         )
     }
 
-    fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
+    fn necessary_children_exprs(
+        &self,
+        output_columns: &[usize],
+    ) -> Option<Vec<Vec<usize>>> {
         if !self.rows_per_match.is_one_row() {
             return None;
         }
@@ -728,12 +751,18 @@ impl UserDefinedLogicalNodeCore for MatchRecognizeNode {
         }
 
         for expr in all_exprs {
-            let mut cols = HashSet::new();
+            #[expect(
+                clippy::disallowed_types,
+                reason = "datafusion_expr::utils::expr_to_columns requires std::collections::HashSet"
+            )]
+            let mut cols = std::collections::HashSet::new();
             if expr_to_columns(&strip_outer_reference(expr), &mut cols).is_err() {
                 return None;
             }
             for col in cols {
-                if col.name == AGG_META_CLASSIFIER_COL || col.name == AGG_META_MATCH_NUMBER_COL {
+                if col.name == AGG_META_CLASSIFIER_COL
+                    || col.name == AGG_META_MATCH_NUMBER_COL
+                {
                     continue;
                 }
                 if let Ok(idx) = input_schema.index_of_column(&col) {

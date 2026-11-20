@@ -4,9 +4,7 @@
 //! variables into dense [`SymbolSet`] bitmasks, and precomputes start-symbol masks for
 //! O(1) row fast-skipping.
 
-use std::collections::HashMap;
-
-use datafusion_common::{Result, plan_err};
+use datafusion_common::{HashMap, Result, plan_err};
 
 use crate::ast::{MatchRecognizeConfig, Pattern, SubsetDef, SymbolRef};
 
@@ -49,7 +47,9 @@ impl SymbolSet {
     pub fn contains(&self, sym: SymbolId) -> bool {
         match self {
             SymbolSet::Single(id) => *id == sym,
-            SymbolSet::Mask64(mask) => (sym as usize) < 64 && (*mask & (1u64 << sym)) != 0,
+            SymbolSet::Mask64(mask) => {
+                (sym as usize) < 64 && (*mask & (1u64 << sym)) != 0
+            }
             SymbolSet::List(ids) => ids.binary_search(&sym).is_ok(),
         }
     }
@@ -128,7 +128,8 @@ impl Program {
         }
 
         // Validate and resolve SUBSET union variables.
-        let mut subsets: HashMap<String, SymbolSet> = HashMap::with_capacity(subset_defs.len());
+        let mut subsets: HashMap<String, SymbolSet> =
+            HashMap::with_capacity(subset_defs.len());
         for sdef in subset_defs {
             if symbol_to_id.contains_key(&sdef.name) {
                 return plan_err!(
@@ -241,8 +242,9 @@ fn register_symbol(
     if symbol_to_id.contains_key(name) {
         return Ok(());
     }
-    let id = SymbolId::try_from(id_to_symbol.len())
-        .map_err(|_| datafusion_common::plan_datafusion_err!("Too many pattern variables"))?;
+    let id = SymbolId::try_from(id_to_symbol.len()).map_err(|_| {
+        datafusion_common::plan_datafusion_err!("Too many pattern variables")
+    })?;
     id_to_symbol.push(name.to_string());
     symbol_to_id.insert(name.to_string(), id);
     Ok(())
@@ -255,7 +257,7 @@ struct Compiler<'a> {
     max_nfa_states: usize,
 }
 
-impl<'a> Compiler<'a> {
+impl Compiler<'_> {
     fn push(&mut self, inst: Inst) -> Result<usize> {
         if self.instructions.len() >= self.max_nfa_states {
             return plan_err!(
@@ -272,7 +274,9 @@ impl<'a> Compiler<'a> {
         match pattern {
             Pattern::Symbol(SymbolRef::Named(name)) => {
                 let sym = *self.symbol_to_id.get(name).ok_or_else(|| {
-                    datafusion_common::plan_datafusion_err!("Unknown pattern variable '{name}'")
+                    datafusion_common::plan_datafusion_err!(
+                        "Unknown pattern variable '{name}'"
+                    )
                 })?;
                 self.push(Inst::MatchLabel { sym })?;
             }
@@ -332,7 +336,9 @@ impl<'a> Compiler<'a> {
             };
         }
 
-        self.compile_pattern(branches.last().expect("non-empty branches"))?;
+        if let Some(last) = branches.last() {
+            self.compile_pattern(last)?;
+        }
         let end_pc = self.instructions.len();
         for jump_pc in jump_pcs {
             self.instructions[jump_pc] = Inst::Jump(end_pc);
@@ -358,7 +364,9 @@ impl<'a> Compiler<'a> {
         let perms = lexicographic_permutations(items.len());
         let branches: Vec<Pattern> = perms
             .into_iter()
-            .map(|order| Pattern::Concat(order.into_iter().map(|i| items[i].clone()).collect()))
+            .map(|order| {
+                Pattern::Concat(order.into_iter().map(|i| items[i].clone()).collect())
+            })
             .collect();
         self.compile_alternation(&branches)
     }
@@ -377,7 +385,9 @@ impl<'a> Compiler<'a> {
                 );
             }
             if min > max_val {
-                return plan_err!("Invalid quantifier bounds: min ({min}) exceeds max ({max_val})");
+                return plan_err!(
+                    "Invalid quantifier bounds: min ({min}) exceeds max ({max_val})"
+                );
             }
             for _ in 0..min {
                 self.compile_pattern(inner)?;

@@ -10,7 +10,7 @@
 //!   on candidate transitions with per-thread epsilon-cycle detection and configurable thread
 //!   limits (`max_active_threads`).
 
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{Result, exec_err, internal_datafusion_err};
 
 use crate::ast::{AfterMatchSkip, RowsPerMatch};
 use crate::pattern::{Inst, Program, SymbolId, SymbolSet};
@@ -114,7 +114,9 @@ impl PartitionSymbols {
     /// Estimated heap bytes held by this symbol table.
     pub fn memory_bytes(&self) -> usize {
         match self {
-            PartitionSymbols::Bitmask64 { rows, .. } => rows.capacity() * size_of::<u64>(),
+            PartitionSymbols::Bitmask64 { rows, .. } => {
+                rows.capacity() * size_of::<u64>()
+            }
             PartitionSymbols::Bitset { words, .. } => words.capacity() * size_of::<u64>(),
         }
     }
@@ -235,11 +237,17 @@ pub struct Matcher<'a> {
 impl<'a> Matcher<'a> {
     /// Creates a matcher for `program` with default stateful thread limit.
     pub fn new(program: &'a Program) -> Self {
-        Self::with_max_active_threads(program, crate::ast::DEFAULT_MAX_ACTIVE_THREADS as usize)
+        Self::with_max_active_threads(
+            program,
+            crate::ast::DEFAULT_MAX_ACTIVE_THREADS as usize,
+        )
     }
 
     /// Creates a matcher for `program` with an explicit active-thread cap for stateful matching.
-    pub fn with_max_active_threads(program: &'a Program, max_active_threads: usize) -> Self {
+    pub fn with_max_active_threads(
+        program: &'a Program,
+        max_active_threads: usize,
+    ) -> Self {
         Self {
             visited: vec![0; program.instructions.len()],
             program,
@@ -300,11 +308,13 @@ impl<'a> Matcher<'a> {
         while start_row < num_rows {
             // Tier 1 O(1) fast skip: if no symbol on the pattern's start frontier matches this
             // row (and the pattern is non-nullable & anchor-free), no match can start here.
-            if let (Some(mask), Some(row_bits)) = (start_mask, symbols.row_bitmask64(start_row))
+            if let (Some(mask), Some(row_bits)) =
+                (start_mask, symbols.row_bitmask64(start_row))
                 && (row_bits & mask) == 0
             {
                 stats.fast_skipped_rows += 1;
-                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end {
+                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
+                {
                     events.push(PartitionEvent::UnmatchedRow { row_idx: start_row });
                 }
                 start_row += 1;
@@ -359,7 +369,9 @@ impl<'a> Matcher<'a> {
                     start_row = next_start;
                 }
                 None => {
-                    if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end {
+                    if rows_per_match.include_unmatched_rows()
+                        && start_row >= max_matched_end
+                    {
                         events.push(PartitionEvent::UnmatchedRow { row_idx: start_row });
                     }
                     start_row += 1;
@@ -692,7 +704,9 @@ fn compute_next_start(
         AfterMatchSkip::PastLastRow => Ok(end_row),
         AfterMatchSkip::ToNextRow => Ok(start_row + 1),
         AfterMatchSkip::ToFirst(name) => {
-            let target = skip_target_set.expect("validated symbol or subset");
+            let target = skip_target_set.ok_or_else(|| {
+                internal_datafusion_err!("missing validated skip target '{name}'")
+            })?;
             let Some(step) = steps.iter().find(|s| target.contains(s.sym)) else {
                 return exec_err!(
                     "AFTER MATCH SKIP TO FIRST {name} failed: variable '{name}' was not matched"
@@ -706,7 +720,9 @@ fn compute_next_start(
             Ok(step.row_idx)
         }
         AfterMatchSkip::ToLast(name) => {
-            let target = skip_target_set.expect("validated symbol or subset");
+            let target = skip_target_set.ok_or_else(|| {
+                internal_datafusion_err!("missing validated skip target '{name}'")
+            })?;
             let Some(step) = steps.iter().rev().find(|s| target.contains(s.sym)) else {
                 return exec_err!(
                     "AFTER MATCH SKIP TO LAST {name} failed: variable '{name}' was not matched"

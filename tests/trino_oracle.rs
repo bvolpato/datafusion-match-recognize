@@ -9,7 +9,9 @@
 use arrow::array::{Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::SessionConfig;
-use datafusion_match_recognize::{MatchRecognizeConfig, session_context_with_match_recognize};
+use datafusion_match_recognize::{
+    MatchRecognizeConfig, session_context_with_match_recognize,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -79,7 +81,8 @@ fn format_json_cell(v: serde_json::Value) -> String {
         }
         serde_json::Value::String(s) => s,
         serde_json::Value::Array(items) => {
-            let formatted: Vec<String> = items.into_iter().map(format_json_cell).collect();
+            let formatted: Vec<String> =
+                items.into_iter().map(format_json_cell).collect();
             format!("[{}]", formatted.join(", "))
         }
         other => other.to_string(),
@@ -145,7 +148,12 @@ async fn run_df_sql(sql: &str) -> Result<Vec<Vec<String>>, String> {
     Ok(format_df_batches(&batches))
 }
 
-async fn assert_matches_trino(client: &reqwest::Client, base_url: &str, name: &str, sql: &str) {
+async fn assert_matches_trino(
+    client: &reqwest::Client,
+    base_url: &str,
+    name: &str,
+    sql: &str,
+) {
     let trino_res = run_trino_sql(client, base_url, sql).await;
     let df_res = run_df_sql(sql).await;
 
@@ -157,7 +165,9 @@ async fn assert_matches_trino(client: &reqwest::Client, base_url: &str, name: &s
             );
         }
         (Err(df_err), Err(trino_err)) => {
-            eprintln!("[{name}] Both errored as expected (DF: {df_err} | Trino: {trino_err})");
+            eprintln!(
+                "[{name}] Both errored as expected (DF: {df_err} | Trino: {trino_err})"
+            );
         }
         (df_res, trino_res) => {
             panic!(
@@ -170,8 +180,8 @@ async fn assert_matches_trino(client: &reqwest::Client, base_url: &str, name: &s
 #[tokio::test]
 #[ignore = "requires live Trino container at TRINO_URL (default http://localhost:18080)"]
 async fn test_live_trino_differential_oracle() {
-    let base_url =
-        std::env::var("TRINO_URL").unwrap_or_else(|_| "http://localhost:18080".to_string());
+    let base_url = std::env::var("TRINO_URL")
+        .unwrap_or_else(|_| "http://localhost:18080".to_string());
     let client = reqwest::Client::new();
 
     // Verify Trino is reachable.
@@ -1394,6 +1404,21 @@ async fn test_live_trino_differential_oracle() {
             "#,
         ),
         (
+            "trino_empty_iter_in_unbounded_loop",
+            r#"
+            WITH t(id, tag) AS (VALUES (1, 'C'), (2, 'A'))
+            SELECT * FROM t
+            MATCH_RECOGNIZE (
+                ORDER BY id
+                MEASURES MATCH_NUMBER() AS mn, FIRST(id) AS s, LAST(id) AS e, CLASSIFIER() AS cls
+                ONE ROW PER MATCH
+                PATTERN ((C | C? | A)*)
+                DEFINE C AS tag = 'C', A AS tag = 'A'
+            )
+            ORDER BY mn
+            "#,
+        ),
+        (
             "trino_aliased_filter_pushdown_and_null_order_by",
             r#"
             WITH t(p, id, v) AS (
@@ -1599,7 +1624,8 @@ async fn test_live_trino_differential_oracle() {
             }
         }
         let values_sql = value_rows.join(", ");
-        let (pat, defs, has_excl) = rand_patterns[(next_u64() as usize) % rand_patterns.len()];
+        let (pat, defs, has_excl) =
+            rand_patterns[(next_u64() as usize) % rand_patterns.len()];
         let ord = rand_orders[(next_u64() as usize) % rand_orders.len()];
         let skip = rand_skips[(next_u64() as usize) % rand_skips.len()];
         let mode_choice = (next_u64() % 4) as usize;

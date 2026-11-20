@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionConfig;
-use datafusion_match_recognize::{MatchRecognizeConfig, session_context_with_match_recognize};
+use datafusion_match_recognize::{
+    MatchRecognizeConfig, session_context_with_match_recognize,
+};
 
 #[tokio::main]
 async fn main() -> datafusion_common::Result<()> {

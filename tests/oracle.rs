@@ -75,7 +75,8 @@ fn ref_eval(
         }
         Pattern::Alternation(branches) => {
             for branch in branches {
-                if let Some(m) = ref_eval(branch, pos, exclude_depth, symbols, program, steps, cont)
+                if let Some(m) =
+                    ref_eval(branch, pos, exclude_depth, symbols, program, steps, cont)
                 {
                     return Some(m);
                 }
@@ -88,10 +89,17 @@ fn ref_eval(
             }
             let perms = lexicographic_perms(items.len());
             for order in perms {
-                let seq: Vec<Pattern> = order.into_iter().map(|i| items[i].clone()).collect();
-                if let Some(m) =
-                    ref_eval_slice(&seq, pos, exclude_depth, symbols, program, steps, cont)
-                {
+                let seq: Vec<Pattern> =
+                    order.into_iter().map(|i| items[i].clone()).collect();
+                if let Some(m) = ref_eval_slice(
+                    &seq,
+                    pos,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    steps,
+                    cont,
+                ) {
                     return Some(m);
                 }
             }
@@ -142,7 +150,7 @@ fn ref_eval_slice(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn ref_eval_rep(
     inner: &Pattern,
     min: u32,
@@ -207,6 +215,14 @@ fn ref_eval_rep(
             program,
             st,
             &|next_pos, st2| {
+                // Once already in a loop-back iteration (`count >= 1`) of an unbounded loop,
+                // returning to `loop_split` at the same `pos` without consuming a row hits the
+                // epsilon-cycle guard (`visited[loop_split]`), aborting this zero-width branch so
+                // remaining alternation branches (e.g. `(c | c? | a)*` on `[c, a]`) can run first.
+                // Verified against Trino 484.
+                if max.is_none() && count >= 1 && next_pos == pos {
+                    return None;
+                }
                 ref_eval_rep(
                     inner,
                     min,
@@ -329,7 +345,8 @@ fn ref_match_partition(
                 start_row = next_start;
             }
             None => {
-                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end {
+                if rows_per_match.include_unmatched_rows() && start_row >= max_matched_end
+                {
                     events.push(PartitionEvent::UnmatchedRow { row_idx: start_row });
                 }
                 start_row += 1;
@@ -499,6 +516,43 @@ fn test_targeted_sql2016_edge_cases_against_oracle() {
             ]),
             vec![0b111, 0b111, 0b111],
         ),
+        // Empty-iteration cycle in loop-back vs initial iteration (verified against Trino 484):
+        // (c | c? | a)* on [c, a] matches [c, a], whereas (c? | a)* on [a] matches empty [].
+        (
+            Pattern::Repetition {
+                inner: Box::new(Pattern::Alternation(vec![
+                    Pattern::Symbol(SymbolRef::Named("c".into())),
+                    Pattern::Repetition {
+                        inner: Box::new(Pattern::Symbol(SymbolRef::Named("c".into()))),
+                        min: 0,
+                        max: Some(1),
+                        reluctant: false,
+                    },
+                    Pattern::Symbol(SymbolRef::Named("a".into())),
+                ])),
+                min: 0,
+                max: None,
+                reluctant: false,
+            },
+            vec![0b100, 0b001],
+        ),
+        (
+            Pattern::Repetition {
+                inner: Box::new(Pattern::Alternation(vec![
+                    Pattern::Repetition {
+                        inner: Box::new(Pattern::Symbol(SymbolRef::Named("c".into()))),
+                        min: 0,
+                        max: Some(1),
+                        reluctant: false,
+                    },
+                    Pattern::Symbol(SymbolRef::Named("a".into())),
+                ])),
+                min: 0,
+                max: None,
+                reluctant: false,
+            },
+            vec![0b001],
+        ),
         // Anchors ^ A+ $
         (
             Pattern::Concat(vec![
@@ -517,7 +571,8 @@ fn test_targeted_sql2016_edge_cases_against_oracle() {
 
     for (pattern, bitmasks) in cases {
         let program =
-            Program::compile(&pattern, &declared, MatchRecognizeConfig::default()).unwrap();
+            Program::compile(&pattern, &declared, MatchRecognizeConfig::default())
+                .unwrap();
         let symbols = PartitionSymbols::from_bitmasks(bitmasks, 3);
         for skip in [AfterMatchSkip::PastLastRow, AfterMatchSkip::ToNextRow] {
             for rpm in [
@@ -526,7 +581,8 @@ fn test_targeted_sql2016_edge_cases_against_oracle() {
                 RowsPerMatch::AllRowsOmitEmpty,
                 RowsPerMatch::AllRowsWithUnmatched,
             ] {
-                let expected = ref_match_partition(&pattern, &symbols, &program, &skip, rpm);
+                let expected =
+                    ref_match_partition(&pattern, &symbols, &program, &skip, rpm);
                 let mut matcher = Matcher::new(&program);
                 let actual = matcher
                     .match_partition(&symbols, &skip, rpm)
@@ -600,14 +656,19 @@ proptest! {
     }
 }
 
-type StatefulMatchCont<'a> =
-    &'a dyn Fn(usize, &mut Vec<MatchStep>, &mut TestStatefulEval) -> Option<Vec<MatchStep>>;
+type StatefulMatchCont<'a> = &'a dyn Fn(
+    usize,
+    &mut Vec<MatchStep>,
+    &mut TestStatefulEval,
+) -> Option<Vec<MatchStep>>;
 
 struct TestStatefulEval {
     vals: Vec<i32>,
 }
 
-impl datafusion_match_recognize::matcher::StatefulPredicateEvaluator for TestStatefulEval {
+impl datafusion_match_recognize::matcher::StatefulPredicateEvaluator
+    for TestStatefulEval
+{
     fn is_stateful(&self, sym: SymbolId) -> bool {
         sym == 1 || sym == 2
     }
@@ -637,7 +698,7 @@ impl datafusion_match_recognize::matcher::StatefulPredicateEvaluator for TestSta
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn ref_eval_stateful(
     pattern: &Pattern,
     pos: usize,
@@ -705,9 +766,16 @@ fn ref_eval_stateful(
         ),
         Pattern::Alternation(branches) => {
             for b in branches {
-                if let Some(m) =
-                    ref_eval_stateful(b, pos, exclude_depth, symbols, program, eval, steps, cont)
-                {
+                if let Some(m) = ref_eval_stateful(
+                    b,
+                    pos,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    eval,
+                    steps,
+                    cont,
+                ) {
                     return Some(m);
                 }
             }
@@ -715,7 +783,8 @@ fn ref_eval_stateful(
         }
         Pattern::Permute(items) => {
             for order in lexicographic_perms(items.len()) {
-                let seq: Vec<Pattern> = order.into_iter().map(|i| items[i].clone()).collect();
+                let seq: Vec<Pattern> =
+                    order.into_iter().map(|i| items[i].clone()).collect();
                 if let Some(m) = ref_eval_stateful_slice(
                     &seq,
                     pos,
@@ -754,7 +823,7 @@ fn ref_eval_stateful(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn ref_eval_stateful_slice(
     items: &[Pattern],
     pos: usize,
@@ -776,13 +845,22 @@ fn ref_eval_stateful_slice(
             eval,
             steps,
             &|p, st, ev| {
-                ref_eval_stateful_slice(tail, p, exclude_depth, symbols, program, ev, st, cont)
+                ref_eval_stateful_slice(
+                    tail,
+                    p,
+                    exclude_depth,
+                    symbols,
+                    program,
+                    ev,
+                    st,
+                    cont,
+                )
             },
         ),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn ref_eval_stateful_rep(
     inner: &Pattern,
     min: u32,
@@ -844,6 +922,9 @@ fn ref_eval_stateful_rep(
             ev,
             st,
             &|next_pos, st2, ev2| {
+                if max.is_none() && count >= 1 && next_pos == pos {
+                    return None;
+                }
                 ref_eval_stateful_rep(
                     inner,
                     min,
@@ -962,7 +1043,8 @@ fn test_trino_pattern_matching_machine_cases() {
     };
 
     let check = |pat: Pattern, input: &str, expected: Option<&[(char, bool)]>| {
-        let program = Program::compile(&pat, &declared, MatchRecognizeConfig::default()).unwrap();
+        let program =
+            Program::compile(&pat, &declared, MatchRecognizeConfig::default()).unwrap();
         let symbols = make_input(input);
         let mut matcher = Matcher::new(&program);
         let mut stats = Default::default();
@@ -987,7 +1069,9 @@ fn test_trino_pattern_matching_machine_cases() {
                 assert_eq!(got, exp, "mismatch for {pat} on {input}");
             }
             (got, exp) => {
-                panic!("match presence mismatch for {pat} on {input}: got={got:?}, exp={exp:?}")
+                panic!(
+                    "match presence mismatch for {pat} on {input}: got={got:?}, exp={exp:?}"
+                )
             }
         }
     };
@@ -1129,7 +1213,7 @@ proptest! {
     ) {
         let len = vals.len().min(a_flags.len());
         let vals = vals[..len].to_vec();
-        let bitmasks: Vec<u64> = a_flags[..len].iter().map(|&b| if b { 1 } else { 0 }).collect();
+        let bitmasks: Vec<u64> = a_flags[..len].iter().map(|&b| u64::from(b)).collect();
         let declared = vec!["a".into(), "b".into(), "c".into()];
         let program = Program::compile(&pattern, &declared, MatchRecognizeConfig::default()).unwrap();
         let symbols = PartitionSymbols::from_bitmasks(bitmasks, 3);
@@ -1183,13 +1267,15 @@ fn ref_eval_measures_oracle(
     program: &Program,
     rows_per_match: RowsPerMatch,
 ) -> Vec<Vec<String>> {
-    use std::collections::HashSet;
+    use datafusion_common::HashSet;
 
     let a_id = program.symbol_id("a").unwrap();
     let u_set = program.resolve_symbol_set("u").unwrap();
     let sym_name = |id: SymbolId| program.id_to_symbol[id as usize].as_str();
-    let fmt_opt_i64 = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".into());
-    let fmt_opt_str = |v: Option<&str>| v.map(str::to_string).unwrap_or_else(|| "NULL".into());
+    let fmt_opt_i64 =
+        |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".into());
+    let fmt_opt_str =
+        |v: Option<&str>| v.map(str::to_string).unwrap_or_else(|| "NULL".into());
 
     let mut out = Vec::new();
     for event in events {
@@ -1236,7 +1322,8 @@ fn ref_eval_measures_oracle(
                             None => &[],
                         }
                     };
-                    let fin_horizon: &[MatchStep] = if is_empty { &[] } else { &found.steps };
+                    let fin_horizon: &[MatchStep] =
+                        if is_empty { &[] } else { &found.steps };
 
                     let mn = found.match_number;
                     let cls_run = run_horizon.last().map(|s| sym_name(s.sym));
@@ -1266,7 +1353,8 @@ fn ref_eval_measures_oracle(
                         .and_then(|r| vals[r]);
                     let cnt_star = run_horizon.len() as i64;
                     let cnt_u_fin =
-                        fin_horizon.iter().filter(|s| u_set.contains(s.sym)).count() as i64;
+                        fin_horizon.iter().filter(|s| u_set.contains(s.sym)).count()
+                            as i64;
                     let cnt_distinct = {
                         let mut set = HashSet::new();
                         for s in run_horizon {
@@ -1299,8 +1387,10 @@ fn ref_eval_measures_oracle(
                         }
                         acc
                     };
-                    let max_val = run_horizon.iter().filter_map(|s| vals[s.row_idx]).max();
-                    let min_val = run_horizon.iter().filter_map(|s| vals[s.row_idx]).min();
+                    let max_val =
+                        run_horizon.iter().filter_map(|s| vals[s.row_idx]).max();
+                    let min_val =
+                        run_horizon.iter().filter_map(|s| vals[s.row_idx]).min();
 
                     let mut row = Vec::new();
                     if !rows_per_match.is_one_row() {

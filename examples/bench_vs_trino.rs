@@ -19,12 +19,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig};
-use datafusion_match_recognize::{MatchRecognizeConfig, session_context_with_match_recognize};
+use datafusion_common::instant::Instant;
+use datafusion_match_recognize::{
+    MatchRecognizeConfig, session_context_with_match_recognize,
+};
 use serde::Deserialize;
 
 const DEFAULT_PARTITIONS: usize = 200_000;
@@ -317,8 +319,8 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8);
-    let trino_url =
-        std::env::var("TRINO_URL").unwrap_or_else(|_| "http://localhost:18080".to_string());
+    let trino_url = std::env::var("TRINO_URL")
+        .unwrap_or_else(|_| "http://localhost:18080".to_string());
     let parquet_dir = std::env::var("BENCH_PARQUET_DIR")
         .unwrap_or_else(|_| "/benchdata/metastore/default/bench_events".to_string());
     let checksum_file = std::env::var("BENCH_CHECKSUM_FILE").ok();

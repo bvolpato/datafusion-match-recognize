@@ -3,12 +3,11 @@
 //! Optional optimizer rule pushing filters that reference only `PARTITION BY` columns below
 //! [`MatchRecognizeNode`].
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::optimizer::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{Column, Result};
+use datafusion_common::{Column, HashSet, Result};
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{Extension, Filter, LogicalPlan};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction};
@@ -69,9 +68,16 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
         let mut remaining: Vec<Expr> = Vec::new();
 
         for pred in conjuncts {
-            let mut cols: HashSet<Column> = HashSet::new();
+            #[expect(
+                clippy::disallowed_types,
+                reason = "datafusion_expr::utils::expr_to_columns requires std::collections::HashSet"
+            )]
+            let mut cols: std::collections::HashSet<Column> =
+                std::collections::HashSet::new();
             expr_to_columns(pred, &mut cols)?;
-            if !cols.is_empty() && cols.iter().all(|c| partition_col_names.contains(&c.name)) {
+            if !cols.is_empty()
+                && cols.iter().all(|c| partition_col_names.contains(&c.name))
+            {
                 // Rewrite column qualifiers to match input schema (dropping any MATCH_RECOGNIZE alias).
                 let input_schema = mr_node.input.schema();
                 let mut valid_on_input = true;
@@ -89,8 +95,8 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
                         .clone()
                         .transform(|e| match e {
                             Expr::Column(c) => {
-                                let (qual, field) =
-                                    input_schema.qualified_field_with_unqualified_name(&c.name)?;
+                                let (qual, field) = input_schema
+                                    .qualified_field_with_unqualified_name(&c.name)?;
                                 Ok(Transformed::yes(Expr::Column(Column::new(
                                     qual.cloned(),
                                     field.name(),
@@ -110,7 +116,9 @@ impl OptimizerRule for MatchRecognizeFilterPushdown {
             return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         }
 
-        let pushed_pred = conjunction(pushable).expect("non-empty pushable");
+        let Some(pushed_pred) = conjunction(pushable) else {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+        };
         let new_input = LogicalPlan::Filter(Filter::try_new(
             pushed_pred,
             Arc::new(mr_node.input.clone()),

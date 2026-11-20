@@ -5,10 +5,9 @@
 //! navigation over `CLASSIFIER()`, `PREV`/`NEXT` inside aggregates, and arbitrary registered
 //! DataFusion [`AggregateUDF`]s.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use datafusion_common::{DFSchema, Result, plan_datafusion_err, plan_err};
+use datafusion_common::{DFSchema, HashSet, Result, plan_datafusion_err, plan_err};
 use datafusion_expr::AggregateUDF;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlanner, RelationPlannerContext, RelationPlanning,
@@ -22,9 +21,9 @@ use sqlparser::ast::{
 };
 
 use crate::ast::{
-    AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig, MeasureSlot,
-    MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SymbolDef,
-    SymbolDefKind, SymbolRef,
+    AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig,
+    MeasureSlot, MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind,
+    RowsPerMatch, SymbolDef, SymbolDefKind, SymbolRef,
 };
 use crate::logical::{
     AGG_META_CLASSIFIER_COL, AGG_META_MATCH_NUMBER_COL, MatchRecognizeNode,
@@ -106,11 +105,13 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let planned_rows_per_match = lower_rows_per_match(rows_per_match);
+        let planned_rows_per_match = lower_rows_per_match(rows_per_match.as_ref());
         let planned_skip = lower_after_match_skip(after_match_skip);
         let planned_pattern = lower_pattern(pattern)?;
 
-        if planned_rows_per_match.include_unmatched_rows() && planned_pattern.has_exclusion() {
+        if planned_rows_per_match.include_unmatched_rows()
+            && planned_pattern.has_exclusion()
+        {
             return plan_err!(
                 "MATCH_RECOGNIZE pattern exclusion {{- ... -}} is not allowed with ALL ROWS PER MATCH WITH UNMATCHED ROWS"
             );
@@ -148,8 +149,11 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
                 };
                 let rewritten_sql = extractor.rewrite_outer(sym_def.definition)?;
                 let slots = extractor.slots;
-                let slot_schema =
-                    build_slot_schema(input_schema.as_ref(), &slots, RowsPerMatch::OneRow)?;
+                let slot_schema = build_slot_schema(
+                    input_schema.as_ref(),
+                    &slots,
+                    RowsPerMatch::OneRow,
+                )?;
                 let outer_expr = ctx.sql_to_expr(rewritten_sql, &slot_schema)?;
                 planned_definitions.push(SymbolDef {
                     name,
@@ -166,10 +170,13 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
             }
         }
 
-        if let AfterMatchSkip::ToFirst(target) | AfterMatchSkip::ToLast(target) = &planned_skip
+        if let AfterMatchSkip::ToFirst(target) | AfterMatchSkip::ToLast(target) =
+            &planned_skip
             && !known_symbols.contains(target)
         {
-            return plan_err!("AFTER MATCH SKIP references undefined pattern variable '{target}'");
+            return plan_err!(
+                "AFTER MATCH SKIP references undefined pattern variable '{target}'"
+            );
         }
 
         let declared_names: Vec<String> =
@@ -225,13 +232,15 @@ impl RelationPlanner for MatchRecognizeRelationPlanner {
     }
 }
 
-fn lower_rows_per_match(rpm: Option<SqlRowsPerMatch>) -> RowsPerMatch {
+fn lower_rows_per_match(rpm: Option<&SqlRowsPerMatch>) -> RowsPerMatch {
     match rpm {
         None | Some(SqlRowsPerMatch::OneRow) => RowsPerMatch::OneRow,
         Some(SqlRowsPerMatch::AllRows(None | Some(SqlEmptyMode::Show))) => {
             RowsPerMatch::AllRowsShowEmpty
         }
-        Some(SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Omit))) => RowsPerMatch::AllRowsOmitEmpty,
+        Some(SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Omit))) => {
+            RowsPerMatch::AllRowsOmitEmpty
+        }
         Some(SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::WithUnmatched))) => {
             RowsPerMatch::AllRowsWithUnmatched
         }
@@ -242,7 +251,9 @@ fn lower_after_match_skip(skip: Option<SqlSkip>) -> AfterMatchSkip {
     match skip {
         None | Some(SqlSkip::PastLastRow) => AfterMatchSkip::PastLastRow,
         Some(SqlSkip::ToNextRow) => AfterMatchSkip::ToNextRow,
-        Some(SqlSkip::ToFirst(id)) => AfterMatchSkip::ToFirst(normalize_pattern_ident(id)),
+        Some(SqlSkip::ToFirst(id)) => {
+            AfterMatchSkip::ToFirst(normalize_pattern_ident(id))
+        }
         Some(SqlSkip::ToLast(id)) => AfterMatchSkip::ToLast(normalize_pattern_ident(id)),
     }
 }
@@ -250,9 +261,9 @@ fn lower_after_match_skip(skip: Option<SqlSkip>) -> AfterMatchSkip {
 fn lower_pattern(pattern: SqlPattern) -> Result<Pattern> {
     match pattern {
         SqlPattern::Symbol(sym) => Ok(Pattern::Symbol(lower_symbol(sym))),
-        SqlPattern::Exclude(sym) => Ok(Pattern::Exclude(Box::new(Pattern::Symbol(lower_symbol(
-            sym,
-        ))))),
+        SqlPattern::Exclude(sym) => Ok(Pattern::Exclude(Box::new(Pattern::Symbol(
+            lower_symbol(sym),
+        )))),
         SqlPattern::Permute(syms) => Ok(Pattern::Permute(
             syms.into_iter()
                 .map(|s| Pattern::Symbol(lower_symbol(s)))
@@ -274,7 +285,7 @@ fn lower_pattern(pattern: SqlPattern) -> Result<Pattern> {
             Ok(Pattern::Alternation(lowered))
         }
         SqlPattern::Repetition(inner, quant) => {
-            let (min, max, reluctant) = lower_quantifier(quant);
+            let (min, max, reluctant) = lower_quantifier(&quant);
             Ok(Pattern::Repetition {
                 inner: Box::new(lower_pattern(*inner)?),
                 min,
@@ -293,8 +304,8 @@ fn lower_symbol(sym: SqlSymbol) -> SymbolRef {
     }
 }
 
-fn lower_quantifier(quant: SqlQuant) -> (u32, Option<u32>, bool) {
-    match quant {
+fn lower_quantifier(quant: &SqlQuant) -> (u32, Option<u32>, bool) {
+    match *quant {
         SqlQuant::ZeroOrMore => (0, None, false),
         SqlQuant::OneOrMore => (1, None, false),
         SqlQuant::AtMostOne => (0, Some(1), false),
@@ -366,7 +377,8 @@ fn is_stateful_define(
         | SqlExpr::Floor { expr, .. } => {
             is_stateful_define(expr, current_symbol, known_symbols, ctx)
         }
-        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
+        SqlExpr::IsDistinctFrom(left, right)
+        | SqlExpr::IsNotDistinctFrom(left, right) => {
             is_stateful_define(left, current_symbol, known_symbols, ctx)
                 || is_stateful_define(right, current_symbol, known_symbols, ctx)
         }
@@ -383,20 +395,20 @@ fn is_stateful_define(
             ..
         } => {
             is_stateful_define(expr, current_symbol, known_symbols, ctx)
-                || substring_from
-                    .as_deref()
-                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
-                || substring_for
-                    .as_deref()
-                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+                || substring_from.as_deref().is_some_and(|e| {
+                    is_stateful_define(e, current_symbol, known_symbols, ctx)
+                })
+                || substring_for.as_deref().is_some_and(|e| {
+                    is_stateful_define(e, current_symbol, known_symbols, ctx)
+                })
         }
         SqlExpr::Trim {
             expr, trim_what, ..
         } => {
             is_stateful_define(expr, current_symbol, known_symbols, ctx)
-                || trim_what
-                    .as_deref()
-                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+                || trim_what.as_deref().is_some_and(|e| {
+                    is_stateful_define(e, current_symbol, known_symbols, ctx)
+                })
         }
         SqlExpr::Position { expr, r#in } => {
             is_stateful_define(expr, current_symbol, known_symbols, ctx)
@@ -428,16 +440,14 @@ fn is_stateful_define(
             else_result,
             ..
         } => {
-            operand
-                .as_deref()
-                .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
-                || conditions.iter().any(|c| {
-                    is_stateful_define(&c.condition, current_symbol, known_symbols, ctx)
-                        || is_stateful_define(&c.result, current_symbol, known_symbols, ctx)
-                })
-                || else_result
-                    .as_deref()
-                    .is_some_and(|e| is_stateful_define(e, current_symbol, known_symbols, ctx))
+            operand.as_deref().is_some_and(|e| {
+                is_stateful_define(e, current_symbol, known_symbols, ctx)
+            }) || conditions.iter().any(|c| {
+                is_stateful_define(&c.condition, current_symbol, known_symbols, ctx)
+                    || is_stateful_define(&c.result, current_symbol, known_symbols, ctx)
+            }) || else_result.as_deref().is_some_and(|e| {
+                is_stateful_define(e, current_symbol, known_symbols, ctx)
+            })
         }
         _ => false,
     }
@@ -446,8 +456,11 @@ fn is_stateful_define(
 fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
     match expr {
         SqlExpr::CompoundIdentifier(mut idents) => {
-            if idents.len() == 2 && normalize_pattern_ident(idents[0].clone()) == current_symbol {
-                return SqlExpr::Identifier(idents.pop().expect("len 2"));
+            if idents.len() == 2
+                && normalize_pattern_ident(idents[0].clone()) == current_symbol
+                && let Some(col) = idents.pop()
+            {
+                return SqlExpr::Identifier(col);
             }
             SqlExpr::CompoundIdentifier(idents)
         }
@@ -456,8 +469,10 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
                 FunctionArguments::List(mut list) => {
                     for arg in &mut list.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            let owned =
-                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
+                            let owned = std::mem::replace(
+                                e,
+                                SqlExpr::Value(ast::Value::Null.into()),
+                            );
                             *e = strip_self_qualifier(owned, current_symbol);
                         }
                     }
@@ -571,7 +586,8 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
         } => SqlExpr::Trim {
             expr: Box::new(strip_self_qualifier(*expr, current_symbol)),
             trim_where,
-            trim_what: trim_what.map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
+            trim_what: trim_what
+                .map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
             trim_characters: trim_characters.map(|v| {
                 v.into_iter()
                     .map(|e| strip_self_qualifier(e, current_symbol))
@@ -652,7 +668,8 @@ fn strip_self_qualifier(expr: SqlExpr, current_symbol: &str) -> SqlExpr {
                     result: strip_self_qualifier(c.result, current_symbol),
                 })
                 .collect(),
-            else_result: else_result.map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
+            else_result: else_result
+                .map(|e| Box::new(strip_self_qualifier(*e, current_symbol))),
         },
         SqlExpr::Cast {
             kind,
@@ -679,7 +696,7 @@ struct SlotExtractor<'a, 'b> {
     slots: Vec<MeasureSlot>,
 }
 
-impl<'a, 'b> SlotExtractor<'a, 'b> {
+impl SlotExtractor<'_, '_> {
     fn next_slot_name(&self) -> String {
         format!("__mr_slot_{}", self.slots.len())
     }
@@ -694,7 +711,10 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
         SqlExpr::Identifier(Ident::new(slot_name))
     }
 
-    fn parse_classifier_symbol(&self, args: &FunctionArguments) -> Result<Option<String>> {
+    fn parse_classifier_symbol(
+        &self,
+        args: &FunctionArguments,
+    ) -> Result<Option<String>> {
         let (arg_exprs, _) = extract_unnamed_args(args)?;
         match arg_exprs.len() {
             0 => Ok(None),
@@ -702,11 +722,15 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 FunctionArgExpr::Expr(SqlExpr::Identifier(id)) => {
                     let sym = normalize_pattern_ident(id.clone());
                     if !self.known_symbols.contains(&sym) {
-                        return plan_err!("CLASSIFIER({sym}) references unknown pattern variable");
+                        return plan_err!(
+                            "CLASSIFIER({sym}) references unknown pattern variable"
+                        );
                     }
                     Ok(Some(sym))
                 }
-                _ => plan_err!("CLASSIFIER() argument must be a pattern variable identifier"),
+                _ => plan_err!(
+                    "CLASSIFIER() argument must be a pattern variable identifier"
+                ),
             },
             _ => plan_err!("CLASSIFIER() takes at most 1 argument"),
         }
@@ -740,13 +764,16 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         Ok(self.push_slot(slot_kind))
                     }
                     "count" | "sum" | "avg" | "min" | "max" => {
-                        let slot_kind = self.lower_agg_function(&fname, None, &func.args)?;
+                        let slot_kind =
+                            self.lower_agg_function(&fname, None, &func.args)?;
                         Ok(self.push_slot(slot_kind))
                     }
                     _ => {
                         // Check if this is any registered DataFusion AggregateUDF (e.g.
                         // ARRAY_AGG, STRING_AGG, STDDEV_SAMP, BOOL_AND, custom UDAFs).
-                        if let Some(udaf) = self.ctx.context_provider().get_aggregate_meta(&fname) {
+                        if let Some(udaf) =
+                            self.ctx.context_provider().get_aggregate_meta(&fname)
+                        {
                             let slot_kind =
                                 self.lower_agg_function(&fname, Some(udaf), &func.args)?;
                             return Ok(self.push_slot(slot_kind));
@@ -755,7 +782,9 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                             FunctionArguments::List(mut list) => {
                                 for arg in &mut list.args {
                                     match arg {
-                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                            e,
+                                        )) => {
                                             let owned = std::mem::replace(
                                                 e,
                                                 SqlExpr::Value(ast::Value::Null.into()),
@@ -785,11 +814,13 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                     let prefix = normalize_pattern_ident(idents[0].clone());
                     if self.known_symbols.contains(&prefix) {
                         let col_ident = idents[1].clone();
-                        let inner_expr = self
-                            .ctx
-                            .sql_to_expr(SqlExpr::Identifier(col_ident), self.input_schema)?;
+                        let inner_expr = self.ctx.sql_to_expr(
+                            SqlExpr::Identifier(col_ident),
+                            self.input_schema,
+                        )?;
                         if self.current_define_symbol == Some(prefix.as_str()) {
-                            return Ok(self.push_slot(MeasureSlotKind::CurrentRow { inner_expr }));
+                            return Ok(self
+                                .push_slot(MeasureSlotKind::CurrentRow { inner_expr }));
                         }
                         return Ok(self.push_slot(MeasureSlotKind::Nav {
                             logical_nav: Some(LogicalNavKind::Last),
@@ -802,9 +833,10 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         }));
                     }
                 }
-                let inner_expr = self
-                    .ctx
-                    .sql_to_expr(SqlExpr::CompoundIdentifier(idents), self.input_schema)?;
+                let inner_expr = self.ctx.sql_to_expr(
+                    SqlExpr::CompoundIdentifier(idents),
+                    self.input_schema,
+                )?;
                 Ok(self.push_bare_column_slot(inner_expr))
             }
             SqlExpr::Identifier(ident) => {
@@ -822,13 +854,21 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 op,
                 expr: Box::new(self.rewrite_outer(*expr)?),
             }),
-            SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(self.rewrite_outer(*inner)?))),
-            SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(self.rewrite_outer(*inner)?))),
+            SqlExpr::Nested(inner) => {
+                Ok(SqlExpr::Nested(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsNull(inner) => {
+                Ok(SqlExpr::IsNull(Box::new(self.rewrite_outer(*inner)?)))
+            }
             SqlExpr::IsNotNull(inner) => {
                 Ok(SqlExpr::IsNotNull(Box::new(self.rewrite_outer(*inner)?)))
             }
-            SqlExpr::IsTrue(inner) => Ok(SqlExpr::IsTrue(Box::new(self.rewrite_outer(*inner)?))),
-            SqlExpr::IsFalse(inner) => Ok(SqlExpr::IsFalse(Box::new(self.rewrite_outer(*inner)?))),
+            SqlExpr::IsTrue(inner) => {
+                Ok(SqlExpr::IsTrue(Box::new(self.rewrite_outer(*inner)?)))
+            }
+            SqlExpr::IsFalse(inner) => {
+                Ok(SqlExpr::IsFalse(Box::new(self.rewrite_outer(*inner)?)))
+            }
             SqlExpr::IsNotTrue(inner) => {
                 Ok(SqlExpr::IsNotTrue(Box::new(self.rewrite_outer(*inner)?)))
             }
@@ -946,13 +986,15 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 expr: Box::new(self.rewrite_outer(*expr)?),
                 field,
             }),
-            SqlExpr::Array(ast::Array { elem, named }) => Ok(SqlExpr::Array(ast::Array {
-                elem: elem
-                    .into_iter()
-                    .map(|e| self.rewrite_outer(e))
-                    .collect::<Result<Vec<_>>>()?,
-                named,
-            })),
+            SqlExpr::Array(ast::Array { elem, named }) => {
+                Ok(SqlExpr::Array(ast::Array {
+                    elem: elem
+                        .into_iter()
+                        .map(|e| self.rewrite_outer(e))
+                        .collect::<Result<Vec<_>>>()?,
+                    named,
+                }))
+            }
             SqlExpr::Tuple(elems) => Ok(SqlExpr::Tuple(
                 elems
                     .into_iter()
@@ -1070,12 +1112,14 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
         let offset = if arg_exprs.len() == 2 {
             match &arg_exprs[1] {
                 FunctionArgExpr::Expr(e) => parse_non_negative_u32(e)?,
-                _ => return plan_err!("{fname}() offset must be a non-negative integer literal"),
+                _ => {
+                    return plan_err!(
+                        "{fname}() offset must be a non-negative integer literal"
+                    );
+                }
             }
-        } else if matches!(fname, "prev" | "next") {
-            1
         } else {
-            0
+            u32::from(matches!(fname, "prev" | "next"))
         };
 
         match fname {
@@ -1099,7 +1143,8 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                         physical_offset: 0,
                     });
                 }
-                let mut analyzer = PatternArgAnalyzer::new(self.known_symbols, self.ctx, fname);
+                let mut analyzer =
+                    PatternArgAnalyzer::new(self.known_symbols, self.ctx, fname);
                 let rewritten = analyzer.rewrite(target_sql)?;
                 analyzer.validate_consistent_labels()?;
                 if !analyzer.has_col_or_classifier {
@@ -1156,19 +1201,33 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                             let (inner_args, inner_distinct) =
                                 extract_unnamed_args(&inner_func.args)?;
                             if inner_distinct {
-                                return plan_err!("DISTINCT is not valid in {inner_name}()");
+                                return plan_err!(
+                                    "DISTINCT is not valid in {inner_name}()"
+                                );
                             }
                             if inner_args.is_empty() || inner_args.len() > 2 {
-                                return plan_err!("{inner_name}() expects 1 or 2 arguments");
+                                return plan_err!(
+                                    "{inner_name}() expects 1 or 2 arguments"
+                                );
                             }
                             let expr = match &inner_args[0] {
                                 FunctionArgExpr::Expr(e) => e.clone(),
-                                _ => return plan_err!("{inner_name}() expects an expression"),
+                                _ => {
+                                    return plan_err!(
+                                        "{inner_name}() expects an expression"
+                                    );
+                                }
                             };
                             let l_off = if inner_args.len() == 2 {
                                 match &inner_args[1] {
-                                    FunctionArgExpr::Expr(e) => parse_non_negative_u32(e)?,
-                                    _ => return plan_err!("{inner_name}() offset must be an int"),
+                                    FunctionArgExpr::Expr(e) => {
+                                        parse_non_negative_u32(e)?
+                                    }
+                                    _ => {
+                                        return plan_err!(
+                                            "{inner_name}() offset must be an int"
+                                        );
+                                    }
                                 }
                             } else {
                                 0
@@ -1201,8 +1260,11 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                     });
                 }
 
-                let mut analyzer =
-                    PatternArgAnalyzer::new(self.known_symbols, self.ctx, &inner_nav_name);
+                let mut analyzer = PatternArgAnalyzer::new(
+                    self.known_symbols,
+                    self.ctx,
+                    &inner_nav_name,
+                );
                 let rewritten = analyzer.rewrite(inner_target)?;
                 analyzer.validate_consistent_labels()?;
                 if !analyzer.has_col_or_classifier {
@@ -1278,7 +1340,9 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
                 }
                 FunctionArgExpr::QualifiedWildcard(obj_name) => {
                     if fname != "count" || distinct {
-                        return plan_err!("{fname}({obj_name}.*) is not valid in MATCH_RECOGNIZE");
+                        return plan_err!(
+                            "{fname}({obj_name}.*) is not valid in MATCH_RECOGNIZE"
+                        );
                     }
                     let ident = obj_name
                         .0
@@ -1323,9 +1387,8 @@ impl<'a, 'b> SlotExtractor<'a, 'b> {
         let mut rewritten_sql_args = Vec::with_capacity(arg_exprs.len());
 
         for (i, arg) in arg_exprs.into_iter().enumerate() {
-            let sql_expr = match arg {
-                FunctionArgExpr::Expr(e) => e,
-                _ => return plan_err!("Wildcard arguments are not supported in {fname}()"),
+            let FunctionArgExpr::Expr(sql_expr) = arg else {
+                return plan_err!("Wildcard arguments are not supported in {fname}()");
             };
 
             let (phys_nav, unwrapped_sql) = unwrap_arg_physical_nav(sql_expr)?;
@@ -1378,10 +1441,14 @@ fn check_function_clauses(func: &ast::Function) -> Result<()> {
         );
     }
     if func.filter.is_some() {
-        return plan_err!("Cannot use FILTER clause with '{fname}()' inside MATCH_RECOGNIZE");
+        return plan_err!(
+            "Cannot use FILTER clause with '{fname}()' inside MATCH_RECOGNIZE"
+        );
     }
     if !func.within_group.is_empty() {
-        return plan_err!("Cannot use WITHIN GROUP with '{fname}()' inside MATCH_RECOGNIZE");
+        return plan_err!(
+            "Cannot use WITHIN GROUP with '{fname}()' inside MATCH_RECOGNIZE"
+        );
     }
     if let FunctionArguments::List(list) = &func.args
         && !list.clauses.is_empty()
@@ -1480,7 +1547,9 @@ fn validate_no_illegal_function_clauses(expr: &SqlExpr) -> Result<()> {
     }
 }
 
-fn unwrap_arg_physical_nav(expr: SqlExpr) -> Result<(Option<(PhysicalNavKind, u32)>, SqlExpr)> {
+fn unwrap_arg_physical_nav(
+    expr: SqlExpr,
+) -> Result<(Option<(PhysicalNavKind, u32)>, SqlExpr)> {
     if let SqlExpr::Function(ref func) = expr {
         let name = func.name.to_string().to_ascii_lowercase();
         if matches!(name.as_str(), "prev" | "next") {
@@ -1515,11 +1584,14 @@ fn unwrap_arg_physical_nav(expr: SqlExpr) -> Result<(Option<(PhysicalNavKind, u3
     Ok((None, expr))
 }
 
-fn extract_unnamed_args(args: &FunctionArguments) -> Result<(Vec<FunctionArgExpr>, bool)> {
+fn extract_unnamed_args(
+    args: &FunctionArguments,
+) -> Result<(Vec<FunctionArgExpr>, bool)> {
     match args {
         FunctionArguments::None => Ok((vec![], false)),
         FunctionArguments::List(list) => {
-            let distinct = matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct));
+            let distinct =
+                matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct));
             let mut out = Vec::with_capacity(list.args.len());
             for arg in &list.args {
                 match arg {
@@ -1549,17 +1621,24 @@ fn parse_non_negative_u32(expr: &SqlExpr) -> Result<u32> {
                     )
                 })?;
                 if n > i32::MAX as u32 {
-                    return plan_err!("Navigation offset must not exceed {} (got {n})", i32::MAX);
+                    return plan_err!(
+                        "Navigation offset must not exceed {} (got {n})",
+                        i32::MAX
+                    );
                 }
                 Ok(n)
             }
-            other => plan_err!("Navigation offset must be an integer literal, got {other}"),
+            other => {
+                plan_err!("Navigation offset must be an integer literal, got {other}")
+            }
         },
         SqlExpr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
         } => parse_non_negative_u32(expr),
-        other => plan_err!("Navigation offset must be a non-negative integer literal, got {other}"),
+        other => plan_err!(
+            "Navigation offset must be a non-negative integer literal, got {other}"
+        ),
     }
 }
 
@@ -1634,9 +1713,11 @@ impl<'a> PatternArgAnalyzer<'a> {
                 self.has_col_or_classifier = true;
                 if idents.len() == 2 {
                     let prefix = normalize_pattern_ident(idents[0].clone());
-                    if self.known_symbols.contains(&prefix) {
+                    if self.known_symbols.contains(&prefix)
+                        && let Some(col) = idents.pop()
+                    {
                         self.record_label(prefix)?;
-                        return Ok(SqlExpr::Identifier(idents.pop().expect("len 2")));
+                        return Ok(SqlExpr::Identifier(col));
                     }
                 }
                 self.has_unlabeled = true;
@@ -1694,7 +1775,9 @@ impl<'a> PatternArgAnalyzer<'a> {
                         return plan_err!("MATCH_NUMBER() takes no arguments");
                     }
                     self.uses_match_metadata = true;
-                    return Ok(SqlExpr::Identifier(Ident::new(AGG_META_MATCH_NUMBER_COL)));
+                    return Ok(SqlExpr::Identifier(Ident::new(
+                        AGG_META_MATCH_NUMBER_COL,
+                    )));
                 }
                 let args = match func.args {
                     FunctionArguments::List(mut list) => {
@@ -1707,7 +1790,9 @@ impl<'a> PatternArgAnalyzer<'a> {
                                     );
                                     *e = self.rewrite(owned)?;
                                 }
-                                FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(obj)) => {
+                                FunctionArg::Unnamed(
+                                    FunctionArgExpr::QualifiedWildcard(obj),
+                                ) => {
                                     return plan_err!(
                                         "{obj}.* is only supported as the argument of COUNT() in MATCH_RECOGNIZE"
                                     );
@@ -1730,14 +1815,30 @@ impl<'a> PatternArgAnalyzer<'a> {
                 op,
                 expr: Box::new(self.rewrite(*expr)?),
             }),
-            SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsTrue(inner) => Ok(SqlExpr::IsTrue(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsFalse(inner) => Ok(SqlExpr::IsFalse(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsNotTrue(inner) => Ok(SqlExpr::IsNotTrue(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsNotFalse(inner) => Ok(SqlExpr::IsNotFalse(Box::new(self.rewrite(*inner)?))),
-            SqlExpr::IsUnknown(inner) => Ok(SqlExpr::IsUnknown(Box::new(self.rewrite(*inner)?))),
+            SqlExpr::Nested(inner) => {
+                Ok(SqlExpr::Nested(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsNull(inner) => {
+                Ok(SqlExpr::IsNull(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsNotNull(inner) => {
+                Ok(SqlExpr::IsNotNull(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsTrue(inner) => {
+                Ok(SqlExpr::IsTrue(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsFalse(inner) => {
+                Ok(SqlExpr::IsFalse(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsNotTrue(inner) => {
+                Ok(SqlExpr::IsNotTrue(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsNotFalse(inner) => {
+                Ok(SqlExpr::IsNotFalse(Box::new(self.rewrite(*inner)?)))
+            }
+            SqlExpr::IsUnknown(inner) => {
+                Ok(SqlExpr::IsUnknown(Box::new(self.rewrite(*inner)?)))
+            }
             SqlExpr::IsNotUnknown(inner) => {
                 Ok(SqlExpr::IsNotUnknown(Box::new(self.rewrite(*inner)?)))
             }
@@ -1887,7 +1988,8 @@ impl<'a> PatternArgAnalyzer<'a> {
                 conditions,
                 else_result,
             } => {
-                let operand = operand.map(|e| self.rewrite(*e)).transpose()?.map(Box::new);
+                let operand =
+                    operand.map(|e| self.rewrite(*e)).transpose()?.map(Box::new);
                 let mut new_conditions = Vec::with_capacity(conditions.len());
                 for c in conditions {
                     new_conditions.push(ast::CaseWhen {
@@ -1907,13 +2009,15 @@ impl<'a> PatternArgAnalyzer<'a> {
                     else_result,
                 })
             }
-            SqlExpr::Array(ast::Array { elem, named }) => Ok(SqlExpr::Array(ast::Array {
-                elem: elem
-                    .into_iter()
-                    .map(|e| self.rewrite(e))
-                    .collect::<Result<Vec<_>>>()?,
-                named,
-            })),
+            SqlExpr::Array(ast::Array { elem, named }) => {
+                Ok(SqlExpr::Array(ast::Array {
+                    elem: elem
+                        .into_iter()
+                        .map(|e| self.rewrite(e))
+                        .collect::<Result<Vec<_>>>()?,
+                    named,
+                }))
+            }
             SqlExpr::Tuple(elems) => Ok(SqlExpr::Tuple(
                 elems
                     .into_iter()

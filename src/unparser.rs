@@ -3,22 +3,21 @@
 //! [`UserDefinedLogicalNodeUnparser`] implementation converting [`MatchRecognizeNode`] back into
 //! SQL (`TableFactor::MatchRecognize`) for plan-to-SQL round-tripping and query federation.
 
-use std::collections::HashMap;
-
-use datafusion_common::{Result, plan_err};
+use datafusion_common::{HashMap, Result, plan_err};
 use datafusion_expr::{Expr, UserDefinedLogicalNode};
 use datafusion_sql::unparser::Unparser;
 use datafusion_sql::unparser::extension_unparser::{
     UnparseToStatementResult, UserDefinedLogicalNodeUnparser,
 };
 use sqlparser::ast::{
-    self, AfterMatchSkip as SqlSkip, DuplicateTreatment, EmptyMatchesMode as SqlEmptyMode,
-    Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, MatchRecognizePattern as SqlPattern,
-    MatchRecognizeSymbol as SqlSymbol, Measure as SqlMeasure, ObjectName, ObjectNamePart,
-    OrderByExpr, OrderByOptions, OrderBySort, Query, RepetitionQuantifier as SqlQuant,
-    RowsPerMatch as SqlRowsPerMatch, Select, SelectItem, SetExpr, SymbolDefinition as SqlSymDef,
-    TableFactor, TableWithJoins,
+    self, AfterMatchSkip as SqlSkip, DuplicateTreatment,
+    EmptyMatchesMode as SqlEmptyMode, Expr as SqlExpr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    MatchRecognizePattern as SqlPattern, MatchRecognizeSymbol as SqlSymbol,
+    Measure as SqlMeasure, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions,
+    OrderBySort, Query, RepetitionQuantifier as SqlQuant,
+    RowsPerMatch as SqlRowsPerMatch, Select, SelectItem, SetExpr,
+    SymbolDefinition as SqlSymDef, TableFactor, TableWithJoins,
 };
 
 use crate::ast::{
@@ -137,8 +136,12 @@ pub fn match_recognize_to_table_factor(
 
     let rows_per_match = Some(match mr.rows_per_match {
         RowsPerMatch::OneRow => SqlRowsPerMatch::OneRow,
-        RowsPerMatch::AllRowsShowEmpty => SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Show)),
-        RowsPerMatch::AllRowsOmitEmpty => SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Omit)),
+        RowsPerMatch::AllRowsShowEmpty => {
+            SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Show))
+        }
+        RowsPerMatch::AllRowsOmitEmpty => {
+            SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::Omit))
+        }
         RowsPerMatch::AllRowsWithUnmatched => {
             SqlRowsPerMatch::AllRows(Some(SqlEmptyMode::WithUnmatched))
         }
@@ -426,10 +429,15 @@ fn build_unparse_meta_map(symbol: Option<&str>) -> HashMap<String, SqlExpr> {
 
 fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
     match expr {
-        SqlExpr::Identifier(id) => SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), id]),
+        SqlExpr::Identifier(id) => {
+            SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), id])
+        }
         SqlExpr::CompoundIdentifier(mut ids) => {
-            let col = ids.pop().expect("non-empty compound identifier");
-            SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), col])
+            if let Some(col) = ids.pop() {
+                SqlExpr::CompoundIdentifier(vec![pattern_ident(sym), col])
+            } else {
+                SqlExpr::CompoundIdentifier(ids)
+            }
         }
         SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
             left: Box::new(qualify_identifiers(*left, sym)),
@@ -440,9 +448,15 @@ fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
             op,
             expr: Box::new(qualify_identifiers(*expr, sym)),
         },
-        SqlExpr::Nested(inner) => SqlExpr::Nested(Box::new(qualify_identifiers(*inner, sym))),
-        SqlExpr::IsNull(inner) => SqlExpr::IsNull(Box::new(qualify_identifiers(*inner, sym))),
-        SqlExpr::IsNotNull(inner) => SqlExpr::IsNotNull(Box::new(qualify_identifiers(*inner, sym))),
+        SqlExpr::Nested(inner) => {
+            SqlExpr::Nested(Box::new(qualify_identifiers(*inner, sym)))
+        }
+        SqlExpr::IsNull(inner) => {
+            SqlExpr::IsNull(Box::new(qualify_identifiers(*inner, sym)))
+        }
+        SqlExpr::IsNotNull(inner) => {
+            SqlExpr::IsNotNull(Box::new(qualify_identifiers(*inner, sym)))
+        }
         SqlExpr::IsDistinctFrom(l, r) => SqlExpr::IsDistinctFrom(
             Box::new(qualify_identifiers(*l, sym)),
             Box::new(qualify_identifiers(*r, sym)),
@@ -520,8 +534,10 @@ fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
                 FunctionArguments::List(mut list) => {
                     for arg in &mut list.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            let owned =
-                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
+                            let owned = std::mem::replace(
+                                e,
+                                SqlExpr::Value(ast::Value::Null.into()),
+                            );
                             *e = qualify_identifiers(owned, sym);
                         }
                     }
@@ -569,7 +585,9 @@ fn qualify_identifiers(expr: SqlExpr, sym: &str) -> SqlExpr {
 
 fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
     match expr {
-        SqlExpr::Identifier(ref id) if map.contains_key(&id.value) => map[&id.value].clone(),
+        SqlExpr::Identifier(ref id) if map.contains_key(&id.value) => {
+            map[&id.value].clone()
+        }
         SqlExpr::CompoundIdentifier(ref ids)
             if ids.len() == 1 && map.contains_key(&ids[0].value) =>
         {
@@ -584,9 +602,15 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
             op,
             expr: Box::new(substitute_slots(*expr, map)),
         },
-        SqlExpr::Nested(inner) => SqlExpr::Nested(Box::new(substitute_slots(*inner, map))),
-        SqlExpr::IsNull(inner) => SqlExpr::IsNull(Box::new(substitute_slots(*inner, map))),
-        SqlExpr::IsNotNull(inner) => SqlExpr::IsNotNull(Box::new(substitute_slots(*inner, map))),
+        SqlExpr::Nested(inner) => {
+            SqlExpr::Nested(Box::new(substitute_slots(*inner, map)))
+        }
+        SqlExpr::IsNull(inner) => {
+            SqlExpr::IsNull(Box::new(substitute_slots(*inner, map)))
+        }
+        SqlExpr::IsNotNull(inner) => {
+            SqlExpr::IsNotNull(Box::new(substitute_slots(*inner, map)))
+        }
         SqlExpr::IsDistinctFrom(l, r) => SqlExpr::IsDistinctFrom(
             Box::new(substitute_slots(*l, map)),
             Box::new(substitute_slots(*r, map)),
@@ -657,8 +681,10 @@ fn substitute_slots(expr: SqlExpr, map: &HashMap<String, SqlExpr>) -> SqlExpr {
                 FunctionArguments::List(mut list) => {
                     for arg in &mut list.args {
                         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            let owned =
-                                std::mem::replace(e, SqlExpr::Value(ast::Value::Null.into()));
+                            let owned = std::mem::replace(
+                                e,
+                                SqlExpr::Value(ast::Value::Null.into()),
+                            );
                             *e = substitute_slots(owned, map);
                         }
                     }
@@ -725,7 +751,11 @@ fn unparse_pattern(p: &Pattern) -> Result<SqlPattern> {
                     Pattern::Symbol(SymbolRef::Named(s)) => {
                         syms.push(SqlSymbol::Named(pattern_ident(s)))
                     }
-                    _ => return plan_err!("sqlparser 0.63.0 PERMUTE expects named symbols"),
+                    _ => {
+                        return plan_err!(
+                            "sqlparser 0.63.0 PERMUTE expects named symbols"
+                        );
+                    }
                 }
             }
             Ok(SqlPattern::Permute(syms))
@@ -736,12 +766,14 @@ fn unparse_pattern(p: &Pattern) -> Result<SqlPattern> {
                 .map(unparse_pattern)
                 .collect::<Result<Vec<_>>>()?,
         )),
-        Pattern::Alternation(items) => Ok(SqlPattern::Group(Box::new(SqlPattern::Alternation(
-            items
-                .iter()
-                .map(unparse_pattern)
-                .collect::<Result<Vec<_>>>()?,
-        )))),
+        Pattern::Alternation(items) => {
+            Ok(SqlPattern::Group(Box::new(SqlPattern::Alternation(
+                items
+                    .iter()
+                    .map(unparse_pattern)
+                    .collect::<Result<Vec<_>>>()?,
+            ))))
+        }
         Pattern::Repetition {
             inner,
             min,
@@ -749,7 +781,9 @@ fn unparse_pattern(p: &Pattern) -> Result<SqlPattern> {
             reluctant,
         } => {
             if *reluctant {
-                return plan_err!("sqlparser 0.63.0 does not yet unparse reluctant quantifiers");
+                return plan_err!(
+                    "sqlparser 0.63.0 does not yet unparse reluctant quantifiers"
+                );
             }
             let quant = match (*min, *max) {
                 (0, None) => SqlQuant::ZeroOrMore,

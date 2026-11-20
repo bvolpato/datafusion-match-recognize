@@ -8,7 +8,9 @@ use std::path::Path;
 use arrow::array::{Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_match_recognize::{MatchRecognizeConfig, session_context_with_match_recognize};
+use datafusion_match_recognize::{
+    MatchRecognizeConfig, session_context_with_match_recognize,
+};
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 
 struct MatchRecognizeDb {
@@ -20,8 +22,9 @@ impl MatchRecognizeDb {
         let cfg = SessionConfig::new()
             .with_batch_size(batch_size)
             .with_target_partitions(target_partitions);
-        let ctx = session_context_with_match_recognize(cfg, MatchRecognizeConfig::default())
-            .expect("session context");
+        let ctx =
+            session_context_with_match_recognize(cfg, MatchRecognizeConfig::default())
+                .expect("session context");
         Self { ctx }
     }
 }
@@ -69,7 +72,10 @@ impl AsyncDB for MatchRecognizeDb {
     type Error = datafusion_common::DataFusionError;
     type ColumnType = DefaultColumnType;
 
-    async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
+    async fn run(
+        &mut self,
+        sql: &str,
+    ) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
         let df = self.ctx.sql(sql).await?;
         let schema = df.schema().clone();
         let batches = df.collect().await?;

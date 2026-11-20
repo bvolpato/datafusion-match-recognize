@@ -74,12 +74,12 @@ The tables below compare `datafusion-match-recognize` against Trino 484 on five 
 
 | Workload | Matched output rows | DataFusion p50 | Trino server exec p50 | Trino CPU p50 | Relative (vs Trino exec) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `1_funnel_3step_stateless` | 1,000,000 | **0.85 s** (850 ms) | 8.63 s (8,631 ms) | 21.97 s | 10.2x faster |
-| `2_funnel_sparse_1pct_fast_skip` | 2,000 | **0.43 s** (427 ms) | 3.30 s (3,300 ms) | 9.48 s | 7.7x faster |
-| `3_overlapping_skip_next_all_rows` | 15,092,674 | **2.16 s** (2,161 ms) | 30.89 s (30,892 ms) | 50.81 s | 14.3x faster |
-| `4_stock_vshape_stateful_prev` | 3,043,902 | **2.84 s** (2,845 ms) | 18.49 s (18,486 ms) | 38.33 s | 6.5x faster |
-| `5_time_window_funnel_stateful` | 880,000 | **2.11 s** (2,113 ms) | 12.04 s (12,038 ms) | 26.04 s | 5.7x faster |
-| **Total (all 5 workloads)** | **20,018,576** | **8.40 s** | **73.35 s** | **146.64 s** | **8.7x faster** |
+| `1_funnel_3step_stateless` | 1,000,000 | **0.850 s** | 8.631 s | 21.97 s | 10.2x faster |
+| `2_funnel_sparse_1pct_fast_skip` | 2,000 | **0.427 s** | 3.300 s | 9.48 s | 7.7x faster |
+| `3_overlapping_skip_next_all_rows` | 15,092,674 | **2.161 s** | 30.892 s | 50.81 s | 14.3x faster |
+| `4_stock_vshape_stateful_prev` | 3,043,902 | **2.845 s** | 18.486 s | 38.33 s | 6.5x faster |
+| `5_time_window_funnel_stateful` | 880,000 | **2.113 s** | 12.038 s | 26.04 s | 5.7x faster |
+| **Total (all 5 workloads)** | **20,018,576** | **8.396 s** | **73.347 s** | **146.64 s** | **8.7x faster** |
 
 **Conditions.** Both engines ran sequentially (never concurrently) inside identical Linux ARM64 Docker containers (`--cpus=8 --memory=12g`) on the same Colima VM, scanning the exact same 10,000,000-row Parquet files written by Trino's Hive file metastore. DataFusion was pinned to `target_partitions = 8` and 8 Tokio worker threads. Each workload ran 2 warmup iterations (to warm Trino's JIT) followed by 5 measured runs (median p50 reported), wrapped in `SELECT COUNT(*), SUM(...)` so result transfer is 1 row, with exact checksum parity verified across containers on every query. Trino's server-side `elapsedTimeMillis` is reported so HTTP client round-trip time is excluded.
 

@@ -5,7 +5,7 @@
 //! `DEFINE` evaluation, `SUBSET` union variables, `DISTINCT` aggregates, arbitrary DataFusion
 //! `AggregateUDF`s, and automatic disk spilling via DataFusion's [`SpillManager`].
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::{self, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,32 +29,39 @@ use datafusion::physical_plan::metrics::{
 use datafusion::physical_plan::spill::SpillManager;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    ExecutionPlanProperties, InputDistributionRequirements, PlanProperties, ReplaceChildrenOptions,
+    ExecutionPlanProperties, InputDistributionRequirements, PlanProperties,
+    ReplaceChildrenOptions,
 };
-use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
+use datafusion::physical_planner::{
+    DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner,
+};
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{DFSchema, DataFusionError, Result, exec_datafusion_err, internal_err};
+use datafusion_common::{
+    DFSchema, DataFusionError, HashMap, Result, exec_datafusion_err,
+    internal_datafusion_err, internal_err,
+};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, UserDefinedLogicalNode};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{
-    LexRequirement, OrderingRequirements, PhysicalExpr, PhysicalSortExpr, PhysicalSortRequirement,
-    create_physical_expr,
+    LexRequirement, OrderingRequirements, PhysicalExpr, PhysicalSortExpr,
+    PhysicalSortRequirement, create_physical_expr,
 };
 use futures::stream::Stream;
 
 use crate::ast::{
-    AfterMatchSkip, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, Pattern, RowsPerMatch,
-    SubsetDef, SymbolDefKind,
+    AfterMatchSkip, MatchRecognizeConfig, MeasureSlot, MeasureSlotKind, Pattern,
+    RowsPerMatch, SubsetDef, SymbolDefKind,
 };
 use crate::logical::{
     MatchRecognizeNode, build_agg_metadata_dfschema, slot_data_type_and_nullability,
 };
 use crate::matcher::{Matcher, PartitionSymbols};
 use crate::measures::{
-    PartitionStatefulEvaluator, PhysicalMeasure, PhysicalMeasureSlot, PhysicalMeasureSlotKind,
-    StatefulDefineInput, build_partition_output_batch, build_physical_slot_schema,
+    PartitionStatefulEvaluator, PhysicalMeasure, PhysicalMeasureSlot,
+    PhysicalMeasureSlotKind, StatefulDefineInput, build_partition_output_batch,
+    build_physical_slot_schema,
 };
 use crate::pattern::Program;
 
@@ -176,14 +183,20 @@ fn compile_physical_slots(
                 } else {
                     input_dfschema
                 };
-                let phys_inner =
-                    create_physical_expr(inner_expr, eval_schema, exec_props, planning_ctx)?;
+                let phys_inner = create_physical_expr(
+                    inner_expr,
+                    eval_schema,
+                    exec_props,
+                    planning_ctx,
+                )?;
                 PhysicalMeasureSlotKind::Nav {
                     logical_nav: *logical_nav,
                     logical_offset: *logical_offset,
                     physical_nav: *physical_nav,
                     physical_offset: *physical_offset,
-                    symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
+                    symbol_set: symbol
+                        .as_ref()
+                        .and_then(|s| program.resolve_symbol_set(s)),
                     symbol: symbol.clone(),
                     inner_expr: phys_inner,
                     uses_match_metadata: *uses_match_metadata,
@@ -206,11 +219,15 @@ fn compile_physical_slots(
                 };
                 let phys_args = args
                     .iter()
-                    .map(|e| create_physical_expr(e, eval_schema, exec_props, planning_ctx))
+                    .map(|e| {
+                        create_physical_expr(e, eval_schema, exec_props, planning_ctx)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 PhysicalMeasureSlotKind::Agg {
                     agg_kind: agg_kind.clone(),
-                    symbol_set: symbol.as_ref().and_then(|s| program.resolve_symbol_set(s)),
+                    symbol_set: symbol
+                        .as_ref()
+                        .and_then(|s| program.resolve_symbol_set(s)),
                     symbol: symbol.clone(),
                     args: phys_args,
                     distinct: *distinct,
@@ -219,8 +236,12 @@ fn compile_physical_slots(
                 }
             }
             MeasureSlotKind::CurrentRow { inner_expr } => {
-                let phys_inner =
-                    create_physical_expr(inner_expr, input_dfschema, exec_props, planning_ctx)?;
+                let phys_inner = create_physical_expr(
+                    inner_expr,
+                    input_dfschema,
+                    exec_props,
+                    planning_ctx,
+                )?;
                 PhysicalMeasureSlotKind::CurrentRow {
                     inner_expr: phys_inner,
                 }
@@ -266,8 +287,12 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
             .order_by
             .iter()
             .map(|ob| {
-                let expr =
-                    create_physical_expr(&ob.expr, input_dfschema, exec_props, planning_ctx)?;
+                let expr = create_physical_expr(
+                    &ob.expr,
+                    input_dfschema,
+                    exec_props,
+                    planning_ctx,
+                )?;
                 let input_col_idx = expr.downcast_ref::<Column>().map(|c| c.index());
                 Ok(PhysicalOrderBySpec {
                     expr,
@@ -293,8 +318,12 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
         for d in &mr_node.definitions {
             let kind = match &d.kind {
                 SymbolDefKind::Stateless { predicate } => {
-                    let phys_pred =
-                        create_physical_expr(predicate, input_dfschema, exec_props, planning_ctx)?;
+                    let phys_pred = create_physical_expr(
+                        predicate,
+                        input_dfschema,
+                        exec_props,
+                        planning_ctx,
+                    )?;
                     PhysicalSymbolDefKind::Stateless {
                         predicate: phys_pred,
                     }
@@ -310,8 +339,12 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
                     )?;
                     let slot_schema = build_physical_slot_schema(&phys_slots);
                     let slot_dfschema = DFSchema::try_from(slot_schema.as_ref().clone())?;
-                    let phys_outer =
-                        create_physical_expr(outer_expr, &slot_dfschema, exec_props, planning_ctx)?;
+                    let phys_outer = create_physical_expr(
+                        outer_expr,
+                        &slot_dfschema,
+                        exec_props,
+                        planning_ctx,
+                    )?;
                     PhysicalSymbolDefKind::Stateful {
                         outer_expr: phys_outer,
                         slot_schema,
@@ -337,8 +370,12 @@ impl ExtensionPlanner for MatchRecognizeExtensionPlanner {
             )?;
             let slot_schema = build_physical_slot_schema(&phys_slots);
             let slot_dfschema = DFSchema::try_from(slot_schema.as_ref().clone())?;
-            let outer_expr =
-                create_physical_expr(&m.outer_expr, &slot_dfschema, exec_props, planning_ctx)?;
+            let outer_expr = create_physical_expr(
+                &m.outer_expr,
+                &slot_dfschema,
+                exec_props,
+                planning_ctx,
+            )?;
 
             physical_measures.push(PhysicalMeasure {
                 alias: m.alias.clone(),
@@ -388,7 +425,7 @@ pub struct MatchRecognizeExec {
 }
 
 impl MatchRecognizeExec {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         partition_by: Vec<Arc<dyn PhysicalExpr>>,
@@ -416,7 +453,7 @@ impl MatchRecognizeExec {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new_with_subsets(
         input: Arc<dyn ExecutionPlan>,
         partition_by: Vec<Arc<dyn PhysicalExpr>>,
@@ -430,7 +467,8 @@ impl MatchRecognizeExec {
         config: MatchRecognizeConfig,
         output_schema: SchemaRef,
     ) -> Result<Self> {
-        let declared_names: Vec<String> = definitions.iter().map(|d| d.name.clone()).collect();
+        let declared_names: Vec<String> =
+            definitions.iter().map(|d| d.name.clone()).collect();
         let program = Arc::new(Program::compile_with_subsets(
             &pattern,
             &declared_names,
@@ -559,7 +597,8 @@ fn apply_slot_exprs(
                     }
                 }
             }
-            PhysicalMeasureSlotKind::MatchNumber | PhysicalMeasureSlotKind::Classifier { .. } => {}
+            PhysicalMeasureSlotKind::MatchNumber
+            | PhysicalMeasureSlotKind::Classifier { .. } => {}
         }
     }
     Ok(TreeNodeRecursion::Continue)
@@ -656,7 +695,10 @@ impl ExecutionPlan for MatchRecognizeExec {
         _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
-            return internal_err!("MatchRecognizeExec expects 1 child, got {}", children.len());
+            return internal_err!(
+                "MatchRecognizeExec expects 1 child, got {}",
+                children.len()
+            );
         }
         let child = children.swap_remove(0);
         Ok(Arc::new(Self::try_new_with_subsets(
@@ -740,7 +782,7 @@ impl ExecutionPlan for MatchRecognizeExec {
             buffered_batches: Vec::new(),
             spilled_files: Vec::new(),
             spill_manager,
-            pending_outputs: std::collections::VecDeque::new(),
+            pending_outputs: VecDeque::new(),
             input_done: false,
             reservation,
             metrics,
@@ -770,7 +812,7 @@ struct MatchRecognizeStream {
     buffered_batches: Vec<RecordBatch>,
     spilled_files: Vec<Arc<dyn SpillFile>>,
     spill_manager: Option<SpillManager>,
-    pending_outputs: std::collections::VecDeque<RecordBatch>,
+    pending_outputs: VecDeque<RecordBatch>,
     input_done: bool,
     reservation: MemoryReservation,
     metrics: BaselineMetrics,
@@ -814,10 +856,11 @@ impl MatchRecognizeStream {
             .iter()
             .map(|e| e.evaluate(&batch)?.into_array(batch.num_rows()))
             .collect::<Result<_>>()?;
-        let converter = self
-            .row_converter
-            .as_ref()
-            .expect("RowConverter present when partition_by is non-empty");
+        let converter = self.row_converter.as_ref().ok_or_else(|| {
+            internal_datafusion_err!(
+                "RowConverter missing when partition_by is non-empty"
+            )
+        })?;
         let rows = converter.convert_columns(&key_arrays)?;
 
         let num_rows = batch.num_rows();
@@ -863,7 +906,9 @@ impl MatchRecognizeStream {
         let had_spills = !spilled.is_empty();
         for spill_file in spilled {
             let path = spill_file.path().ok_or_else(|| {
-                exec_datafusion_err!("MatchRecognizeExec spill file does not expose a local path")
+                exec_datafusion_err!(
+                    "MatchRecognizeExec spill file does not expose a local path"
+                )
             })?;
             let file = std::fs::File::open(path).map_err(DataFusionError::IoError)?;
             let reader = StreamReader::try_new(file, None)?;
@@ -879,7 +924,7 @@ impl MatchRecognizeStream {
         }
 
         let partition_batch = if all_batches.len() == 1 {
-            all_batches.into_iter().next().expect("len 1")
+            all_batches.swap_remove(0)
         } else {
             compute::concat_batches(&self.input_schema, &all_batches)?
         };
@@ -891,36 +936,43 @@ impl MatchRecognizeStream {
             self.reservation.try_resize(work_mem)?;
         }
 
-        let symbols =
-            evaluate_stateless_symbols(&partition_batch, &self.program, &self.definitions)?;
+        let symbols = evaluate_stateless_symbols(
+            &partition_batch,
+            &self.program,
+            &self.definitions,
+        )?;
         if !had_spills {
             self.reservation.try_grow(symbols.memory_bytes())?;
         }
 
-        let stateful_defs: Vec<StatefulDefineInput<'_>> = self
-            .definitions
-            .iter()
-            .filter_map(|d| match &d.kind {
-                PhysicalSymbolDefKind::Stateless { .. } => None,
-                PhysicalSymbolDefKind::Stateful {
-                    outer_expr,
-                    slot_schema,
-                    slots,
-                } => self
-                    .program
-                    .symbol_id(&d.name)
-                    .map(|sym_id| StatefulDefineInput {
-                        sym_id,
+        let stateful_defs: Vec<StatefulDefineInput<'_>> =
+            self.definitions
+                .iter()
+                .filter_map(|d| match &d.kind {
+                    PhysicalSymbolDefKind::Stateless { .. } => None,
+                    PhysicalSymbolDefKind::Stateful {
                         outer_expr,
                         slot_schema,
-                        slots: slots.as_slice(),
+                        slots,
+                    } => self.program.symbol_id(&d.name).map(|sym_id| {
+                        StatefulDefineInput {
+                            sym_id,
+                            outer_expr,
+                            slot_schema,
+                            slots: slots.as_slice(),
+                        }
                     }),
-            })
-            .collect();
+                })
+                .collect();
 
-        let mut matcher = Matcher::with_max_active_threads(&self.program, self.max_active_threads);
+        let mut matcher =
+            Matcher::with_max_active_threads(&self.program, self.max_active_threads);
         let (events, _stats) = if stateful_defs.is_empty() {
-            matcher.match_partition(&symbols, &self.after_match_skip, self.rows_per_match)?
+            matcher.match_partition(
+                &symbols,
+                &self.after_match_skip,
+                self.rows_per_match,
+            )?
         } else {
             let mut stateful_eval = PartitionStatefulEvaluator::try_new(
                 &partition_batch,
@@ -971,7 +1023,8 @@ fn evaluate_stateless_symbols(
     for sym_name in &program.id_to_symbol {
         match def_map.get(sym_name.as_str()) {
             Some(PhysicalSymbolDefKind::Stateless { predicate }) => {
-                let evaluated = predicate.evaluate(partition_batch)?.into_array(num_rows)?;
+                let evaluated =
+                    predicate.evaluate(partition_batch)?.into_array(num_rows)?;
                 let bool_arr = evaluated
                     .as_any()
                     .downcast_ref::<BooleanArray>()
@@ -1002,7 +1055,10 @@ fn evaluate_stateless_symbols(
 impl Stream for MatchRecognizeStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
         loop {
             if let Some(batch) = this.pending_outputs.pop_front() {
@@ -1017,9 +1073,9 @@ impl Stream for MatchRecognizeStream {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Ok(batch))) => {
                     let timer = this.metrics.elapsed_compute().clone();
-                    let _guard = timer.timer();
+                    let guard = timer.timer();
                     let res = this.ingest_batch(batch);
-                    drop(_guard);
+                    drop(guard);
                     if let Err(e) = res {
                         this.input_done = true;
                         return Poll::Ready(Some(Err(e)));
@@ -1032,9 +1088,9 @@ impl Stream for MatchRecognizeStream {
                 Poll::Ready(None) => {
                     this.input_done = true;
                     let timer = this.metrics.elapsed_compute().clone();
-                    let _guard = timer.timer();
+                    let guard = timer.timer();
                     let res = this.flush_current_partition();
-                    drop(_guard);
+                    drop(guard);
                     if let Err(e) = res {
                         return Poll::Ready(Some(Err(e)));
                     }

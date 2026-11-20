@@ -3,15 +3,14 @@
 //! Layer 4 verification: adversarial anti-backtracking complexity gate proving PikeVM thread
 //! deduplication executes in linear time O(N * |states|) even on classic catastrophic patterns.
 
-use std::time::Instant;
-
+use datafusion_common::instant::Instant;
 use datafusion_match_recognize::ast::{MatchRecognizeConfig, Pattern, SymbolRef};
 use datafusion_match_recognize::matcher::{MatchStats, Matcher, PartitionSymbols};
 use datafusion_match_recognize::pattern::Program;
 
-fn assert_linear_no_match(name: &str, pattern: Pattern, num_rows: usize) {
+fn assert_linear_no_match(name: &str, pattern: &Pattern, num_rows: usize) {
     let program = Program::compile(
-        &pattern,
+        pattern,
         &["a".into(), "b".into()],
         MatchRecognizeConfig::default(),
     )
@@ -58,7 +57,7 @@ fn test_catastrophic_backtracking_nested_plus() {
         },
         Pattern::Symbol(SymbolRef::Named("b".into())),
     ]);
-    assert_linear_no_match("(A+)+ B", pattern, 50_000);
+    assert_linear_no_match("(A+)+ B", &pattern, 50_000);
 }
 
 #[test]
@@ -78,7 +77,7 @@ fn test_catastrophic_backtracking_nested_star() {
         },
         Pattern::Symbol(SymbolRef::Named("b".into())),
     ]);
-    assert_linear_no_match("(A*)* B", pattern, 50_000);
+    assert_linear_no_match("(A*)* B", &pattern, 50_000);
 }
 
 #[test]
@@ -96,7 +95,7 @@ fn test_catastrophic_backtracking_overlapping_alternation() {
         },
         Pattern::Symbol(SymbolRef::Named("b".into())),
     ]);
-    assert_linear_no_match("(A | A)* B", pattern, 50_000);
+    assert_linear_no_match("(A | A)* B", &pattern, 50_000);
 }
 
 #[test]
@@ -122,5 +121,5 @@ fn test_catastrophic_backtracking_classic_a_opt_n() {
         },
         Pattern::Symbol(SymbolRef::Named("b".into())),
     ]);
-    assert_linear_no_match("(A?){25} A{25} B", pattern, 20_000);
+    assert_linear_no_match("(A?){25} A{25} B", &pattern, 20_000);
 }

@@ -2,8 +2,10 @@
 
 //! SQL:2016 `MATCH_RECOGNIZE` (Row Pattern Recognition) extension for Apache DataFusion.
 //!
-//! Register with a [`datafusion::prelude::SessionContext`] via [`session_context_with_match_recognize`]
-//! or [`register_match_recognize`].
+//! Register with a [`SessionContext`] via [`session_context_with_match_recognize`],
+//! [`configure_session_state`] + [`register_relation_planner`], or the
+//! [`MatchRecognizeSessionStateBuilderExt`] and [`MatchRecognizeSessionContextExt`]
+//! extension traits.
 
 use std::sync::Arc;
 
@@ -24,9 +26,9 @@ pub mod proto;
 pub mod unparser;
 
 pub use ast::{
-    AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig, MeasureSlot,
-    MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind, RowsPerMatch, SubsetDef,
-    SymbolDef, SymbolDefKind, SymbolRef,
+    AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeConfig,
+    MeasureSlot, MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, PhysicalNavKind,
+    RowsPerMatch, SubsetDef, SymbolDef, SymbolDefKind, SymbolRef,
 };
 pub use logical::MatchRecognizeNode;
 pub use optimizer::MatchRecognizeFilterPushdown;
@@ -37,6 +39,30 @@ pub use planner::MatchRecognizeRelationPlanner;
 #[cfg(feature = "proto")]
 pub use proto::{MatchRecognizeLogicalCodec, MatchRecognizePhysicalCodec};
 pub use unparser::{MatchRecognizeUnparser, match_recognize_to_table_factor};
+
+/// Extension trait adding `MATCH_RECOGNIZE` planning and optimization onto [`SessionStateBuilder`].
+pub trait MatchRecognizeSessionStateBuilderExt {
+    /// Installs [`MatchRecognizeQueryPlanner`] and [`MatchRecognizeFilterPushdown`].
+    fn with_match_recognize(self) -> Self;
+}
+
+impl MatchRecognizeSessionStateBuilderExt for SessionStateBuilder {
+    fn with_match_recognize(self) -> Self {
+        configure_session_state(self)
+    }
+}
+
+/// Extension trait registering [`MatchRecognizeRelationPlanner`] on a [`SessionContext`].
+pub trait MatchRecognizeSessionContextExt {
+    /// Registers [`MatchRecognizeRelationPlanner`] with `config`.
+    fn register_match_recognize(&self, config: MatchRecognizeConfig) -> Result<()>;
+}
+
+impl MatchRecognizeSessionContextExt for SessionContext {
+    fn register_match_recognize(&self, config: MatchRecognizeConfig) -> Result<()> {
+        register_relation_planner(self, config)
+    }
+}
 
 /// Configures a [`SessionStateBuilder`] with `MATCH_RECOGNIZE` physical planning and
 /// partition-filter pushdown optimization.
@@ -50,7 +76,10 @@ pub fn configure_session_state(builder: SessionStateBuilder) -> SessionStateBuil
 }
 
 /// Registers [`MatchRecognizeRelationPlanner`] on an existing [`SessionContext`].
-pub fn register_relation_planner(ctx: &SessionContext, config: MatchRecognizeConfig) -> Result<()> {
+pub fn register_relation_planner(
+    ctx: &SessionContext,
+    config: MatchRecognizeConfig,
+) -> Result<()> {
     ctx.register_relation_planner(Arc::new(MatchRecognizeRelationPlanner::new(config)))
 }
 

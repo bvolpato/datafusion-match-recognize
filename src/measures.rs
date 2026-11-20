@@ -2,19 +2,21 @@
 
 //! Physical evaluation of `MATCH_RECOGNIZE` `MEASURES`, stateful `DEFINE` predicates,
 //! `SUBSET` union variables, `DISTINCT` aggregates, navigation over `CLASSIFIER()`,
-//! `PREV`/`NEXT` inside aggregates, and arbitrary DataFusion [`AggregateUDF`]s via
-//! [`datafusion_expr::Accumulator`].
+//! `PREV`/`NEXT` inside aggregates, and arbitrary DataFusion [`datafusion_expr::AggregateUDF`]s
+//! via [`datafusion_expr::Accumulator`].
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Builder, Int64Builder, RecordBatch, RecordBatchOptions,
-    StringBuilder, UInt32Array, new_null_array,
+    Array, ArrayRef, BooleanArray, Float64Builder, Int64Builder, RecordBatch,
+    RecordBatchOptions, StringBuilder, UInt32Array, new_null_array,
 };
 use arrow::compute::{self, kernels::zip};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
-use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err};
+use datafusion_common::{
+    DataFusionError, HashMap, HashSet, Result, ScalarValue, exec_err,
+    internal_datafusion_err,
+};
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_physical_expr::PhysicalExpr;
 
@@ -150,13 +152,18 @@ impl<'a> PartitionStatefulEvaluator<'a> {
                         } else {
                             let mut evaluated = Vec::with_capacity(args.len());
                             for (i, e) in args.iter().enumerate() {
-                                let raw = e.evaluate(partition_batch)?.into_array(num_part_rows)?;
+                                let raw = e
+                                    .evaluate(partition_batch)?
+                                    .into_array(num_part_rows)?;
                                 let pre = if i == 0 {
                                     match agg_kind {
-                                        AggKind::Avg => {
-                                            compute::cast(raw.as_ref(), &DataType::Float64)?
-                                        }
-                                        AggKind::Sum if raw.data_type() != &slot.data_type => {
+                                        AggKind::Avg => compute::cast(
+                                            raw.as_ref(),
+                                            &DataType::Float64,
+                                        )?,
+                                        AggKind::Sum
+                                            if raw.data_type() != &slot.data_type =>
+                                        {
                                             compute::cast(raw.as_ref(), &slot.data_type)?
                                         }
                                         _ => raw,
@@ -195,7 +202,7 @@ impl<'a> PartitionStatefulEvaluator<'a> {
     }
 }
 
-impl<'a> StatefulPredicateEvaluator for PartitionStatefulEvaluator<'a> {
+impl StatefulPredicateEvaluator for PartitionStatefulEvaluator<'_> {
     #[inline]
     fn is_stateful(&self, sym: SymbolId) -> bool {
         self.by_symbol.contains_key(&sym)
@@ -212,13 +219,18 @@ impl<'a> StatefulPredicateEvaluator for PartitionStatefulEvaluator<'a> {
         tentative_steps: &[MatchStep],
         candidate_match_number: i64,
     ) -> Result<bool> {
-        let compiled = self
-            .by_symbol
-            .get(&sym)
-            .expect("eval_stateful called only for stateful symbols");
+        let compiled = self.by_symbol.get(&sym).ok_or_else(|| {
+            internal_datafusion_err!(
+                "eval_stateful called for non-stateful symbol id {sym}"
+            )
+        })?;
         let current_row = tentative_steps
             .last()
-            .expect("tentative_steps always contains candidate row")
+            .ok_or_else(|| {
+                internal_datafusion_err!(
+                    "tentative_steps missing candidate row in eval_stateful"
+                )
+            })?
             .row_idx;
 
         let mut slot_arrays: Vec<ArrayRef> = Vec::with_capacity(compiled.slots.len());
@@ -257,7 +269,7 @@ impl<'a> StatefulPredicateEvaluator for PartitionStatefulEvaluator<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn eval_single_slot_scalar(
     partition_batch: &RecordBatch,
     horizon: &[MatchStep],
@@ -271,7 +283,9 @@ fn eval_single_slot_scalar(
     precomputed_args: &[ArrayRef],
 ) -> Result<ScalarValue> {
     match &slot.kind {
-        PhysicalMeasureSlotKind::MatchNumber => Ok(ScalarValue::Int64(Some(match_number))),
+        PhysicalMeasureSlotKind::MatchNumber => {
+            Ok(ScalarValue::Int64(Some(match_number)))
+        }
         PhysicalMeasureSlotKind::Classifier {
             symbol_set,
             logical_nav,
@@ -383,7 +397,7 @@ fn eval_single_slot_scalar(
 ///   current row up to `full_steps.len()`.
 /// - In `DEFINE`, `full_steps == tentative_steps`, so `NEXT(CLASSIFIER(), n)` past the candidate
 ///   row returns `NULL`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn eval_classifier_on_horizon(
     horizon: &[MatchStep],
     full_steps: &[MatchStep],
@@ -491,7 +505,7 @@ fn eval_metadata_nav_scalar(
 
 /// Evaluates an aggregate whose arguments reference runtime match metadata (`CLASSIFIER()` or
 /// `MATCH_NUMBER()`), such as `ARRAY_AGG(CLASSIFIER())` or `SUM(MATCH_NUMBER() * 100)`.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn eval_metadata_agg_scalar(
     partition_batch: &RecordBatch,
     horizon: &[MatchStep],
@@ -528,7 +542,8 @@ fn eval_metadata_agg_scalar(
         partition_batch.schema().as_ref(),
     ));
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(ext_schema.fields().len());
-    let take_idx = UInt32Array::from_iter(matched_steps.iter().map(|(r, _)| r.map(|i| i as u32)));
+    let take_idx =
+        UInt32Array::from_iter(matched_steps.iter().map(|(r, _)| r.map(|i| i as u32)));
     for col in partition_batch.columns() {
         cols.push(compute::take(col.as_ref(), &take_idx, None)?);
     }
@@ -587,7 +602,7 @@ fn eval_metadata_agg_scalar(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn eval_single_agg_scalar(
     horizon: &[MatchStep],
     num_part_rows: usize,
@@ -603,7 +618,7 @@ fn eval_single_agg_scalar(
     match agg_kind {
         AggKind::CountStar | AggKind::CountSymbol => {
             let count = matching_row_indices(horizon, symbol_set, None, num_part_rows)
-                .filter(|o| o.is_some())
+                .flatten()
                 .count();
             Ok(ScalarValue::Int64(Some(count as i64)))
         }
@@ -611,9 +626,12 @@ fn eval_single_agg_scalar(
             let arr = &precomputed_args[0];
             if distinct {
                 let mut seen: HashSet<ScalarValue> = HashSet::new();
-                for maybe_idx in
-                    matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                {
+                for maybe_idx in matching_row_indices(
+                    horizon,
+                    symbol_set,
+                    arg_physical_nav,
+                    num_part_rows,
+                ) {
                     if let Some(idx) = maybe_idx
                         && arr.is_valid(idx)
                     {
@@ -622,10 +640,14 @@ fn eval_single_agg_scalar(
                 }
                 Ok(ScalarValue::Int64(Some(seen.len() as i64)))
             } else {
-                let count =
-                    matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                        .filter(|maybe_idx| maybe_idx.is_some_and(|idx| arr.is_valid(idx)))
-                        .count();
+                let count = matching_row_indices(
+                    horizon,
+                    symbol_set,
+                    arg_physical_nav,
+                    num_part_rows,
+                )
+                .filter(|maybe_idx| maybe_idx.is_some_and(|idx| arr.is_valid(idx)))
+                .count();
                 Ok(ScalarValue::Int64(Some(count as i64)))
             }
         }
@@ -635,15 +657,20 @@ fn eval_single_agg_scalar(
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
                 .ok_or_else(|| {
-                    datafusion_common::exec_datafusion_err!("Expected Float64Array for AVG")
+                    datafusion_common::exec_datafusion_err!(
+                        "Expected Float64Array for AVG"
+                    )
                 })?;
             let mut sum = 0.0f64;
             let mut count = 0u64;
             if distinct {
                 let mut seen: HashSet<u64> = HashSet::new();
-                for maybe_idx in
-                    matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                {
+                for maybe_idx in matching_row_indices(
+                    horizon,
+                    symbol_set,
+                    arg_physical_nav,
+                    num_part_rows,
+                ) {
                     if let Some(idx) = maybe_idx
                         && f64_arr.is_valid(idx)
                     {
@@ -655,9 +682,12 @@ fn eval_single_agg_scalar(
                     }
                 }
             } else {
-                for maybe_idx in
-                    matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                {
+                for maybe_idx in matching_row_indices(
+                    horizon,
+                    symbol_set,
+                    arg_physical_nav,
+                    num_part_rows,
+                ) {
                     if let Some(idx) = maybe_idx
                         && f64_arr.is_valid(idx)
                     {
@@ -674,9 +704,13 @@ fn eval_single_agg_scalar(
         }
         AggKind::Sum => {
             let arr = &precomputed_args[0];
-            let valid_indices =
-                matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                    .flatten();
+            let valid_indices = matching_row_indices(
+                horizon,
+                symbol_set,
+                arg_physical_nav,
+                num_part_rows,
+            )
+            .flatten();
             if distinct {
                 sum_indices_distinct(arr, valid_indices, result_type)
             } else {
@@ -688,7 +722,8 @@ fn eval_single_agg_scalar(
             let is_min = matches!(agg_kind, AggKind::Min);
             let mut best: Option<ScalarValue> = None;
             for idx in
-                matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows).flatten()
+                matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
+                    .flatten()
             {
                 if !arr.is_valid(idx) {
                     continue;
@@ -717,12 +752,15 @@ fn eval_single_agg_scalar(
             let raw_fields: Vec<FieldRef> = precomputed_args
                 .iter()
                 .enumerate()
-                .map(|(i, a)| Arc::new(Field::new(format!("arg_{i}"), a.data_type().clone(), true)))
+                .map(|(i, a)| {
+                    Arc::new(Field::new(format!("arg_{i}"), a.data_type().clone(), true))
+                })
                 .collect();
-            let coerced_fields = datafusion_expr::type_coercion::functions::fields_with_udf(
-                &raw_fields,
-                udaf.as_ref(),
-            )?;
+            let coerced_fields =
+                datafusion_expr::type_coercion::functions::fields_with_udf(
+                    &raw_fields,
+                    udaf.as_ref(),
+                )?;
             let coerced_args: Vec<ArrayRef> = precomputed_args
                 .iter()
                 .zip(&coerced_fields)
@@ -735,11 +773,16 @@ fn eval_single_agg_scalar(
                 })
                 .collect::<Result<_>>()?;
 
-            let take_indices: Vec<Option<u32>> =
-                matching_row_indices(horizon, symbol_set, arg_physical_nav, num_part_rows)
-                    .map(|opt| opt.map(|i| i as u32))
-                    .collect();
-            let return_field = Arc::new(Field::new(udaf.name(), result_type.clone(), true));
+            let take_indices: Vec<Option<u32>> = matching_row_indices(
+                horizon,
+                symbol_set,
+                arg_physical_nav,
+                num_part_rows,
+            )
+            .map(|opt| opt.map(|i| i as u32))
+            .collect();
+            let return_field =
+                Arc::new(Field::new(udaf.name(), result_type.clone(), true));
             let acc_args = AccumulatorArgs {
                 return_field,
                 schema: input_schema,
@@ -796,7 +839,7 @@ enum EmitRow<'a> {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn build_partition_output_batch(
     partition_batch: &RecordBatch,
     events: &[PartitionEvent],
@@ -978,7 +1021,9 @@ fn evaluate_slot(
             let mut builder = Int64Builder::with_capacity(out_len);
             for row in emitted {
                 match row {
-                    EmitRow::Matched { found, .. } => builder.append_value(found.match_number),
+                    EmitRow::Matched { found, .. } => {
+                        builder.append_value(found.match_number)
+                    }
                     EmitRow::Unmatched { .. } => builder.append_null(),
                 }
             }
@@ -1071,7 +1116,8 @@ fn evaluate_slot(
                             if *is_empty_match {
                                 scalars.push(ScalarValue::try_from(&slot.data_type)?);
                             } else {
-                                let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                                let horizon =
+                                    horizon_steps(found, *step_pos, slot.semantics);
                                 let target = navigate_logical_row(
                                     horizon,
                                     *logical_nav,
@@ -1087,7 +1133,8 @@ fn evaluate_slot(
                                     )
                                 });
                                 match target {
-                                    None => scalars.push(ScalarValue::try_from(&slot.data_type)?),
+                                    None => scalars
+                                        .push(ScalarValue::try_from(&slot.data_type)?),
                                     Some(final_row) => {
                                         let cls = classifier_at_partition_row(
                                             &found.steps,
@@ -1112,33 +1159,34 @@ fn evaluate_slot(
                 let evaluated = inner_expr
                     .evaluate(partition_batch)?
                     .into_array(num_part_rows)?;
-                let indices = UInt32Array::from_iter(emitted.iter().map(|row| match row {
-                    EmitRow::Unmatched { .. } => None,
-                    EmitRow::Matched {
-                        found,
-                        step_pos,
-                        is_empty_match,
-                        ..
-                    } => {
-                        if *is_empty_match {
-                            return None;
+                let indices =
+                    UInt32Array::from_iter(emitted.iter().map(|row| match row {
+                        EmitRow::Unmatched { .. } => None,
+                        EmitRow::Matched {
+                            found,
+                            step_pos,
+                            is_empty_match,
+                            ..
+                        } => {
+                            if *is_empty_match {
+                                return None;
+                            }
+                            let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                            let base_row = navigate_logical_row(
+                                horizon,
+                                *logical_nav,
+                                *logical_offset as usize,
+                                symbol_set.as_ref(),
+                            )?;
+                            let final_row = navigate_physical(
+                                base_row,
+                                *physical_nav,
+                                *physical_offset as usize,
+                                num_part_rows,
+                            )?;
+                            Some(final_row as u32)
                         }
-                        let horizon = horizon_steps(found, *step_pos, slot.semantics);
-                        let base_row = navigate_logical_row(
-                            horizon,
-                            *logical_nav,
-                            *logical_offset as usize,
-                            symbol_set.as_ref(),
-                        )?;
-                        let final_row = navigate_physical(
-                            base_row,
-                            *physical_nav,
-                            *physical_offset as usize,
-                            num_part_rows,
-                        )?;
-                        Some(final_row as u32)
-                    }
-                }));
+                    }));
                 Ok(compute::take(evaluated.as_ref(), &indices, None)?)
             }
         }
@@ -1184,7 +1232,8 @@ fn evaluate_slot(
                                     scalars.push(ScalarValue::try_from(&slot.data_type)?);
                                 }
                             } else {
-                                let horizon = horizon_steps(found, *step_pos, slot.semantics);
+                                let horizon =
+                                    horizon_steps(found, *step_pos, slot.semantics);
                                 scalars.push(eval_metadata_agg_scalar(
                                     partition_batch,
                                     horizon,
@@ -1288,7 +1337,7 @@ fn navigate_physical(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn evaluate_agg_slot(
     partition_batch: &RecordBatch,
     emitted: &[EmitRow<'_>],
@@ -1319,9 +1368,13 @@ fn evaluate_agg_slot(
                             builder.append_value(0);
                         } else {
                             let horizon = horizon_steps(found, *step_pos, semantics);
-                            let count =
-                                matching_row_indices(horizon, symbol_set, None, num_part_rows)
-                                    .count();
+                            let count = matching_row_indices(
+                                horizon,
+                                symbol_set,
+                                None,
+                                num_part_rows,
+                            )
+                            .count();
                             builder.append_value(count as i64);
                         }
                     }
@@ -1368,11 +1421,15 @@ fn evaluate_agg_slot(
                                 builder.append_value(0);
                             } else {
                                 let horizon = horizon_steps(found, *step_pos, semantics);
-                                let count =
-                                    matching_row_indices(horizon, symbol_set, None, num_part_rows)
-                                        .flatten()
-                                        .filter(|&idx| evaluated.is_valid(idx))
-                                        .count();
+                                let count = matching_row_indices(
+                                    horizon,
+                                    symbol_set,
+                                    None,
+                                    num_part_rows,
+                                )
+                                .flatten()
+                                .filter(|&idx| evaluated.is_valid(idx))
+                                .count();
                                 builder.append_value(count as i64);
                             }
                         }
@@ -1385,7 +1442,9 @@ fn evaluate_agg_slot(
                     .as_any()
                     .downcast_ref::<arrow::array::Float64Array>()
                     .ok_or_else(|| {
-                        datafusion_common::exec_datafusion_err!("Expected Float64Array for AVG")
+                        datafusion_common::exec_datafusion_err!(
+                            "Expected Float64Array for AVG"
+                        )
                     })?;
                 let mut builder = Float64Builder::with_capacity(out_len);
                 for row in emitted {
@@ -1403,9 +1462,13 @@ fn evaluate_agg_slot(
                                 let horizon = horizon_steps(found, *step_pos, semantics);
                                 let mut sum = 0.0f64;
                                 let mut count = 0u64;
-                                for idx in
-                                    matching_row_indices(horizon, symbol_set, None, num_part_rows)
-                                        .flatten()
+                                for idx in matching_row_indices(
+                                    horizon,
+                                    symbol_set,
+                                    None,
+                                    num_part_rows,
+                                )
+                                .flatten()
                                 {
                                     if f64_arr.is_valid(idx) {
                                         sum += f64_arr.value(idx);
@@ -1519,7 +1582,9 @@ fn sum_indices(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected Int64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected Int64Array")
+                })?;
             let mut acc: Option<i64> = None;
             for idx in indices {
                 if a.is_valid(idx) {
@@ -1532,7 +1597,9 @@ fn sum_indices(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected UInt64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected UInt64Array")
+                })?;
             let mut acc: Option<u64> = None;
             for idx in indices {
                 if a.is_valid(idx) {
@@ -1545,7 +1612,9 @@ fn sum_indices(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected Float64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected Float64Array")
+                })?;
             let mut acc: Option<f64> = None;
             for idx in indices {
                 if a.is_valid(idx) {
@@ -1583,7 +1652,9 @@ fn sum_indices_distinct(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected Int64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected Int64Array")
+                })?;
             let mut seen = HashSet::new();
             let mut acc: Option<i64> = None;
             for idx in indices {
@@ -1600,7 +1671,9 @@ fn sum_indices_distinct(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::UInt64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected UInt64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected UInt64Array")
+                })?;
             let mut seen = HashSet::new();
             let mut acc: Option<u64> = None;
             for idx in indices {
@@ -1617,7 +1690,9 @@ fn sum_indices_distinct(
             let a = arr
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| datafusion_common::exec_datafusion_err!("Expected Float64Array"))?;
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("Expected Float64Array")
+                })?;
             let mut seen = HashSet::new();
             let mut acc: Option<f64> = None;
             for idx in indices {

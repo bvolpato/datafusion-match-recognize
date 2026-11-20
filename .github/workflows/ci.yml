@@ -5,7 +5,21 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@master
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -25,20 +39,25 @@ jobs:
       - name: Format check
         working-directory: datafusion-match-recognize
         run: cargo fmt --all -- --check
-      - name: Clippy
+      - name: Clippy (all targets, all features)
         working-directory: datafusion-match-recognize
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Check without default features
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (no default features)
         working-directory: datafusion-match-recognize
-        run: cargo check --lib --no-default-features
+        run: cargo clippy --lib --no-default-features -- -D warnings
+      - name: Rustdoc check
+        working-directory: datafusion-match-recognize
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features
       - name: Unit, Oracle, SLT, Invariance, and Complexity Tests
         working-directory: datafusion-match-recognize
-        run: cargo test
+        run: cargo test --profile ci
       - name: Run Examples
         working-directory: datafusion-match-recognize
         run: |
-          cargo run --example funnel
-          cargo run --example stock_vshape
+          cargo run --profile ci --example funnel
+          cargo run --profile ci --example stock_vshape
       - name: Compile Benchmarks
         working-directory: datafusion-match-recognize
         run: cargo bench --no-run

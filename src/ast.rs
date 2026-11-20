@@ -82,7 +82,9 @@ impl Pattern {
             }
             Pattern::Symbol(SymbolRef::Start | SymbolRef::End) => {}
             Pattern::Exclude(inner) => inner.collect_named_symbols(out),
-            Pattern::Permute(items) | Pattern::Concat(items) | Pattern::Alternation(items) => {
+            Pattern::Permute(items)
+            | Pattern::Concat(items)
+            | Pattern::Alternation(items) => {
                 for item in items {
                     item.collect_named_symbols(out);
                 }
@@ -96,9 +98,9 @@ impl Pattern {
         match self {
             Pattern::Symbol(_) => false,
             Pattern::Exclude(_) => true,
-            Pattern::Permute(items) | Pattern::Concat(items) | Pattern::Alternation(items) => {
-                items.iter().any(Pattern::has_exclusion)
-            }
+            Pattern::Permute(items)
+            | Pattern::Concat(items)
+            | Pattern::Alternation(items) => items.iter().any(Pattern::has_exclusion),
             Pattern::Repetition { inner, .. } => inner.has_exclusion(),
         }
     }
@@ -192,8 +194,12 @@ impl fmt::Display for RowsPerMatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RowsPerMatch::OneRow => write!(f, "ONE ROW PER MATCH"),
-            RowsPerMatch::AllRowsShowEmpty => write!(f, "ALL ROWS PER MATCH SHOW EMPTY MATCHES"),
-            RowsPerMatch::AllRowsOmitEmpty => write!(f, "ALL ROWS PER MATCH OMIT EMPTY MATCHES"),
+            RowsPerMatch::AllRowsShowEmpty => {
+                write!(f, "ALL ROWS PER MATCH SHOW EMPTY MATCHES")
+            }
+            RowsPerMatch::AllRowsOmitEmpty => {
+                write!(f, "ALL ROWS PER MATCH OMIT EMPTY MATCHES")
+            }
             RowsPerMatch::AllRowsWithUnmatched => {
                 write!(f, "ALL ROWS PER MATCH WITH UNMATCHED ROWS")
             }
@@ -348,7 +354,11 @@ impl SymbolDef {
         }
     }
 
-    pub fn stateful(name: impl Into<String>, outer_expr: Expr, slots: Vec<MeasureSlot>) -> Self {
+    pub fn stateful(
+        name: impl Into<String>,
+        outer_expr: Expr,
+        slots: Vec<MeasureSlot>,
+    ) -> Self {
         Self {
             name: name.into(),
             kind: SymbolDefKind::Stateful { outer_expr, slots },

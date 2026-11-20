@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, Decimal128Array, DictionaryArray, Float64Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, StringViewArray, TimestampNanosecondArray,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::Int32Type;
 use arrow::util::pretty::pretty_format_batches;
@@ -25,8 +26,10 @@ use datafusion_match_recognize::{
     session_context_with_match_recognize,
 };
 use datafusion_proto::bytes::{
-    logical_plan_from_bytes_with_extension_codec, logical_plan_to_bytes_with_extension_codec,
-    physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
+    logical_plan_from_bytes_with_extension_codec,
+    logical_plan_to_bytes_with_extension_codec,
+    physical_plan_from_bytes_with_extension_codec,
+    physical_plan_to_bytes_with_extension_codec,
 };
 
 fn make_multi_partition_events() -> RecordBatch {
@@ -47,8 +50,8 @@ fn make_multi_partition_events() -> RecordBatch {
         (
             "event",
             Arc::new(StringArray::from(vec![
-                "view", "view", "view", "click", "click", "buy", "other", "buy", "view", "click",
-                "view", "buy",
+                "view", "view", "view", "click", "click", "buy", "other", "buy", "view",
+                "click", "view", "buy",
             ])),
         ),
         (
@@ -158,9 +161,11 @@ async fn test_batch_size_and_partition_count_invariance() {
                 let cfg = SessionConfig::new()
                     .with_batch_size(batch_size)
                     .with_target_partitions(target_partitions);
-                let ctx =
-                    session_context_with_match_recognize(cfg, MatchRecognizeConfig::default())
-                        .unwrap();
+                let ctx = session_context_with_match_recognize(
+                    cfg,
+                    MatchRecognizeConfig::default(),
+                )
+                .unwrap();
 
                 // Split input across multiple small batches to force multi-batch partitions.
                 let mut chunks = Vec::new();
@@ -296,9 +301,11 @@ async fn test_optimizer_filter_pushdown_and_projection_pruning() {
     "#;
 
     // With MatchRecognizeFilterPushdown enabled
-    let ctx_opt =
-        session_context_with_match_recognize(SessionConfig::new(), MatchRecognizeConfig::default())
-            .unwrap();
+    let ctx_opt = session_context_with_match_recognize(
+        SessionConfig::new(),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
     ctx_opt.register_batch("events", batch.clone()).unwrap();
 
     let df_opt = ctx_opt.sql(sql).await.unwrap();
@@ -379,7 +386,9 @@ async fn test_memory_pool_enforcement_when_disk_disabled() {
     match res {
         Err(DataFusionError::ResourcesExhausted(_)) => {}
         Err(other) if other.to_string().contains("Resources exhausted") => {}
-        other => panic!("Expected ResourcesExhausted error under 64KB memory pool, got: {other:?}"),
+        other => panic!(
+            "Expected ResourcesExhausted error under 64KB memory pool, got: {other:?}"
+        ),
     }
 }
 
@@ -519,7 +528,8 @@ async fn test_logical_and_physical_proto_roundtrip() {
     let logical_plan = df.clone().into_optimized_plan().unwrap();
     let logical_codec = MatchRecognizeLogicalCodec::new();
     let logical_bytes =
-        logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec).unwrap();
+        logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec)
+            .unwrap();
     let decoded_logical = logical_plan_from_bytes_with_extension_codec(
         &logical_bytes,
         &ctx.task_ctx(),
@@ -544,12 +554,17 @@ async fn test_logical_and_physical_proto_roundtrip() {
     // 2. Physical plan protobuf round-trip
     let physical_plan = df.create_physical_plan().await.unwrap();
     let phys_codec = MatchRecognizePhysicalCodec::new();
-    let phys_bytes =
-        physical_plan_to_bytes_with_extension_codec(Arc::clone(&physical_plan), &phys_codec)
-            .unwrap();
-    let decoded_phys =
-        physical_plan_from_bytes_with_extension_codec(&phys_bytes, &ctx.task_ctx(), &phys_codec)
-            .unwrap();
+    let phys_bytes = physical_plan_to_bytes_with_extension_codec(
+        Arc::clone(&physical_plan),
+        &phys_codec,
+    )
+    .unwrap();
+    let decoded_phys = physical_plan_from_bytes_with_extension_codec(
+        &phys_bytes,
+        &ctx.task_ctx(),
+        &phys_codec,
+    )
+    .unwrap();
     let phys_batches = collect(decoded_phys, ctx.task_ctx()).await.unwrap();
     let phys_out = pretty_format_batches(&phys_batches).unwrap().to_string();
     assert_eq!(
@@ -611,7 +626,8 @@ async fn test_stateful_define_and_distinct_proto_roundtrip() {
         datafusion_proto::logical_plan::DefaultLogicalExtensionCodec {},
     ));
     let logical_bytes =
-        logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec).unwrap();
+        logical_plan_to_bytes_with_extension_codec(&logical_plan, &logical_codec)
+            .unwrap();
     let decoded_logical = logical_plan_from_bytes_with_extension_codec(
         &logical_bytes,
         &ctx.task_ctx(),
@@ -634,12 +650,17 @@ async fn test_stateful_define_and_distinct_proto_roundtrip() {
     let phys_codec = MatchRecognizePhysicalCodec::with_delegate(Arc::new(
         datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec {},
     ));
-    let phys_bytes =
-        physical_plan_to_bytes_with_extension_codec(Arc::clone(&physical_plan), &phys_codec)
-            .unwrap();
-    let decoded_phys =
-        physical_plan_from_bytes_with_extension_codec(&phys_bytes, &ctx.task_ctx(), &phys_codec)
-            .unwrap();
+    let phys_bytes = physical_plan_to_bytes_with_extension_codec(
+        Arc::clone(&physical_plan),
+        &phys_codec,
+    )
+    .unwrap();
+    let decoded_phys = physical_plan_from_bytes_with_extension_codec(
+        &phys_bytes,
+        &ctx.task_ctx(),
+        &phys_codec,
+    )
+    .unwrap();
     let phys_batches = collect(decoded_phys, ctx.task_ctx()).await.unwrap();
     let phys_out = pretty_format_batches(&phys_batches).unwrap().to_string();
     assert_eq!(phys_out, expected);
@@ -649,9 +670,9 @@ async fn test_stateful_define_and_distinct_proto_roundtrip() {
 async fn test_subset_union_variables_and_final_semantics_roundtrip() {
     use datafusion_expr::{col, lit};
     use datafusion_match_recognize::{
-        AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeNode, MeasureSlot,
-        MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, RowsPerMatch, SubsetDef, SymbolDef,
-        SymbolRef,
+        AfterMatchSkip, AggKind, EvalSemantics, LogicalNavKind, MatchRecognizeNode,
+        MeasureSlot, MeasureSlotKind, MeasureSpec, OrderBySpec, Pattern, RowsPerMatch,
+        SubsetDef, SymbolDef, SymbolRef,
     };
 
     let ctx = session_context_with_match_recognize(
@@ -786,25 +807,29 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
     let batches = df.clone().collect().await.unwrap();
     let formatted = pretty_format_batches(&batches).unwrap().to_string();
     assert!(
-        formatted
-            .contains("| 1  | 20      | 30           | 2           |               | A   | 10  |"),
+        formatted.contains(
+            "| 1  | 20      | 30           | 2           |               | A   | 10  |"
+        ),
         "got:\n{formatted}"
     );
     assert!(
-        formatted
-            .contains("| 2  | 20      | 30           | 2           | b             | B   | 20  |"),
+        formatted.contains(
+            "| 2  | 20      | 30           | 2           | b             | B   | 20  |"
+        ),
         "got:\n{formatted}"
     );
     assert!(
-        formatted
-            .contains("| 3  | 20      | 30           | 2           | c             | C   | 30  |"),
+        formatted.contains(
+            "| 3  | 20      | 30           | 2           | c             | C   | 30  |"
+        ),
         "got:\n{formatted}"
     );
 
     let lcodec = MatchRecognizeLogicalCodec::new();
     let lbytes = logical_plan_to_bytes_with_extension_codec(&mr_plan, &lcodec).unwrap();
     let ldecoded =
-        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec)
+            .unwrap();
     let lout = pretty_format_batches(
         &ctx.execute_logical_plan(ldecoded)
             .await
@@ -821,7 +846,8 @@ async fn test_subset_union_variables_and_final_semantics_roundtrip() {
     let pcodec = MatchRecognizePhysicalCodec::new();
     let pbytes = physical_plan_to_bytes_with_extension_codec(phys, &pcodec).unwrap();
     let pdecoded =
-        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec)
+            .unwrap();
     let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
         .unwrap()
         .to_string();
@@ -870,7 +896,8 @@ async fn test_udaf_and_classifier_nav_proto_roundtrip() {
     let lcodec = MatchRecognizeLogicalCodec::new();
     let lbytes = logical_plan_to_bytes_with_extension_codec(&lplan, &lcodec).unwrap();
     let ldecoded =
-        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec)
+            .unwrap();
     let lout = pretty_format_batches(
         &ctx.execute_logical_plan(ldecoded)
             .await
@@ -887,7 +914,8 @@ async fn test_udaf_and_classifier_nav_proto_roundtrip() {
     let pcodec = MatchRecognizePhysicalCodec::new();
     let pbytes = physical_plan_to_bytes_with_extension_codec(pplan, &pcodec).unwrap();
     let pdecoded =
-        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec)
+            .unwrap();
     let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
         .unwrap()
         .to_string();
@@ -937,7 +965,8 @@ async fn test_metadata_agg_and_quoted_labels_proto_roundtrip() {
     let lcodec = MatchRecognizeLogicalCodec::new();
     let lbytes = logical_plan_to_bytes_with_extension_codec(&lplan, &lcodec).unwrap();
     let ldecoded =
-        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec).unwrap();
+        logical_plan_from_bytes_with_extension_codec(&lbytes, &ctx.task_ctx(), &lcodec)
+            .unwrap();
     let lout = pretty_format_batches(
         &ctx.execute_logical_plan(ldecoded)
             .await
@@ -954,7 +983,8 @@ async fn test_metadata_agg_and_quoted_labels_proto_roundtrip() {
     let pcodec = MatchRecognizePhysicalCodec::new();
     let pbytes = physical_plan_to_bytes_with_extension_codec(pplan, &pcodec).unwrap();
     let pdecoded =
-        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec).unwrap();
+        physical_plan_from_bytes_with_extension_codec(&pbytes, &ctx.task_ctx(), &pcodec)
+            .unwrap();
     let pout = pretty_format_batches(&collect(pdecoded, ctx.task_ctx()).await.unwrap())
         .unwrap()
         .to_string();
@@ -967,9 +997,11 @@ async fn test_sql_unparser_roundtrip() {
     use datafusion_match_recognize::MatchRecognizeUnparser;
     use datafusion_sql::unparser::Unparser;
 
-    let ctx =
-        session_context_with_match_recognize(SessionConfig::new(), MatchRecognizeConfig::default())
-            .unwrap();
+    let ctx = session_context_with_match_recognize(
+        SessionConfig::new(),
+        MatchRecognizeConfig::default(),
+    )
+    .unwrap();
     ctx.register_batch(
         "ticks",
         RecordBatch::try_from_iter(vec![
@@ -1021,9 +1053,10 @@ async fn test_sql_unparser_roundtrip() {
         None
     }
 
-    let mr_ext = find_extension(&df.into_unoptimized_plan()).expect("MatchRecognize Extension");
-    let unparser =
-        Unparser::default().with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
+    let mr_ext =
+        find_extension(&df.into_unoptimized_plan()).expect("MatchRecognize Extension");
+    let unparser = Unparser::default()
+        .with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
     let unparsed_sql = unparser.plan_to_sql(&mr_ext).unwrap().to_string();
 
     let roundtrip = run_and_format(&ctx, &unparsed_sql).await;
@@ -1095,6 +1128,7 @@ async fn test_aliased_filter_pushdown_and_quoted_unparser_roundtrip() {
                 "b" AS event = 'click',
                 c AS event = 'buy'
         )
+        ORDER BY user_id, ts
     "#;
     let df2 = ctx.sql(unparse_sql).await.unwrap();
     let expected2 = pretty_format_batches(&df2.clone().collect().await.unwrap())
@@ -1107,14 +1141,34 @@ async fn test_aliased_filter_pushdown_and_quoted_unparser_roundtrip() {
         }
         plan.inputs().into_iter().find_map(find_ext)
     }
-    let mr_ext = find_ext(&df2.into_unoptimized_plan()).expect("MatchRecognize Extension");
-    let unparser =
-        Unparser::default().with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
+    let mr_ext =
+        find_ext(&df2.into_unoptimized_plan()).expect("MatchRecognize Extension");
+    let unparser = Unparser::default()
+        .with_extension_unparsers(vec![Arc::new(MatchRecognizeUnparser)]);
     let roundtrip_sql = unparser.plan_to_sql(&mr_ext).unwrap().to_string();
     assert!(
         roundtrip_sql.contains("\"b\""),
         "Expected quoted lowercase label in unparsed SQL:\n{roundtrip_sql}"
     );
-    let actual2 = run_and_format(&ctx, &roundtrip_sql).await;
+    let ordered_roundtrip = format!("{roundtrip_sql} ORDER BY user_id, ts");
+    let actual2 = run_and_format(&ctx, &ordered_roundtrip).await;
     assert_eq!(actual2, expected2, "Unparsed SQL:\n{roundtrip_sql}");
+
+    // 3. Extension-trait ergonomic registration (datafusion-distributed style)
+    use datafusion_match_recognize::{
+        MatchRecognizeSessionContextExt, MatchRecognizeSessionStateBuilderExt,
+    };
+    let ext_state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_match_recognize()
+        .build();
+    let ext_ctx = SessionContext::new_with_state(ext_state);
+    ext_ctx
+        .register_match_recognize(MatchRecognizeConfig::default())
+        .unwrap();
+    ext_ctx
+        .register_batch("events", make_multi_partition_events())
+        .unwrap();
+    let actual3 = run_and_format(&ext_ctx, unparse_sql).await;
+    assert_eq!(actual3, expected2);
 }
